@@ -92,6 +92,15 @@ docker_set_image() {
 # SQLite. AGENTOS_KEEP_BACKUPS (default 5) prunes the oldest archives. Under
 # managed PostgreSQL (DATABASE_URL set) this is a deliberate no-op — see
 # uses_managed_postgres() above.
+#
+# Rollback pairing (same contract as systemd mode below): every archive
+# carries a ".image" sidecar recording the image its DATA belongs to, and
+# docker_upgrade is the ONLY place that ever repoints
+# $BACKUP_DIR/.last-upgrade — the single pointer docker_rollback reads — at
+# the archive it just took, before the image flip. A standalone
+# `agentos backup` (docker_backup) calls the same docker_backup_sqlite
+# helper but never touches .last-upgrade, so a routine backup can never
+# change what `agentos rollback` restores.
 
 docker_data_volume() { # → docker volume name backing /data
   local vol
@@ -100,13 +109,13 @@ docker_data_volume() { # → docker volume name backing /data
   printf '%s' "$vol"
 }
 
-docker_latest_backup() { ls -1t "$BACKUP_DIR"/agentos-*.tar.gz 2>/dev/null | head -1 || true; }
-
-docker_prune_backups() {
-  local keep="${AGENTOS_KEEP_BACKUPS:-5}" n
+docker_prune_backups() { # AGENTOS_KEEP_BACKUPS (default 5) — never removes the archive $BACKUP_DIR/.last-upgrade points at (or its sidecar), regardless of age, so routine backup churn can't strand a pending rollback
+  local keep="${AGENTOS_KEEP_BACKUPS:-5}" n protect=""
+  [ -f "$BACKUP_DIR/.last-upgrade" ] && protect="$(basename "$(cat "$BACKUP_DIR/.last-upgrade" 2>/dev/null || true)")"
   n="$(ls -1t "$BACKUP_DIR"/agentos-*.tar.gz 2>/dev/null | wc -l | tr -d ' ')"
   [ "${n:-0}" -le "$keep" ] && return 0
   ls -1t "$BACKUP_DIR"/agentos-*.tar.gz | tail -n +"$((keep + 1))" | while IFS= read -r old; do
+    [ -n "$protect" ] && [ "$(basename "$old")" = "$protect" ] && continue
     rm -f "$old" "${old%.tar.gz}.image"
     info "pruned $(basename "$old")"
   done
@@ -136,10 +145,9 @@ docker_backup_sqlite() { # stop → tar /data out → prune; prints the archive 
   printf '%s' "$out"
 }
 
-docker_restore_sqlite() { # docker_restore_sqlite [archive]  — default: newest backup
-  local archive="${1:-}" vol
-  [ -n "$archive" ] || archive="$(docker_latest_backup)"
-  [ -n "$archive" ] && [ -f "$archive" ] || die "no backup to restore (looked in $BACKUP_DIR)"
+docker_restore_sqlite() { # docker_restore_sqlite <archive> — restores /data from an archive docker_backup_sqlite created
+  local archive="${1:?docker_restore_sqlite needs an archive}" vol
+  [ -f "$archive" ] || die "backup archive gone: $archive"
   vol="$(docker_data_volume)"
   ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" stop node ) >/dev/null 2>&1 || true
   # Wipe then unpack: a restore that merges into a newer schema's leftovers is
@@ -153,7 +161,7 @@ docker_restore_sqlite() { # docker_restore_sqlite [archive]  — default: newest
 # ─── docker mode: upgrade / rollback / backup ───────────────────────────────
 
 docker_upgrade() { # docker_upgrade [tag]  — empty tag = latest stable
-  local to="${1:-}" manifest image prev
+  local to="${1:-}" manifest image prev snap
   if [ -n "$to" ]; then
     manifest="$(curl -fsSL "https://github.com/${DIST_REPO}/releases/download/${to}/stable.json")" \
       || die "no stable.json for ${to}"
@@ -163,7 +171,8 @@ docker_upgrade() { # docker_upgrade [tag]  — empty tag = latest stable
   image="$(printf '%s' "$manifest" | jq -r .image)"
   prev="$(grep -E '^AGENTOS_IMAGE=' "$AGENTOS_HOME/.env" | cut -d= -f2-)"
   [ "$image" = "$prev" ] && { echo "already at $image"; return 0; }
-  docker_backup_sqlite >/dev/null
+  snap="$(docker_backup_sqlite | tail -1)"   # consistent copy: the node is stopped
+  [ -n "$snap" ] && echo "$snap" > "$BACKUP_DIR/.last-upgrade"   # pairs archive + pre-upgrade image (its .image sidecar), before the flip
   docker_set_image "$image"
   ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" pull && docker compose -f "$COMPOSE_FILE" up -d )
   if ! wait_healthz; then
@@ -174,23 +183,24 @@ docker_upgrade() { # docker_upgrade [tag]  — empty tag = latest stable
     fi
     echo "new version unhealthy — rolling back" >&2
     docker_set_image "$prev"
-    docker_restore_sqlite
+    docker_restore_sqlite "$snap"
     ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" up -d )
     die "upgrade failed; previous version restored"
   fi
   ok "upgraded: $prev → $image"
 }
 
-docker_rollback() {
+docker_rollback() { # undo the last recorded upgrade — database + image together, from the single .last-upgrade pair
   local archive image
-  archive="$(docker_latest_backup)"
+  archive="$(cat "$BACKUP_DIR/.last-upgrade" 2>/dev/null || true)"
   if [ -z "$archive" ]; then
     if uses_managed_postgres; then
       docker_managed_postgres_warning
       die "refusing an unsafe rollback in managed-PostgreSQL mode."
     fi
-    die "no backup to roll back to (nothing in $BACKUP_DIR)"
+    die "no upgrade recorded to roll back (missing $BACKUP_DIR/.last-upgrade); archives under $BACKUP_DIR (if any) can be restored by hand, but this command only ever undoes the last upgrade."
   fi
+  [ -f "$archive" ] || die "backup archive gone: $archive"
   image="$(cat "${archive%.tar.gz}.image" 2>/dev/null || true)"
   step "Rolling back"
   info "database → $(basename "$archive")"
