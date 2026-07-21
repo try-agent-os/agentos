@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+# agentos — install, upgrade and operate an AgentOS Core node.
+# Modes: docker (compose profile) | systemd (bare-metal, no Docker).
+#
+#   agentos install [installer flags]   fresh install (delegates to install.sh)
+#   agentos upgrade [--to <tag>]        upgrade to the stable channel (or a pinned tag)
+#   agentos rollback                    undo the last upgrade (code + database)
+#   agentos backup                      take a manual backup without upgrading
+#   agentos status | logs [n] | version
+#
+# Docker-mode operations shell out to `docker compose` exactly like
+# install.sh does. Systemd-mode (bare-metal, no Docker) operates on the
+# versions/<tag> + current-symlink layout that install.sh lays down under
+# AGENTOS_HOME instead — see the systemd_* functions below.
+set -euo pipefail
+
+AGENTOS_HOME="${AGENTOS_DIR:-/opt/agentos}"
+DIST_REPO="try-agent-os/agentos"
+# shellcheck disable=SC2034  # kept for parity with install.sh/resolve-image.sh
+# and reserved for later use (systemd mode, and a future manifest-trust check
+# on the docker branches); stable.json's "image" field is already a
+# fully-qualified ref, so nothing here consumes IMAGE_REPO yet.
+IMAGE_REPO="${AGENTOS_IMAGE_REPO:-ghcr.io/try-agent-os/agentos-core}"
+CHANNEL_URL="https://github.com/${DIST_REPO}/releases/latest/download/stable.json"
+COMPOSE_FILE="docker-compose.node.yml"
+BACKUP_DIR="$AGENTOS_HOME/backups"
+
+GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'
+BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+step() { echo -e "\n${CYAN}${BOLD}▸${NC} ${BOLD}$*${NC}"; }
+info() { echo -e "  ${DIM}$*${NC}"; }
+ok()   { echo -e "  ${GREEN}✓${NC} $*"; }
+warn() { echo -e "  ${YELLOW}!${NC} $*"; }
+die()  { echo "agentos: $*" >&2; exit 1; }
+
+detect_mode() {
+  if [ -L "$AGENTOS_HOME/current" ]; then echo systemd
+  elif [ -f "$AGENTOS_HOME/$COMPOSE_FILE" ]; then echo docker
+  else echo none; fi
+}
+
+fetch_manifest() { # → stable.json on stdout
+  curl -fsSL --max-time 30 "$CHANNEL_URL" || die "cannot fetch channel manifest: $CHANNEL_URL"
+}
+
+wait_healthz() {
+  for _ in $(seq 1 45); do
+    curl -fsS --max-time 3 "http://127.0.0.1:${AGENTOS_PORT:-8787}/healthz" >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# Mirrors scripts/agentos-upgrade.sh's uses_managed_postgres(): DATABASE_URL in
+# .env means the node runs against managed PostgreSQL, not the local SQLite
+# fallback — the /data volume this file otherwise backs up is not the source
+# of truth, and its backups are external to this CLI entirely.
+uses_managed_postgres() {
+  grep -qE '^DATABASE_URL=.+' "$AGENTOS_HOME/.env" 2>/dev/null
+}
+
+# Mirrors agentos-upgrade.sh's managed-mode warning (lines 285-298): the boot
+# guard (apps/api/src/core/db/schema-guard.ts) refuses to start an image older
+# than the schema on disk, so blindly flipping AGENTOS_IMAGE back after a failed
+# managed-PostgreSQL upgrade would trade a broken node for one that cannot boot
+# at all. Say so and point at the real fix instead of pretending it is safe.
+docker_managed_postgres_warning() { # docker_managed_postgres_warning [prev-image]
+  local prev="${1:-}"
+  warn "DATABASE_URL is set: there is no local backup to fall back to (managed"
+  warn "PostgreSQL backups are external), and the schema may already have migrated"
+  warn "past what an older image understands. A code-only rollback would hit the"
+  warn "boot guard (database ahead of image) and fail to start."
+  warn "Roll back the DATABASE from your managed-PostgreSQL provider's backup to a"
+  warn "point before this upgrade${prev:+, then bring back $prev}."
+  warn "To force an old image onto the migrated schema anyway (accepting the risk),"
+  warn "set AGENTOS_SCHEMA_COMPAT_OVERRIDE=1 in .env before starting it."
+}
+
+# Idempotent AGENTOS_IMAGE= rewrite in .env; drops the sed -i.bak leftover on
+# success so a repeated upgrade/rollback doesn't litter the install dir.
+docker_set_image() {
+  sed -i.bak "s|^AGENTOS_IMAGE=.*|AGENTOS_IMAGE=${1}|" "$AGENTOS_HOME/.env"
+  rm -f "$AGENTOS_HOME/.env.bak"
+}
+
+# ─── docker mode: data-volume backup/restore ────────────────────────────────
+#
+# Mirrors scripts/agentos-upgrade.sh:88-160 (backup_now / restore_backup): a
+# throwaway alpine container mounts the SAME named volume the node uses for
+# /data (messages.db + its WAL sidecars + .aop state) and tars it out while the
+# node is STOPPED, so the copy is consistent and not a torn read of a live
+# SQLite. AGENTOS_KEEP_BACKUPS (default 5) prunes the oldest archives. Under
+# managed PostgreSQL (DATABASE_URL set) this is a deliberate no-op — see
+# uses_managed_postgres() above.
+
+docker_data_volume() { # → docker volume name backing /data
+  local vol
+  vol="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' agentos-node 2>/dev/null || true)"
+  [ -n "$vol" ] || vol="$(basename "$AGENTOS_HOME")_agentos-data"
+  printf '%s' "$vol"
+}
+
+docker_latest_backup() { ls -1t "$BACKUP_DIR"/agentos-*.tar.gz 2>/dev/null | head -1 || true; }
+
+docker_prune_backups() {
+  local keep="${AGENTOS_KEEP_BACKUPS:-5}" n
+  n="$(ls -1t "$BACKUP_DIR"/agentos-*.tar.gz 2>/dev/null | wc -l | tr -d ' ')"
+  [ "${n:-0}" -le "$keep" ] && return 0
+  ls -1t "$BACKUP_DIR"/agentos-*.tar.gz | tail -n +"$((keep + 1))" | while IFS= read -r old; do
+    rm -f "$old" "${old%.tar.gz}.image"
+    info "pruned $(basename "$old")"
+  done
+}
+
+docker_backup_sqlite() { # stop → tar /data out → prune; prints the archive path last (nothing if managed Postgres)
+  if uses_managed_postgres; then
+    warn "DATABASE_URL is set: skipping local SQLite backup (managed PostgreSQL backups are external)." >&2
+    return 0
+  fi
+  mkdir -p "$BACKUP_DIR"
+  local stamp out vol image
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  out="$BACKUP_DIR/agentos-${stamp}.tar.gz"
+  vol="$(docker_data_volume)"
+  image="$(grep -E '^AGENTOS_IMAGE=' "$AGENTOS_HOME/.env" 2>/dev/null | cut -d= -f2- || true)"
+  step "Backing up"
+  ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" stop node ) >/dev/null 2>&1 || true
+  docker run --rm -v "$vol":/data:ro -v "$BACKUP_DIR":/backup alpine:3 \
+    tar czf "/backup/$(basename "$out")" -C /data . \
+    || die "backup FAILED — refusing to continue with a node whose data we cannot restore."
+  # sidecar records the image the DATA belongs to (pre-upgrade), same idea as
+  # agentos-upgrade.sh's ".ref" file recording the pre-upgrade git commit.
+  [ -n "$image" ] && printf '%s\n' "$image" > "${out%.tar.gz}.image"
+  ok "backup: $(basename "$out") ($(du -h "$out" | cut -f1)) from volume '$vol'"
+  docker_prune_backups
+  printf '%s' "$out"
+}
+
+docker_restore_sqlite() { # docker_restore_sqlite [archive]  — default: newest backup
+  local archive="${1:-}" vol
+  [ -n "$archive" ] || archive="$(docker_latest_backup)"
+  [ -n "$archive" ] && [ -f "$archive" ] || die "no backup to restore (looked in $BACKUP_DIR)"
+  vol="$(docker_data_volume)"
+  ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" stop node ) >/dev/null 2>&1 || true
+  # Wipe then unpack: a restore that merges into a newer schema's leftovers is
+  # not a restore.
+  docker run --rm -v "$vol":/data -v "$BACKUP_DIR":/backup:ro alpine:3 \
+    sh -c 'rm -rf /data/* /data/.[!.]* 2>/dev/null; tar xzf "/backup/'"$(basename "$archive")"'" -C /data' \
+    || die "restore FAILED — the backup is still at $archive, do not start the node."
+  ok "restored $(basename "$archive")"
+}
+
+# ─── docker mode: upgrade / rollback / backup ───────────────────────────────
+
+docker_upgrade() { # docker_upgrade [tag]  — empty tag = latest stable
+  local to="${1:-}" manifest image prev
+  if [ -n "$to" ]; then
+    manifest="$(curl -fsSL "https://github.com/${DIST_REPO}/releases/download/${to}/stable.json")" \
+      || die "no stable.json for ${to}"
+  else
+    manifest="$(fetch_manifest)"
+  fi
+  image="$(printf '%s' "$manifest" | jq -r .image)"
+  prev="$(grep -E '^AGENTOS_IMAGE=' "$AGENTOS_HOME/.env" | cut -d= -f2-)"
+  [ "$image" = "$prev" ] && { echo "already at $image"; return 0; }
+  docker_backup_sqlite >/dev/null
+  docker_set_image "$image"
+  ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" pull && docker compose -f "$COMPOSE_FILE" up -d )
+  if ! wait_healthz; then
+    if uses_managed_postgres; then
+      echo "new version unhealthy" >&2
+      docker_managed_postgres_warning "$prev"
+      die "refusing an unsafe automatic rollback in managed-PostgreSQL mode; inspect: docker compose -f $COMPOSE_FILE logs node"
+    fi
+    echo "new version unhealthy — rolling back" >&2
+    docker_set_image "$prev"
+    docker_restore_sqlite
+    ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" up -d )
+    die "upgrade failed; previous version restored"
+  fi
+  ok "upgraded: $prev → $image"
+}
+
+docker_rollback() {
+  local archive image
+  archive="$(docker_latest_backup)"
+  if [ -z "$archive" ]; then
+    if uses_managed_postgres; then
+      docker_managed_postgres_warning
+      die "refusing an unsafe rollback in managed-PostgreSQL mode."
+    fi
+    die "no backup to roll back to (nothing in $BACKUP_DIR)"
+  fi
+  image="$(cat "${archive%.tar.gz}.image" 2>/dev/null || true)"
+  step "Rolling back"
+  info "database → $(basename "$archive")"
+  [ -n "$image" ] && info "image    → $image"
+  uses_managed_postgres && warn "DATABASE_URL is set — restoring the LOCAL backup only; the managed database is not part of it."
+  docker_restore_sqlite "$archive"
+  [ -n "$image" ] && docker_set_image "$image"
+  ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" up -d )
+  if wait_healthz; then
+    ok "rolled back and healthy"
+  else
+    ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" logs --tail 30 node ) || true
+    die "still unhealthy after rollback — the pre-upgrade state is at $archive."
+  fi
+}
+
+docker_backup() { # manual, standalone backup — leaves the node running afterward
+  local out
+  out="$(docker_backup_sqlite | tail -1)"
+  ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" up -d ) >/dev/null
+  if ! wait_healthz; then
+    ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" logs --tail 30 node ) || true
+    die "node did not come back healthy after the backup stop/start cycle."
+  fi
+  if [ -n "$out" ]; then
+    ok "backup: $out"
+  else
+    ok "node is healthy (no local backup taken — see the notice above)"
+  fi
+}
+
+# ─── systemd mode: version + backup/restore helpers ────────────────────────
+#
+# Bare-metal self-host is SQLite-only by design: there is no volume to tar
+# (docker mode's approach), so this backs up the SQLite files directly under
+# a timestamped directory in $BACKUP_DIR and prunes old ones. Managed
+# PostgreSQL (DATABASE_URL set) is the same deliberate no-op as
+# uses_managed_postgres()/docker_managed_postgres_warning() describe for
+# docker mode above — reused here rather than duplicated.
+#
+# Rollback pairing: a data snapshot and the code tag it was taken next to
+# must never come apart. Every snapshot dir carries its OWN tag in a
+# `version` file (systemd_backup_sqlite writes it unconditionally, whoever
+# the caller is). systemd_upgrade is the ONLY place that ever repoints
+# $BACKUP_DIR/.last-upgrade — the single pointer systemd_rollback reads —
+# and it does so atomically with the snapshot it just took, before the
+# symlink swap. A standalone `agentos backup` (systemd_backup) calls the
+# same systemd_backup_sqlite helper but never touches .last-upgrade, so a
+# routine backup can never change what `agentos rollback` restores. There is
+# no separate `.last` pointer — the snapshot dir IS the record.
+
+systemd_backup_sqlite() { # systemd_backup_sqlite <label> — <label> is the code tag this snapshot belongs next to. Prints the new dir's path on stdout (nothing if managed Postgres). Never touches .last-upgrade — callers decide that.
+  if uses_managed_postgres; then
+    warn "DATABASE_URL is set: skipping local SQLite backup (managed PostgreSQL backups are external)." >&2
+    return 0
+  fi
+  local label="${1:?systemd_backup_sqlite needs a label}"
+  local ts dest f
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  dest="$BACKUP_DIR/${ts}-${label}"
+  mkdir -p "$dest"
+  for f in messages.db messages.db-wal messages.db-shm search.db; do
+    [ -f "$AGENTOS_HOME/data/$f" ] && cp -a "$AGENTOS_HOME/data/$f" "$dest/"
+  done
+  echo "$label" > "$dest/version"
+  ok "backup: $(basename "$dest")"
+  systemd_prune_backups
+  printf '%s' "$dest"
+}
+
+systemd_prune_backups() { # AGENTOS_KEEP_BACKUPS (default 5) — never removes the dir $BACKUP_DIR/.last-upgrade points at, regardless of age, so routine backup churn can't strand a pending rollback
+  local keep="${AGENTOS_KEEP_BACKUPS:-5}" protect=""
+  [ -f "$BACKUP_DIR/.last-upgrade" ] && protect="$(basename "$(cat "$BACKUP_DIR/.last-upgrade" 2>/dev/null || true)")"
+  ls -1dt "$BACKUP_DIR"/*/ 2>/dev/null | tail -n +"$((keep + 1))" | while IFS= read -r d; do
+    [ -n "$protect" ] && [ "$(basename "$d")" = "$protect" ] && continue
+    rm -rf "$d"
+    info "pruned $(basename "$d")"
+  done
+}
+
+systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores data/ from a dir systemd_backup_sqlite created
+  if uses_managed_postgres; then
+    docker_managed_postgres_warning
+    die "refusing an unsafe rollback in managed-PostgreSQL mode."
+  fi
+  local src="${1:?systemd_restore_sqlite needs a snapshot dir}"
+  [ -d "$src" ] || die "backup dir gone: $src"
+  cp -a "$src"/. "$AGENTOS_HOME/data/"
+  ok "restored $(basename "$src")"
+}
+
+systemd_last_upgrade_dir() { # → the snapshot dir recorded by the most recent systemd_upgrade, validated to exist
+  local src
+  src="$(cat "$BACKUP_DIR/.last-upgrade" 2>/dev/null || true)"
+  [ -n "$src" ] || die "no upgrade recorded to roll back (missing $BACKUP_DIR/.last-upgrade)"
+  [ -d "$src" ] || die "backup dir gone: $src"
+  printf '%s' "$src"
+}
+
+prune_versions() { # keep current + 2 previous version dirs under versions/ — always excludes the current symlink target and the .last-upgrade pair's version, regardless of age
+  local cur="" last_upgrade_ver="" src
+  [ -L "$AGENTOS_HOME/current" ] && cur="$(basename "$(readlink "$AGENTOS_HOME/current")")"
+  if [ -f "$BACKUP_DIR/.last-upgrade" ]; then
+    src="$(cat "$BACKUP_DIR/.last-upgrade" 2>/dev/null || true)"
+    [ -n "$src" ] && [ -f "$src/version" ] && last_upgrade_ver="$(cat "$src/version" 2>/dev/null || true)"
+  fi
+  ls -1dt "$AGENTOS_HOME/versions"/*/ 2>/dev/null | tail -n +4 | while IFS= read -r d; do
+    local tag; tag="$(basename "$d")"
+    [ "$tag" = "$cur" ] && continue
+    [ -n "$last_upgrade_ver" ] && [ "$tag" = "$last_upgrade_ver" ] && continue
+    rm -rf "$d"
+  done
+}
+
+# ─── systemd mode: upgrade / rollback / backup ─────────────────────────────
+#
+# Mirrors the docker-mode contract above: fetch stable.json (or a pinned
+# tag's, symmetric to docker_upgrade's --to handling), unpack the release
+# tree into a versions/.tmp-<tag> staging dir and atomically `mv` it into
+# versions/<tag> only once download + checksum + extract all succeeded — so
+# `[ -d versions/$tag ]` can only ever be true for a complete, verified
+# release, never a half-downloaded one; an EXIT trap cleans the staging dir
+# on any failure (checksum mismatch, bad tarball, or a plain crash), so a
+# retry starts from a clean slate. Then stop the unit, back up the SQLite
+# data files, flip the `current` symlink, start the unit, and wait for
+# /healthz. The schema boot-guard (apps/api/src/core/db/schema-guard.ts)
+# refuses to start code older than the database it finds, so an unhealthy
+# new version rolls back CODE AND DATABASE TOGETHER — a code-only rollback
+# would leave the node unable to boot at all.
+
+systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
+  local to="${1:-}" manifest tag tarball sha url prev tmp_dir snap
+  if [ -n "$to" ]; then
+    manifest="$(curl -fsSL "https://github.com/${DIST_REPO}/releases/download/${to}/stable.json")" \
+      || die "no stable.json for ${to}"
+  else
+    manifest="$(fetch_manifest)"
+  fi
+  tag="$(jq -r .version <<<"$manifest")"
+  prev="$(basename "$(readlink "$AGENTOS_HOME/current")")"
+  [ "$tag" = "$prev" ] && { echo "already at $tag"; return 0; }
+  tarball="$(jq -r .tarball <<<"$manifest")"
+  sha="$(jq -r .tarball_sha256 <<<"$manifest")"
+  url="https://github.com/${DIST_REPO}/releases/download/${tag}/${tarball}"
+
+  if [ ! -d "$AGENTOS_HOME/versions/$tag" ]; then
+    step "Fetching $tag"
+    tmp_dir="$AGENTOS_HOME/versions/.tmp-$tag"
+    rm -rf "$tmp_dir"
+    trap 'rm -rf "$tmp_dir"' EXIT
+    mkdir -p "$tmp_dir"
+    curl -fsSL "$url" -o "$tmp_dir/${tarball}"
+    echo "${sha}  $tmp_dir/${tarball}" | sha256sum -c - || die "tarball checksum mismatch"
+    tar --use-compress-program=unzstd -xf "$tmp_dir/${tarball}" -C "$tmp_dir"
+    rm -f "$tmp_dir/${tarball}"
+    trap - EXIT
+    mv "$tmp_dir" "$AGENTOS_HOME/versions/$tag"   # atomic: versions/$tag only ever appears fully populated
+  fi
+
+  step "Upgrading $prev → $tag"
+  systemctl stop agentos
+  snap="$(systemd_backup_sqlite "$prev" | tail -1)"   # consistent copy: the unit is stopped
+  [ -n "$snap" ] && echo "$snap" > "$BACKUP_DIR/.last-upgrade"   # pairs snapshot + code tag atomically, before the swap
+  ln -sfn "$AGENTOS_HOME/versions/$tag" "$AGENTOS_HOME/current"
+  systemctl start agentos
+
+  if wait_healthz; then
+    ok "upgraded: $prev → $tag"
+    prune_versions
+  else
+    if uses_managed_postgres; then
+      echo "new version unhealthy" >&2
+      docker_managed_postgres_warning "$prev"
+      die "refusing an unsafe automatic rollback in managed-PostgreSQL mode; inspect: journalctl -u agentos"
+    fi
+    echo "unhealthy — rolling back to $prev (code + database)" >&2
+    systemctl stop agentos
+    systemd_restore_sqlite "$snap"
+    ln -sfn "$AGENTOS_HOME/versions/$prev" "$AGENTOS_HOME/current"
+    systemctl start agentos
+    wait_healthz || die "rollback ALSO unhealthy — inspect: journalctl -u agentos"
+    die "upgrade to $tag failed; $prev restored"
+  fi
+}
+
+systemd_rollback() { # undo the last recorded upgrade — code + database together, from the single .last-upgrade pair
+  if uses_managed_postgres; then
+    docker_managed_postgres_warning
+    die "refusing an unsafe rollback in managed-PostgreSQL mode."
+  fi
+  local src prev
+  src="$(systemd_last_upgrade_dir)"
+  prev="$(cat "$src/version" 2>/dev/null || true)"
+  [ -n "$prev" ] || die "backup dir $src has no recorded version (corrupt snapshot)"
+  [ -d "$AGENTOS_HOME/versions/$prev" ] || die "version dir gone: $AGENTOS_HOME/versions/$prev"
+  step "Rolling back to $prev"
+  systemctl stop agentos
+  systemd_restore_sqlite "$src"
+  ln -sfn "$AGENTOS_HOME/versions/$prev" "$AGENTOS_HOME/current"
+  systemctl start agentos
+  if wait_healthz; then
+    ok "rolled back to $prev and healthy"
+  else
+    journalctl -u agentos -n 30 --no-pager || true
+    die "still unhealthy after rollback — the pre-upgrade snapshot is at $src."
+  fi
+}
+
+systemd_backup() { # manual, standalone backup — leaves the unit running afterward; NEVER touches .last-upgrade
+  local tag out
+  tag="$(basename "$(readlink "$AGENTOS_HOME/current")")"
+  systemctl stop agentos
+  out="$(systemd_backup_sqlite "$tag" | tail -1)"
+  systemctl start agentos
+  if ! wait_healthz; then
+    journalctl -u agentos -n 30 --no-pager || true
+    die "node did not come back healthy after the backup stop/start cycle."
+  fi
+  if [ -n "$out" ]; then
+    ok "backup: $out"
+  else
+    ok "node is healthy (no local backup taken — see the notice above)"
+  fi
+}
+
+# ─── command dispatch ────────────────────────────────────────────────────────
+
+cmd_version() {
+  case "$(detect_mode)" in
+    systemd) readlink "$AGENTOS_HOME/current" | xargs basename ;;
+    docker)  grep -E '^AGENTOS_IMAGE=' "$AGENTOS_HOME/.env" | cut -d= -f2- ;;
+    none)    die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
+cmd_status() {
+  case "$(detect_mode)" in
+    systemd) systemctl status agentos --no-pager ;;
+    docker)  (cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" ps) ;;
+    none)    die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
+cmd_logs() {
+  case "$(detect_mode)" in
+    systemd) journalctl -u agentos -n "${1:-200}" --no-pager ;;
+    docker)  (cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" logs --tail "${1:-200}") ;;
+    none)    die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
+cmd_upgrade() {
+  local to=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to) to="${2:?--to needs a value}"; shift 2 ;;
+      *)    die "unknown upgrade option: $1 (try --help)" ;;
+    esac
+  done
+  case "$(detect_mode)" in
+    systemd) systemd_upgrade "$to" ;;
+    docker)  docker_upgrade "$to" ;;
+    none)    die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
+cmd_rollback() {
+  case "$(detect_mode)" in
+    systemd) systemd_rollback ;;
+    docker)  docker_rollback ;;
+    none)    die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
+cmd_backup() {
+  case "$(detect_mode)" in
+    systemd) systemd_backup ;;
+    docker)  docker_backup ;;
+    none)    die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
+usage() {
+  cat <<'EOF'
+agentos — operate an AgentOS Core node
+  install [installer flags]   fresh install (delegates to install.sh)
+  upgrade [--to <tag>]        upgrade to the stable channel (or a pinned tag)
+  rollback                    undo the last upgrade (code + database)
+  backup                      take a manual backup without upgrading
+  status | logs [n] | version
+EOF
+}
+
+case "${1:-}" in
+  install)  shift; exec bash <(curl -fsSL "https://raw.githubusercontent.com/${DIST_REPO}/main/install.sh") "$@" ;;
+  upgrade)  shift; cmd_upgrade "$@" ;;
+  rollback) cmd_rollback ;;
+  status)   cmd_status ;;
+  logs)     shift || true; cmd_logs "${1:-200}" ;;
+  version)  cmd_version ;;
+  backup)   cmd_backup ;;
+  *)        usage; exit 1 ;;
+esac
