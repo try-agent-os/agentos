@@ -1,3 +1,12 @@
+This license covers only the files tracked in this repository (`install.sh`,
+`agentos`, and this documentation). The release artifacts attached to this
+repository — the `agentos-core-*.tar.zst` tarballs, the
+`ghcr.io/try-agent-os/agentos-core` container images, and everything inside
+them — are proprietary © Novo Studio, all rights reserved, and are not covered
+by this license. You are welcome to download and run them to self-host AgentOS.
+
+---
+
 MIT License
 
 Copyright (c) 2026 Novo Studio
