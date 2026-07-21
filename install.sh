@@ -129,14 +129,22 @@ AOP_STATE_DIR=${INSTALL_DIR}/data/.aop
 MINIAPP_DIST_DIR=${INSTALL_DIR}/current/miniapp-dist
 EOF
   $SUDO chmod 600 "$INSTALL_DIR/.env"
-  [ -n "$DOMAIN" ] && echo "MINIAPP_URL=https://${DOMAIN}/app" | $SUDO tee -a "$INSTALL_DIR/.env" >/dev/null
+  # Explicit if, NOT `[ -n ] && …`: as the function's last command, a false
+  # test would become its exit status and `set -e` would kill the install at
+  # the call site — exactly the --no-https path, before the unit even exists.
+  if [ -n "$DOMAIN" ]; then
+    echo "MINIAPP_URL=https://${DOMAIN}/app" | $SUDO tee -a "$INSTALL_DIR/.env" >/dev/null
+  fi
 }
 
 install_systemd() {
   step "System packages"
   export DEBIAN_FRONTEND=noninteractive
-  $SUDO apt-get update -qq
-  $SUDO apt-get install -y -qq ffmpeg git tmux curl zstd jq ca-certificates
+  # DPkg::Lock::Timeout: on a fresh droplet's FIRST boot the provider agent
+  # (cloud-init, unattended-upgrades) still holds the apt/dpkg lock — wait for
+  # it (up to 120s) instead of dying on "could not get lock".
+  $SUDO apt-get -o DPkg::Lock::Timeout=120 update -qq
+  $SUDO apt-get -o DPkg::Lock::Timeout=120 install -y -qq ffmpeg git tmux curl zstd jq ca-certificates
 
   step "Release"
   local manifest tag tarball sha node_ver url
@@ -180,8 +188,12 @@ install_systemd() {
   step "Claude Code CLI"
   # Pinned to the version the image bakes; the manifest is authoritative later
   # (add claude_code_version to stable.json when it first diverges — YAGNI now).
-  $SUDO "$INSTALL_DIR/node/bin/npm" install -g --prefix "$INSTALL_DIR/node" \
-    "@anthropic-ai/claude-code@2.1.205"
+  # npm's shebang is `#!/usr/bin/env node` and the vendored node is not on
+  # sudo's secure_path, so run npm through the vendored node explicitly AND put
+  # its bin dir on PATH for any child `node` processes npm spawns.
+  $SUDO env PATH="$INSTALL_DIR/node/bin:$PATH" \
+    "$INSTALL_DIR/node/bin/node" "$INSTALL_DIR/node/bin/npm" \
+    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.205"
 
   step "Config + unit"
   write_env_systemd
@@ -209,7 +221,7 @@ install_systemd() {
     # env-substitution placeholder and the docker-network upstream hostname
     # swapped for what a bare-metal box actually has: a known domain and the
     # node listening on loopback.
-    $SUDO apt-get install -y -qq caddy
+    $SUDO apt-get -o DPkg::Lock::Timeout=120 install -y -qq caddy
     # Same $SUDO-on-the-read reasoning as the unit render above: this template
     # also lives under $INSTALL_DIR (the agentos account's $HOME).
     $SUDO sed -e "s/{\$AGENTOS_DOMAIN}/${DOMAIN}/" -e "s/node:8787/127.0.0.1:8787/" \

@@ -289,6 +289,11 @@ systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores 
   local src="${1:?systemd_restore_sqlite needs a snapshot dir}"
   [ -d "$src" ] || die "backup dir gone: $src"
   cp -a "$src"/. "$AGENTOS_HOME/data/"
+  # The snapshots are root-owned (this CLI runs as root), and `cp -a` of
+  # "<dir>/." carries the snapshot dir's OWN ownership onto data/ itself — the
+  # rolled-back User=agentos node would then hit SQLITE_READONLY_DIRECTORY and
+  # never start. Give the whole data dir back to the service account.
+  chown -R agentos:agentos "$AGENTOS_HOME/data"
   ok "restored $(basename "$src")"
 }
 
@@ -332,7 +337,7 @@ prune_versions() { # keep current + 2 previous version dirs under versions/ — 
 # would leave the node unable to boot at all.
 
 systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
-  local to="${1:-}" manifest tag tarball sha url prev tmp_dir snap
+  local to="${1:-}" manifest tag tarball sha url prev tmp_dir snap started
   if [ -n "$to" ]; then
     manifest="$(curl -fsSL "https://github.com/${DIST_REPO}/releases/download/${to}/stable.json")" \
       || die "no stable.json for ${to}"
@@ -360,14 +365,26 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     mv "$tmp_dir" "$AGENTOS_HOME/versions/$tag"   # atomic: versions/$tag only ever appears fully populated
   fi
 
+  # The unpack above ran as root (this CLI needs root for systemctl anyway),
+  # so the new tree is root-owned mode 700 — the User=agentos service cannot
+  # even chdir into it (systemd 200/CHDIR). install.sh chown -R's the whole
+  # install root on first install; mirror that for every version this CLI
+  # materializes, BEFORE `current` ever points at it. Unconditional on
+  # purpose: it also repairs a pre-existing root-owned dir from an older CLI.
+  chown -R agentos:agentos "$AGENTOS_HOME/versions/$tag"
+
   step "Upgrading $prev → $tag"
   systemctl stop agentos
   snap="$(systemd_backup_sqlite "$prev" | tail -1)"   # consistent copy: the unit is stopped
   [ -n "$snap" ] && echo "$snap" > "$BACKUP_DIR/.last-upgrade"   # pairs snapshot + code tag atomically, before the swap
   ln -sfn "$AGENTOS_HOME/versions/$tag" "$AGENTOS_HOME/current"
-  systemctl start agentos
+  # A start that fails to ACTIVATE (non-zero systemctl) must land in the same
+  # rollback below as a failed healthz — a bare call here would abort under
+  # set -e with the node down and no rollback.
+  started=0
+  if systemctl start agentos; then started=1; fi
 
-  if wait_healthz; then
+  if [ "$started" = 1 ] && wait_healthz; then
     ok "upgraded: $prev → $tag"
     prune_versions
   else
@@ -380,7 +397,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     systemctl stop agentos
     systemd_restore_sqlite "$snap"
     ln -sfn "$AGENTOS_HOME/versions/$prev" "$AGENTOS_HOME/current"
-    systemctl start agentos
+    systemctl start agentos || true   # a failed activation IS a failed healthz below
     wait_healthz || die "rollback ALSO unhealthy — inspect: journalctl -u agentos"
     die "upgrade to $tag failed; $prev restored"
   fi
@@ -400,7 +417,7 @@ systemd_rollback() { # undo the last recorded upgrade — code + database togeth
   systemctl stop agentos
   systemd_restore_sqlite "$src"
   ln -sfn "$AGENTOS_HOME/versions/$prev" "$AGENTOS_HOME/current"
-  systemctl start agentos
+  systemctl start agentos || true   # a failed activation IS a failed healthz below
   if wait_healthz; then
     ok "rolled back to $prev and healthy"
   else
@@ -414,7 +431,7 @@ systemd_backup() { # manual, standalone backup — leaves the unit running after
   tag="$(basename "$(readlink "$AGENTOS_HOME/current")")"
   systemctl stop agentos
   out="$(systemd_backup_sqlite "$tag" | tail -1)"
-  systemctl start agentos
+  systemctl start agentos || true   # a failed activation IS a failed healthz below
   if ! wait_healthz; then
     journalctl -u agentos -n 30 --no-pager || true
     die "node did not come back healthy after the backup stop/start cycle."
