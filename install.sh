@@ -236,6 +236,40 @@ install_systemd() {
 
   $SUDO ln -sfn "$INSTALL_DIR/current/profiles/agentos" /usr/local/bin/agentos
   ok "agentos CLI → /usr/local/bin/agentos"
+
+  install_autoupdate_timer "$INSTALL_DIR/current/profiles"
+}
+
+# Install + arm the unattended update timer. Mode-agnostic: the poller and its
+# systemd units ride the same profiles/ layer as the agentos CLI, so both the
+# docker and bare-metal paths get the identical manifest-driven updater. Renders
+# the oneshot's install-root placeholder exactly like agentos.service does, then
+# enables the timer. On a host with no systemd it degrades to a printed hint, not
+# a failure — the node still works, it just checks by hand.
+install_autoupdate_timer() { # install_autoupdate_timer <profiles-dir>
+  local pdir="$1"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "no systemd on this host — unattended auto-update not armed."
+    info "check for updates by hand any time with: agentos autoupdate --check"
+    return 0
+  fi
+  [ -f "$pdir/agentos-autoupdate.service" ] || { warn "auto-update units missing from $pdir — skipping timer."; return 0; }
+  $SUDO sed "s|/opt/agentos|${INSTALL_DIR}|g" "$pdir/agentos-autoupdate.service" \
+    | $SUDO tee /etc/systemd/system/agentos-autoupdate.service >/dev/null
+  $SUDO cp "$pdir/agentos-autoupdate.timer" /etc/systemd/system/agentos-autoupdate.timer
+  # The operator's auto-apply appetite, when they set one. Default lives in the
+  # unit (patch): patch/security land unattended, minor/major wait for a button.
+  if [ -n "${AGENTOS_AUTOUPDATE_POLICY:-}" ]; then
+    $SUDO mkdir -p /etc/systemd/system/agentos-autoupdate.service.d
+    printf '[Service]\nEnvironment=AGENTOS_AUTOUPDATE_POLICY=%s\n' "${AGENTOS_AUTOUPDATE_POLICY}" \
+      | $SUDO tee /etc/systemd/system/agentos-autoupdate.service.d/policy.conf >/dev/null
+  fi
+  $SUDO systemctl daemon-reload
+  if $SUDO systemctl enable --now agentos-autoupdate.timer >/dev/null 2>&1; then
+    ok "auto-update timer armed (policy=${AGENTOS_AUTOUPDATE_POLICY:-patch})"
+  else
+    warn "could not enable agentos-autoupdate.timer — arm it with: systemctl enable --now agentos-autoupdate.timer"
+  fi
 }
 
 echo -e "\n${BOLD}AgentOS Node — install${NC}"
@@ -432,6 +466,8 @@ if [ -f "$INSTALL_DIR/agentos" ]; then
   $SUDO ln -sfn "$INSTALL_DIR/agentos" /usr/local/bin/agentos
   ok "agentos CLI → /usr/local/bin/agentos"
 fi
+[ -f "$INSTALL_DIR/agentos-autoupdate.sh" ] && chmod +x "$INSTALL_DIR/agentos-autoupdate.sh"
+install_autoupdate_timer "$INSTALL_DIR"
 
 # ─── 3. answers ─────────────────────────────────────────────────────────────
 

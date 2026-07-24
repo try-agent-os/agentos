@@ -160,15 +160,27 @@ docker_restore_sqlite() { # docker_restore_sqlite <archive> — restores /data f
 
 # ─── docker mode: upgrade / rollback / backup ───────────────────────────────
 
-docker_upgrade() { # docker_upgrade [tag]  — empty tag = latest stable
-  local to="${1:-}" manifest image prev snap
-  if [ -n "$to" ]; then
-    manifest="$(curl -fsSL "https://github.com/${DIST_REPO}/releases/download/${to}/stable.json")" \
-      || die "no stable.json for ${to}"
+docker_upgrade() { # docker_upgrade [tag] [image-ref]  — empty tag = latest stable
+  local to="${1:-}" image_ref="${2:-}" manifest image digest prev snap
+  if [ -n "$image_ref" ]; then
+    # Explicit, already-resolved ref (the autoupdate poller passes a
+    # digest-pinned repo@sha256:… so the pull is immutable). Skip the manifest.
+    image="$image_ref"
   else
-    manifest="$(fetch_manifest)"
+    if [ -n "$to" ]; then
+      manifest="$(curl -fsSL "https://github.com/${DIST_REPO}/releases/download/${to}/stable.json")" \
+        || die "no stable.json for ${to}"
+    else
+      manifest="$(fetch_manifest)"
+    fi
+    image="$(printf '%s' "$manifest" | jq -r .image)"
+    # Pin by DIGEST, never the moving tag: repo part of .image + @ + .digest. The
+    # image IS the unit of distribution addressed by digest — a tag can be
+    # repointed under us, a digest cannot. Manifests without a digest (older
+    # GitHub-release stable.json) keep the tag ref unchanged.
+    digest="$(printf '%s' "$manifest" | jq -r '.digest // empty')"
+    [ -n "$digest" ] && image="${image%:*}@${digest}"
   fi
-  image="$(printf '%s' "$manifest" | jq -r .image)"
   prev="$(grep -E '^AGENTOS_IMAGE=' "$AGENTOS_HOME/.env" | cut -d= -f2-)"
   [ "$image" = "$prev" ] && { echo "already at $image"; return 0; }
   snap="$(docker_backup_sqlite | tail -1)"   # consistent copy: the node is stopped
@@ -470,18 +482,32 @@ cmd_logs() {
 }
 
 cmd_upgrade() {
-  local to=""
+  local to="" image_ref=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --to) to="${2:?--to needs a value}"; shift 2 ;;
-      *)    die "unknown upgrade option: $1 (try --help)" ;;
+      --to)    to="${2:?--to needs a value}"; shift 2 ;;
+      --image) image_ref="${2:?--image needs a value}"; shift 2 ;;
+      *)       die "unknown upgrade option: $1 (try --help)" ;;
     esac
   done
   case "$(detect_mode)" in
-    systemd) systemd_upgrade "$to" ;;
-    docker)  docker_upgrade "$to" ;;
+    systemd)
+      [ -n "$image_ref" ] && die "--image is docker-mode only; bare-metal ships a tarball channel (use --to <tag>)."
+      systemd_upgrade "$to" ;;
+    docker)  docker_upgrade "$to" "$image_ref" ;;
     none)    die "no install found under $AGENTOS_HOME" ;;
   esac
+}
+
+# Unattended manifest-driven updater — the policy layer that decides WHETHER to
+# call cmd_upgrade at all. Lives in the sibling agentos-autoupdate.sh (shipped
+# next to this CLI in profiles/); this is the one entrypoint the systemd timer
+# invokes so a node has a single `agentos` command surface.
+cmd_autoupdate() {
+  local here; here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+  local poller="$here/agentos-autoupdate.sh"
+  [ -x "$poller" ] || die "autoupdater not found at $poller"
+  exec "$poller" "$@"
 }
 
 cmd_rollback() {
@@ -504,7 +530,10 @@ usage() {
   cat <<'EOF'
 agentos — operate an AgentOS Core node
   install [installer flags]   fresh install (delegates to install.sh)
-  upgrade [--to <tag>]        upgrade to the stable channel (or a pinned tag)
+  upgrade [--to <tag>|--image <ref>]  upgrade to the stable channel, a pinned
+                              tag, or an explicit (digest-pinned) image ref
+  autoupdate [--check]        poll the update channel and apply per policy
+                              (--check: report the verdict, change nothing)
   rollback                    undo the last upgrade (code + database)
   backup                      take a manual backup without upgrading
   status | logs [n] | version
@@ -512,9 +541,10 @@ EOF
 }
 
 case "${1:-}" in
-  install)  shift; exec bash <(curl -fsSL "https://raw.githubusercontent.com/${DIST_REPO}/main/install.sh") "$@" ;;
-  upgrade)  shift; cmd_upgrade "$@" ;;
-  rollback) cmd_rollback ;;
+  install)    shift; exec bash <(curl -fsSL "https://raw.githubusercontent.com/${DIST_REPO}/main/install.sh") "$@" ;;
+  upgrade)    shift; cmd_upgrade "$@" ;;
+  autoupdate) shift; cmd_autoupdate "$@" ;;
+  rollback)   cmd_rollback ;;
   status)   cmd_status ;;
   logs)     shift || true; cmd_logs "${1:-200}" ;;
   version)  cmd_version ;;
