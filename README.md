@@ -27,6 +27,23 @@ to export — wipe the container and your data is still yours.
 One command on a clean Linux x64 box (Ubuntu 24.04 / Debian 12). You'll need a
 bot token from [@BotFather](https://t.me/BotFather) and your Telegram user id.
 
+**No box yet? One click:**
+
+[![Deploy to DigitalOcean](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/droplets/new?image=ubuntu-24-04-x64&size=s-2vcpu-4gb&region=fra1&refcode=6f9a0892dd0a&user_data=https%3A%2F%2Fraw.githubusercontent.com%2Ftry-agent-os%2Fagentos%2Fmain%2Fcloud-init.yaml)
+
+The button provisions an Ubuntu 24.04 droplet whose first boot
+([`cloud-init.yaml`](cloud-init.yaml)) installs Docker and stages `install.sh`
+at `/opt/agentos-bootstrap/` so you can read it before running. SSH in and
+finish with the one command the login banner shows:
+
+```bash
+bash /opt/agentos-bootstrap/install.sh --no-https --token <BOT_TOKEN> --admin <YOUR_TELEGRAM_ID>
+```
+
+Then DM your bot `/login` (admin-only) to connect Claude — no SSH needed for
+that. Secrets never ride the deploy URL: the token is supplied on your own
+terminal, not baked into the button.
+
 Docker (default), with HTTPS for the Mini App:
 
 ```bash
