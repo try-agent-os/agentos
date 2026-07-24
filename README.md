@@ -49,6 +49,11 @@ Then DM your bot `/login` (admin-only) to connect Claude — no SSH needed for
 that. Secrets never ride the deploy URL: the token is supplied on your own
 terminal, not baked into the button.
 
+No DigitalOcean account yet? Signing up through this badge supports the
+project:
+
+<a href="https://www.digitalocean.com/?refcode=6f9a0892dd0a&utm_campaign=Referral_Invite&utm_medium=Referral_Program&utm_source=badge"><img src="https://web-platforms.sfo2.cdn.digitaloceanspaces.com/WWW/Badge%201.svg" alt="DigitalOcean Referral Badge" /></a>
+
 Docker (default), with HTTPS for the Mini App:
 
 ```bash
