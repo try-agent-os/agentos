@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax (install.sh + agentos CLI)
+        run: |
+          bash -n install.sh
+          bash -n agentos
+
+      - name: cloud-init sanity (pure ASCII + valid YAML)
+        # cloud-init's YAML 1.1 parser rejects non-ASCII bytes and then
+        # silently skips runcmd — the deploy button "works" but installs
+        # nothing. Keep this file 7-bit ASCII forever.
+        run: |
+          pip install --quiet pyyaml
+          python3 - <<'PY'
+          import sys, yaml
+          data = open('cloud-init.yaml','rb').read()
+          bad = [i for i, b in enumerate(data) if b > 127]
+          if bad:
+              print(f"cloud-init.yaml: non-ASCII byte at offset {bad[0]}")
+              sys.exit(1)
+          yaml.safe_load(data)
+          print('cloud-init.yaml ok')
+          PY

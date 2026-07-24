@@ -9,6 +9,11 @@ working context. Read it with any editor, version it with git, back it up like
 any repo, move it to another box whenever you want. No vendor database, nothing
 to export — wipe the container and your data is still yours.
 
+Start the agent's repo from the default template:
+**[try-agent-os/claude-code-template](https://github.com/try-agent-os/claude-code-template)**
+— charter, skills, memory, and manifests, pre-structured the way the node
+expects them.
+
 ## What you get
 
 - **A Telegram-native agent** — message it like a person; it answers, does the
