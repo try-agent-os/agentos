@@ -11,8 +11,12 @@
 #   --tunnel-token <token>     HTTPS via a named Cloudflare tunnel. No open ports needed. (Docker mode.)
 #   --quick                    HTTPS via a throwaway trycloudflare hostname. Demo only. (Docker mode.)
 #   --no-https                 Bot only. No Mini App button (the bot itself is fully functional).
-#   --no-docker                Bare-metal systemd install, no Docker. Needs x86_64 + apt (Debian 12 /
-#                              Ubuntu 24.04). --tunnel-token/--quick are not supported in this mode yet
+#   --docker                   Run the node as a Docker container instead of the default systemd
+#                              service. Required for --tunnel-token/--quick/--channel/--image, and for
+#                              any host that is not x86_64 + apt. Implied by those flags.
+#   --no-docker                The DEFAULT (bare-metal systemd unit, no Docker daemon) — still accepted
+#                              so existing command lines keep working. Needs x86_64 + apt (Debian 12 /
+#                              Ubuntu 24.04); --tunnel-token/--quick are not supported in this mode yet
 #                              — use --domain or --no-https.
 #   --dir <path>               Install root. Default /opt/agentos.
 #   --channel <name>           Release channel to resolve. Default stable. (Docker mode.)
@@ -24,14 +28,16 @@
 # --no-https and it is a legitimate install. HTTPS buys exactly one thing:
 # Telegram will only open a Mini App on a public https origin (grabla #7).
 #
-# NOTHING IS BUILT HERE. The default (Docker) path resolves the release channel
-# to an image digest, pulls it, and extracts the compose run profile the image
-# carries. --no-docker instead resolves the channel's stable.json, downloads the
-# matching release tarball straight onto disk, and runs it under a systemd unit.
-# Either way: no git clone, no compiler, no toolchain on the target machine.
+# NOTHING IS BUILT HERE. The default (bare metal) path resolves the release
+# channel's stable.json, downloads the matching release tarball straight onto
+# disk, and runs it under a systemd unit — there is no docker daemon to install
+# first, which is also one less thing to race with a cloud VM's own first boot.
+# --docker instead resolves the channel to an image digest, pulls it, and
+# extracts the compose run profile the image carries. Either way: no git clone,
+# no compiler, no toolchain on the target machine.
 #
 # Re-running is safe: in docker mode the .env is preserved (flags override
-# individual keys); --no-docker rewrites .env from the current flags. The data
+# individual keys); bare metal rewrites .env from the current flags. The data
 # volume is untouched either way. To upgrade an existing install use `agentos upgrade`
 # (both modes install this CLI onto PATH) — it backs up the data first.
 
@@ -42,7 +48,7 @@ INSTALL_DIR="${AGENTOS_DIR:-/opt/agentos}"
 CHANNEL="${AGENTOS_CHANNEL:-stable}"
 IMAGE_REF="${AGENTOS_IMAGE:-}"   # set → skip channel resolution, pin exactly this
 COMPOSE_FILE="docker-compose.node.yml"
-INSTALL_MODE="docker"            # docker | systemd (--no-docker: bare metal)
+INSTALL_MODE=""                  # docker | systemd; empty → resolved after args (default: systemd)
 
 BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 ADMIN_IDS="${TELEGRAM_ADMIN_USER_IDS:-}"
@@ -70,15 +76,56 @@ while [ $# -gt 0 ]; do
     --tunnel-token) TUNNEL_TOKEN="${2:?--tunnel-token needs a value}"; HTTPS_MODE="cloudflared"; shift 2 ;;
     --quick)        HTTPS_MODE="quick"; shift ;;
     --no-https)     HTTPS_MODE="none"; shift ;;
+    --docker)       INSTALL_MODE="docker"; shift ;;
     --no-docker)    INSTALL_MODE="systemd"; shift ;;
     --dir)          INSTALL_DIR="${2:?--dir needs a value}"; shift 2 ;;
     --channel)      CHANNEL="${2:?--channel needs a value}"; shift 2 ;;
     --image)        IMAGE_REF="${2:?--image needs a value}"; shift 2 ;;
     -y|--yes)       ASSUME_YES=1; shift ;;
-    -h|--help)      sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              die "unknown option: $1 (try --help)" ;;
   esac
 done
+
+# ─── install mode ───────────────────────────────────────────────────────────
+#
+# Bare metal is the DEFAULT channel. Not a preference: on a box created a
+# minute ago the provider's own first boot still holds the dpkg lock, and
+# get.docker.com's internal apt-get does not wait for it — installing a docker
+# daemon first is a race the user did not sign up for. The systemd path needs
+# nothing but apt (which does wait, see install_systemd) plus a tarball.
+#
+# Docker remains a first-class channel: opt-in with --docker, and selected
+# automatically by the flags only the compose run profile can honour, so an
+# existing command line asking for a tunnel or a pinned image keeps working.
+#
+# A RE-RUN NEVER CHANGES CHANNEL BY ITSELF. Re-running the installer is
+# advertised as safe, and this flip must not turn that into "systemd unit
+# raised next to your running container": same port, same bot token, two
+# getUpdates consumers, one 409 loop. An existing docker install therefore
+# keeps docker unless --no-docker is passed explicitly.
+if [ -z "$INSTALL_MODE" ]; then
+  if [ -n "$TUNNEL_TOKEN" ] || [ "$HTTPS_MODE" = "quick" ] || \
+     [ -n "$IMAGE_REF" ] || [ "$CHANNEL" != "stable" ]; then
+    INSTALL_MODE="docker"
+    info "docker mode: --tunnel-token/--quick/--channel/--image are container-profile only"
+  elif [ -f "$INSTALL_DIR/$COMPOSE_FILE" ] || \
+       grep -qs '^AGENTOS_IMAGE=' "$INSTALL_DIR/.env"; then
+    INSTALL_MODE="docker"
+    info "existing Docker install in $INSTALL_DIR — staying on the container profile (--no-docker migrates)"
+  else
+    INSTALL_MODE="systemd"
+  fi
+fi
+
+# Answer "which channel would this command pick?" without touching the machine.
+# scripts/tests/install-mode.test.sh drives the whole matrix through it, and it
+# is a straight answer to give a user who is about to re-run the installer on a
+# node they inherited.
+if [ -n "${AGENTOS_PRINT_MODE:-}" ]; then
+  echo "$INSTALL_MODE"
+  exit 0
+fi
 
 ask() { # ask <prompt> <var-value> ; echoes the answer
   local prompt="$1" current="$2"
@@ -101,6 +148,37 @@ wait_healthz() {
     sleep 2
   done
   return 1
+}
+
+# A cloud VM handed over as "active" is usually STILL provisioning: cloud-init
+# runs its own apt-get while the user is already pasting the install command
+# (the DigitalOcean button gives them a shell within seconds). Any nested
+# apt-get then dies with exit 100, "Could not get lock
+# /var/lib/dpkg/lock-frontend ... held by process N (apt-get)" — the host is
+# fine, we just lost a race. install_systemd passes -o DPkg::Lock::Timeout
+# to the apt-get calls it owns; this drops the same timeout into apt's own
+# config so apt-get calls we do NOT own (get.docker.com's, above all) wait too.
+apt_wait_for_lock() {
+  [ -d /etc/apt/apt.conf.d ] || return 0
+  printf 'DPkg::Lock::Timeout "300";\n' \
+    | $SUDO tee /etc/apt/apt.conf.d/99-agentos-lock-timeout >/dev/null 2>&1 || true
+}
+
+# Belt to that suspenders: wait out the provider's first boot before touching
+# packages at all. Bounded, and a stuck cloud-init must not hang the install.
+wait_for_first_boot() {
+  command -v cloud-init >/dev/null 2>&1 || return 0
+  cloud-init status >/dev/null 2>&1 || return 0
+  case "$(cloud-init status 2>/dev/null)" in
+    *running*)
+      info "the machine is still on its first boot (cloud-init) — waiting for it"
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 300 cloud-init status --wait >/dev/null 2>&1 || true
+      else
+        cloud-init status --wait >/dev/null 2>&1 || true
+      fi
+      ;;
+  esac
 }
 
 # ─── --no-docker (bare metal / systemd) ────────────────────────────────────
@@ -142,9 +220,12 @@ install_systemd() {
   export DEBIAN_FRONTEND=noninteractive
   # DPkg::Lock::Timeout: on a fresh droplet's FIRST boot the provider agent
   # (cloud-init, unattended-upgrades) still holds the apt/dpkg lock — wait for
-  # it (up to 120s) instead of dying on "could not get lock".
-  $SUDO apt-get -o DPkg::Lock::Timeout=120 update -qq
-  $SUDO apt-get -o DPkg::Lock::Timeout=120 install -y -qq ffmpeg git tmux curl zstd jq ca-certificates
+  # it (up to 300s) instead of dying on "could not get lock". wait_for_first_boot
+  # gets us out of the busiest window first; the timeout covers the rest.
+  wait_for_first_boot
+  apt_wait_for_lock
+  $SUDO apt-get -o DPkg::Lock::Timeout=300 update -qq
+  $SUDO apt-get -o DPkg::Lock::Timeout=300 install -y -qq ffmpeg git tmux curl zstd jq ca-certificates
 
   step "Release"
   local manifest tag tarball sha node_ver url
@@ -294,9 +375,9 @@ fi
 if [ "$INSTALL_MODE" = "systemd" ]; then
   step "Bare-metal preflight"
   [ "$(uname -m)" = "x86_64" ] \
-    || die "--no-docker needs x86_64 (glibc floor: Debian 12 / Ubuntu 24.04) — this host reports $(uname -m). Use the Docker path instead (drop --no-docker)."
+    || die "the bare-metal node needs x86_64 (glibc floor: Debian 12 / Ubuntu 24.04) — this host reports $(uname -m). Re-run with --docker to use the container profile instead."
   command -v apt-get >/dev/null 2>&1 \
-    || die "--no-docker needs an apt-based distro (Debian 12 / Ubuntu 24.04) — apt-get was not found. Use the Docker path instead (drop --no-docker)."
+    || die "the bare-metal node needs an apt-based distro (Debian 12 / Ubuntu 24.04) — apt-get was not found. Re-run with --docker to use the container profile instead."
   ok "x86_64, apt-get present"
 
   step "Configuration"
@@ -369,8 +450,29 @@ if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; 
 else
   info "not found — installing from get.docker.com"
   command -v curl >/dev/null 2>&1 || $SUDO sh -c 'apt-get update -qq && apt-get install -y -qq curl' >/dev/null 2>&1 || true
-  curl -fsSL https://get.docker.com | $SUDO sh >/dev/null 2>&1 \
-    || die "docker install failed — install Docker Engine + the compose plugin manually, then re-run."
+  wait_for_first_boot
+  apt_wait_for_lock
+  # Three attempts, and the log is PRINTED on the last failure: swallowing it
+  # into /dev/null is how "docker install failed" used to reach the user with
+  # the actual line ("Could not get lock /var/lib/dpkg/lock-frontend") hidden.
+  docker_log="$(mktemp)"
+  docker_ok=0
+  for attempt in 1 2 3; do
+    if curl -fsSL https://get.docker.com | $SUDO sh >"$docker_log" 2>&1; then
+      docker_ok=1
+      break
+    fi
+    [ "$attempt" -lt 3 ] || break
+    info "attempt ${attempt} failed (the machine is likely still busy) — retrying in 20s"
+    sleep 20
+  done
+  if [ "$docker_ok" != "1" ]; then
+    warn "get.docker.com failed three times; its last output:"
+    tail -20 "$docker_log" >&2 || true
+    rm -f "$docker_log"
+    die "docker install failed — install Docker Engine + the compose plugin manually and re-run, or drop --docker to install the default bare-metal node (systemd, no daemon)."
+  fi
+  rm -f "$docker_log"
   docker compose version >/dev/null 2>&1 \
     || die "docker installed but 'docker compose' is missing — install the compose plugin, then re-run."
   $SUDO systemctl enable --now docker >/dev/null 2>&1 || true

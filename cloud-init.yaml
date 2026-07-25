@@ -1,9 +1,19 @@
 #cloud-config
-# AgentOS node -- cloud-init for the "Deploy to DigitalOcean" button in README,
-# and any other cloud provider that accepts cloud-init user_data.
+# AgentOS node -- cloud-init for any provider that actually delivers user_data
+# to the machine: a console with a user-data / cloud-init / "startup script"
+# field (Hetzner, Vultr, Linode), or an API call that carries it
+# (doctl compute droplet create --user-data-file cloud-init.yaml).
+#
+# NOT the README's DigitalOcean button. That button can only prefill the create
+# FORM (image, size, region); DigitalOcean's web form reads a startup script
+# from its own field or from the API, never from a URL in the query string, so a
+# droplet created by clicking it boots plain Ubuntu and the one install command
+# in the README is what finishes the job. Verified the hard way: a droplet made
+# from a ?user_data=<url> link reports zero bytes of user data
+# ("Skipping user-data validation. No user-data found." in /var/log/cloud-init.log).
 #
 # WHAT THIS FILE DOES (first boot, no secrets involved):
-#   1. Installs base packages and Docker Engine + the compose plugin.
+#   1. Installs the few base packages the installer wants (curl, jq, certs).
 #   2. Pre-stages the public AgentOS installer at
 #      /opt/agentos-bootstrap/install.sh so you can read it before you run it.
 #   3. Prints the one remaining command to /etc/motd.
@@ -18,11 +28,12 @@
 # secrets. cloud-init does every step that needs no secret; you supply the bot
 # token and your Telegram id on your own terminal, under your control.
 #
-# WHAT GETS INSTALLED: the installer resolves the "stable" release channel to an
-# exact prebuilt image (the AgentOS node -- a public, amd64-only OCI image) and
-# PULLS it. Nothing is compiled on this machine, and no private repository is
-# accessed. The installer also installs Docker itself if the step below was
-# skipped, so this file degrades safely if get.docker.com is briefly down.
+# WHAT GETS INSTALLED: by default the installer resolves the "stable" release
+# channel and unpacks the matching release tarball (amd64) under a systemd unit
+# -- there is NO Docker daemon in that path, which is why this file no longer
+# installs one. Nothing is compiled on this machine and no private repository is
+# accessed. Pass --docker to the staged installer instead if you want the
+# container profile; it installs Docker itself in that case.
 #
 # HTTPS is optional: the bot long-polls Telegram, so --no-https gives a fully
 # working bot behind NAT with no domain and no open ports. HTTPS (--domain
@@ -61,8 +72,9 @@ write_files:
        Prefer to read the installer first? It is already on disk:
          less /opt/agentos-bootstrap/install.sh
 
-       The command pulls the prebuilt AgentOS node image and starts
-       your Telegram bot. Nothing is compiled here.
+       The command downloads the prebuilt AgentOS node, runs it as a
+       systemd service (no Docker) and starts your Telegram bot.
+       Nothing is compiled here.
 
        Then connect Claude WITHOUT SSH: DM your bot and send
          /login
@@ -88,19 +100,14 @@ write_files:
       fi
 
 runcmd:
-  # 1. Docker Engine + compose plugin. The installer would do this itself if
-  #    missing, so every command here is guarded to be non-fatal: a transient
-  #    failure must not abort runcmd and leave the installer un-staged. The
-  #    real safety net is the installer's own get.docker.com step.
-  - sh -c 'curl -fsSL https://get.docker.com | sh' || true
-  - systemctl enable --now docker || true
-  # 2. Pre-stage the PUBLIC AgentOS installer (from the public distribution
-  #    repo, not the private source tree). It resolves the stable channel to an
-  #    image digest and pulls it. Staged locally so the user can inspect it
-  #    before running; the installer re-resolves the channel at run time, so a
-  #    slightly older copy of this script still installs the current release.
+  # 1. Pre-stage the PUBLIC AgentOS installer (from the public distribution
+  #    repo, not the private source tree). It resolves the stable channel and
+  #    unpacks the release tarball under a systemd unit. Staged locally so the
+  #    user can inspect it before running; the installer re-resolves the channel
+  #    at run time, so a slightly older copy of this file still installs the
+  #    current release.
   - mkdir -p /opt/agentos-bootstrap
   - curl -fsSL https://raw.githubusercontent.com/try-agent-os/agentos/main/install.sh -o /opt/agentos-bootstrap/install.sh || true
   - chmod +x /opt/agentos-bootstrap/install.sh || true
-  # 3. Surface the login hint even when the SSH client suppresses /etc/motd.
+  # 2. Surface the login hint even when the SSH client suppresses /etc/motd.
   - echo '[ -f /etc/profile.d/agentos-bootstrap.sh ] && . /etc/profile.d/agentos-bootstrap.sh' >> /root/.bashrc
