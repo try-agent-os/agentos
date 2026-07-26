@@ -6,7 +6,11 @@
 # Non-interactive (a client install, CI, or a re-run) — every answer has a flag:
 #
 #   --token <bot-token>        @BotFather token           (else: prompt, or $TELEGRAM_BOT_TOKEN)
-#   --admin <telegram-id>      auto-approved admin id     (else: prompt, or $TELEGRAM_ADMIN_USER_IDS)
+#   --admin <id|username>      Auto-approved admin: a numeric Telegram id (123510069) or a Telegram
+#                              username (vasily, or @vasily — the @ is optional). Comma-separate to
+#                              name several, in any mix. Omit it entirely and the node is UNCLAIMED:
+#                              the first person who DMs the bot becomes its admin — once, no time
+#                              limit. (Else: prompt, or $TELEGRAM_ADMIN_USER_IDS.)
 #   --domain <host>            HTTPS via Caddy + real certs. Needs an A record → this host, 80+443 open.
 #   --tunnel-token <token>     HTTPS via a named Cloudflare tunnel. No open ports needed. (Docker mode.)
 #   --quick                    HTTPS via a throwaway trycloudflare hostname. Demo only. (Docker mode.)
@@ -23,6 +27,13 @@
 #   --image <ref>              Pin an exact image (repo@sha256:...). Skips the channel. (Docker mode.)
 #   -y, --yes                  Never prompt; fail instead of asking.
 #
+# WHO IS ADMIN: an id is the durable form. A username is resolved to its numeric
+# id on that person's first private message and the id is canonical from then on,
+# because usernames are mutable and can be re-registered by someone else — so a
+# username is a first-contact convenience, not an identity. With no admin
+# configured at all the node is unclaimed and the first DM claims it, one shot
+# and no time window: message the bot yourself as soon as this finishes.
+#
 # WHAT NEEDS HTTPS AND WHAT DOES NOT: the bot long-polls Telegram, so it works
 # behind NAT with no domain, no certificate and no inbound port — that path is
 # --no-https and it is a legitimate install. HTTPS buys exactly one thing:
@@ -37,7 +48,9 @@
 # no compiler, no toolchain on the target machine.
 #
 # Re-running is safe: in docker mode the .env is preserved (flags override
-# individual keys); bare metal rewrites .env from the current flags. The data
+# individual keys); bare metal rewrites .env from the current flags, EXCEPT the
+# admin pair, which is inherited in both modes when no --admin is passed (a
+# forgotten flag must not strip the operator of their own admin rights). The data
 # volume is untouched either way. To upgrade an existing install use `agentos upgrade`
 # (both modes install this CLI onto PATH) — it backs up the data first.
 
@@ -51,7 +64,15 @@ COMPOSE_FILE="docker-compose.node.yml"
 INSTALL_MODE=""                  # docker | systemd; empty → resolved after args (default: systemd)
 
 BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-ADMIN_IDS="${TELEGRAM_ADMIN_USER_IDS:-}"
+# --admin's raw value: one comma list mixing numeric ids and usernames, split by
+# parse_admin (below) into the two keys the core reads. Both env vars keep
+# working as the defaults they are today; --admin replaces them wholesale.
+ADMIN_INPUT="${TELEGRAM_ADMIN_USER_IDS:-}"
+if [ -n "${TELEGRAM_ADMIN_USERNAMES:-}" ]; then
+  ADMIN_INPUT="${ADMIN_INPUT:+${ADMIN_INPUT},}${TELEGRAM_ADMIN_USERNAMES}"
+fi
+ADMIN_IDS=""         # → TELEGRAM_ADMIN_USER_IDS  (all-digit values)
+ADMIN_USERNAMES=""   # → TELEGRAM_ADMIN_USERNAMES (no leading @)
 DOMAIN=""
 TUNNEL_TOKEN=""
 HTTPS_MODE=""        # caddy | cloudflared | quick | none
@@ -71,7 +92,7 @@ die()   { echo -e "\n${RED}✗ $*${NC}\n" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --token)        BOT_TOKEN="${2:?--token needs a value}"; shift 2 ;;
-    --admin)        ADMIN_IDS="${2:?--admin needs a value}"; shift 2 ;;
+    --admin)        ADMIN_INPUT="${2:?--admin needs a value}"; shift 2 ;;
     --domain)       DOMAIN="${2:?--domain needs a value}"; HTTPS_MODE="caddy"; shift 2 ;;
     --tunnel-token) TUNNEL_TOKEN="${2:?--tunnel-token needs a value}"; HTTPS_MODE="cloudflared"; shift 2 ;;
     --quick)        HTTPS_MODE="quick"; shift ;;
@@ -82,7 +103,9 @@ while [ $# -gt 0 ]; do
     --channel)      CHANNEL="${2:?--channel needs a value}"; shift 2 ;;
     --image)        IMAGE_REF="${2:?--image needs a value}"; shift 2 ;;
     -y|--yes)       ASSUME_YES=1; shift ;;
-    -h|--help)      sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # Line range = the whole header block above (ends one line before
+    # `set -euo pipefail`). Grow the header, grow this range, or --help truncates.
+    -h|--help)      sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              die "unknown option: $1 (try --help)" ;;
   esac
 done
@@ -127,6 +150,116 @@ if [ -n "${AGENTOS_PRINT_MODE:-}" ]; then
   exit 0
 fi
 
+# ─── admin identity ─────────────────────────────────────────────────────────
+#
+# --admin takes numeric ids AND usernames, in any mix, comma separated:
+#
+#   --admin 123510069          → TELEGRAM_ADMIN_USER_IDS=123510069
+#   --admin @vasily            → TELEGRAM_ADMIN_USERNAMES=vasily
+#   --admin 123510069,vasily   → one value in each key
+#
+# Classification needs no network lookup and is never ambiguous: a Telegram
+# username is 5–32 characters, starts with a letter and then holds only letters,
+# digits and underscores ([A-Za-z][A-Za-z0-9_]{4,31}), so it can NEVER be all
+# digits. All digits ⇒ an id; anything else ⇒ a username, with one leading @
+# stripped because the core stores usernames without it. A value that is neither
+# stops the install right here: writing it through would produce a .env the core
+# silently ignores — i.e. a node with no admin, quietly claimable by whoever
+# messages the bot first.
+parse_admin() { # parse_admin <comma-list> — fills ADMIN_IDS + ADMIN_USERNAMES
+  local rest="$1" item given
+  ADMIN_IDS=""
+  ADMIN_USERNAMES=""
+  while [ -n "$rest" ]; do
+    item="${rest%%,*}"
+    if [ "$item" = "$rest" ]; then rest=""; else rest="${rest#*,}"; fi
+    # "--admin '123510069, vasily'" is a command line a human writes by hand —
+    # the spaces they typed around a comma must not make a value invalid.
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+    [ -n "$item" ] || continue
+    given="$item"
+    case "$item" in
+      *[!0-9]*)
+        item="${item#@}"   # exactly one leading @, and only in that position
+        printf '%s' "$item" | grep -qE '^[A-Za-z][A-Za-z0-9_]{4,31}$' || die \
+"--admin: \"${given}\" is neither of the two accepted forms.
+    numeric Telegram id    123510069         (DM @userinfobot to get yours)
+    Telegram username      vasily, @vasily   (5-32 chars, starts with a letter,
+                                              then letters/digits/underscore)"
+        case ",${ADMIN_USERNAMES}," in
+          *",${item},"*) ;;   # named twice (e.g. vasily and @vasily) — keep one
+          *) ADMIN_USERNAMES="${ADMIN_USERNAMES:+${ADMIN_USERNAMES},}${item}" ;;
+        esac
+        ;;
+      *)
+        case ",${ADMIN_IDS}," in
+          *",${item},"*) ;;
+          *) ADMIN_IDS="${ADMIN_IDS:+${ADMIN_IDS},}${item}" ;;
+        esac
+        ;;
+    esac
+  done
+}
+
+parse_admin "$ADMIN_INPUT"
+
+# THE ADMIN PAIR IS STICKY ACROSS RE-RUNS, IN BOTH CHANNELS. An admin is an
+# identity the operator established once — not a per-run switch — so a re-run
+# that simply forgets the flag must not strip them of their own rights (and, on
+# a node whose claim marker has not been set yet, hand the node to whoever DMs
+# the bot next). Docker mode always merged its .env; bare metal used to rewrite
+# it from flags, which silently emptied both keys. Now both inherit here.
+#
+# Only the admin pair is sticky. Every other key bare metal writes still comes
+# from the current flags (write_env_systemd rewrites the file) — that is the
+# documented behaviour and it stays.
+#
+# --admin (or its env default) remains an explicit, COMPLETE replacement of both
+# keys: nothing is inherited when a value was passed, so switching from a
+# username to an id cannot leave the username behind.
+ADMIN_INHERITED=0
+inherit_admin_from_dotenv() {
+  local envfile="$INSTALL_DIR/.env" content=""
+  [ -z "$ADMIN_INPUT" ] || return 0                       # flag/env wins outright
+  [ -z "${ADMIN_IDS}${ADMIN_USERNAMES}" ] || return 0     # already inherited
+  # The file is 0600 and owned by the service account: root reads it directly,
+  # `sudo install.sh` only through $SUDO — which is still unset the first time
+  # this runs (the hook below is deliberately reachable without root). Both
+  # attempts are best effort: an unreadable .env must never fail a run, least of
+  # all a --dir dry run by a normal user.
+  if [ -r "$envfile" ]; then
+    content="$(cat "$envfile" 2>/dev/null || true)"
+  elif [ -n "${SUDO:-}" ]; then
+    content="$($SUDO cat "$envfile" 2>/dev/null || true)"
+  fi
+  [ -n "$content" ] || return 0
+  # tail -1 mirrors set_env's append-last upsert: the last assignment wins.
+  ADMIN_IDS="$(printf '%s\n' "$content" | sed -n 's/^TELEGRAM_ADMIN_USER_IDS=//p' | tail -1)"
+  ADMIN_USERNAMES="$(printf '%s\n' "$content" | sed -n 's/^TELEGRAM_ADMIN_USERNAMES=//p' | tail -1)"
+  # Verbatim, deliberately: what is already in .env is the operator's, and a
+  # re-run is no place to start re-validating a file they may have edited by hand.
+  if [ -n "${ADMIN_IDS}${ADMIN_USERNAMES}" ]; then
+    ADMIN_INHERITED=1
+  fi
+}
+
+# First attempt, before the hook below, so what the hook prints is what the run
+# would actually use. Silent: the info line belongs in each channel's
+# Configuration step, which is where the second attempt (with $SUDO available)
+# happens.
+inherit_admin_from_dotenv
+
+# "Which admins would this command line configure?", answered without touching
+# the machine — the admin counterpart of AGENTOS_PRINT_MODE above, deliberately
+# a SEPARATE hook: that one's output is asserted line-for-line by
+# scripts/tests/install-mode.test.sh. Driven by scripts/tests/install-admin.test.sh.
+if [ -n "${AGENTOS_PRINT_ADMIN:-}" ]; then
+  echo "ids=${ADMIN_IDS}"
+  echo "usernames=${ADMIN_USERNAMES}"
+  exit 0
+fi
+
 ask() { # ask <prompt> <var-value> ; echoes the answer
   local prompt="$1" current="$2"
   if [ -n "$current" ]; then echo "$current"; return; fi
@@ -136,6 +269,21 @@ ask() { # ask <prompt> <var-value> ; echoes the answer
   local answer=""
   read -r -p "$(echo -e "  ${BOLD}${prompt}${NC}: ")" answer </dev/tty
   echo "$answer"
+}
+
+# The admin question, asked identically by both install channels. Sets
+# ADMIN_IDS/ADMIN_USERNAMES through parse_admin (so an id, a username, or a
+# mixed list all work), and says out loud what an empty answer now means —
+# leaving it empty is a real choice, not a "fill this in later" placeholder.
+ask_admin() {
+  local answer=""
+  info "Your numeric Telegram id (DM @userinfobot) or your username — vasily or @vasily."
+  info "Empty = this node stays UNCLAIMED and the first person who DMs the bot becomes"
+  info "its admin, once. Make that you: message the bot as soon as this finishes."
+  read -r -p "$(echo -e "  ${BOLD}Admin Telegram id or username${NC} ${DIM}(optional)${NC}: ")" answer </dev/tty || true
+  if [ -n "$answer" ]; then
+    parse_admin "$answer"
+  fi
 }
 
 # Shared by both install modes (scripts/agentos's own wait_healthz mirrors this
@@ -192,10 +340,15 @@ wait_for_first_boot() {
 write_env_systemd() {
   # 0600 from birth: the file carries the bot token, so no umask-default window.
   # ${tag} comes from the caller (install_systemd) via bash dynamic scoping.
+  # Every key here is (re)written from the current flags — that is this channel's
+  # documented re-run behaviour. The one exception is the admin pair: by the time
+  # this runs, inherit_admin_from_dotenv may have refilled it from the .env this
+  # call is about to overwrite, so a re-run without --admin keeps its admins.
   $SUDO install -m 600 /dev/null "$INSTALL_DIR/.env"
   $SUDO tee "$INSTALL_DIR/.env" >/dev/null <<EOF
 TELEGRAM_BOT_TOKEN=${BOT_TOKEN}
 TELEGRAM_ADMIN_USER_IDS=${ADMIN_IDS}
+TELEGRAM_ADMIN_USERNAMES=${ADMIN_USERNAMES}
 PORT=8787
 MINIAPP_PORT=8787
 # Loopback bind: only Caddy (443) faces the network; the origin stays private.
@@ -389,9 +542,15 @@ if [ "$INSTALL_MODE" = "systemd" ]; then
   echo "$BOT_TOKEN" | grep -qE '^[0-9]+:[A-Za-z0-9_-]+$' \
     || warn "that token does not look like a @BotFather token — continuing, but check it if the bot stays silent."
 
-  if [ -z "$ADMIN_IDS" ] && [ "$ASSUME_YES" != "1" ] && [ -t 0 ]; then
-    info "Your numeric Telegram id — DM @userinfobot to get it. Empty = approve yourself later with /start."
-    ADMIN_IDS="$(read -r -p "$(echo -e "  ${BOLD}Admin Telegram id${NC} ${DIM}(optional)${NC}: ")" a </dev/tty; echo "${a:-}")" || true
+  # Second attempt, now that $SUDO exists: on a re-run the install dir's .env is
+  # 0600 root/agentos, so under `sudo install.sh` the pre-hook attempt above read
+  # nothing. Whichever attempt won, the operator hears about it exactly once.
+  inherit_admin_from_dotenv
+  if [ "$ADMIN_INHERITED" = "1" ]; then
+    info "reusing the admin(s) from the existing .env — pass --admin to replace them"
+  fi
+  if [ -z "${ADMIN_IDS}${ADMIN_USERNAMES}" ] && [ "$ASSUME_YES" != "1" ] && [ -t 0 ]; then
+    ask_admin
   fi
 
   # --tunnel-token / --quick need cloudflared, which this task does not wire
@@ -427,7 +586,11 @@ if [ "$INSTALL_MODE" = "systemd" ]; then
 $(echo -e "${GREEN}${BOLD}AgentOS Node is running.${NC}")
 
   $(echo -e "${BOLD}Bot${NC}")        message it on Telegram — it is already polling.
-$(if [ -z "${ADMIN_IDS:-}" ]; then echo "               No admin id was set: send /start, then approve yourself."; fi)
+$(if [ -z "${ADMIN_IDS:-}${ADMIN_USERNAMES:-}" ]; then
+    echo "               No admin was configured, so this node is UNCLAIMED: the FIRST person"
+    echo "               who sends it a private message becomes its admin — once, no time limit."
+    echo "               Message it NOW, before anybody else does."
+  fi)
   $(echo -e "${BOLD}Mini App${NC}")   $(case "$HTTPS_MODE" in
       none) echo "not published (bot-only install). Add it: re-run with --domain <host>." ;;
       *)    echo "https://${DOMAIN}/app — open it from the bot's menu button or /app." ;;
@@ -586,12 +749,16 @@ fi
 echo "$BOT_TOKEN" | grep -qE '^[0-9]+:[A-Za-z0-9_-]+$' \
   || warn "that token does not look like a @BotFather token — continuing, but check it if the bot stays silent."
 
-if [ -z "$ADMIN_IDS" ] && [ -f .env ]; then
-  ADMIN_IDS="$(grep -E '^TELEGRAM_ADMIN_USER_IDS=' .env | cut -d= -f2- || true)"
+# Admin, on a re-run: inherited from $INSTALL_DIR/.env unless --admin (or its env
+# default) named one — see inherit_admin_from_dotenv above, which both channels
+# share. Second attempt for the same reason bare metal makes one: $SUDO only
+# exists from §0 onward, and this .env is 0600.
+inherit_admin_from_dotenv
+if [ "$ADMIN_INHERITED" = "1" ]; then
+  info "reusing the admin(s) from the existing .env — pass --admin to replace them"
 fi
-if [ -z "$ADMIN_IDS" ] && [ "$ASSUME_YES" != "1" ] && [ -t 0 ]; then
-  info "Your numeric Telegram id — DM @userinfobot to get it. Empty = approve yourself later with /start."
-  ADMIN_IDS="$(read -r -p "$(echo -e "  ${BOLD}Admin Telegram id${NC} ${DIM}(optional)${NC}: ")" a </dev/tty; echo "${a:-}")" || true
+if [ -z "${ADMIN_IDS}${ADMIN_USERNAMES}" ] && [ "$ASSUME_YES" != "1" ] && [ -t 0 ]; then
+  ask_admin
 fi
 
 # HTTPS mode: ask only if no flag decided it.
@@ -698,6 +865,10 @@ umask 077   # the bot token is in here
 set_env AGENTOS_IMAGE "$IMAGE_REF"
 set_env TELEGRAM_BOT_TOKEN "$BOT_TOKEN"
 set_env TELEGRAM_ADMIN_USER_IDS "${ADMIN_IDS:-}"
+# Written even when empty, exactly like the ids key above: an operator who moves
+# from a username to an id (or the other way) needs the key they abandoned to end
+# up empty, not to keep a stale value the core would still honour.
+set_env TELEGRAM_ADMIN_USERNAMES "${ADMIN_USERNAMES:-}"
 [ -n "$DOMAIN" ]       && set_env AGENTOS_DOMAIN "$DOMAIN"
 [ -n "$TUNNEL_TOKEN" ] && set_env CLOUDFLARE_TUNNEL_TOKEN "$TUNNEL_TOKEN"
 # --no-https (and quick before the tunnel resolves) leaves MINIAPP_URL empty. A
@@ -810,7 +981,11 @@ cat <<EOF
 $(echo -e "${GREEN}${BOLD}AgentOS Node is running.${NC}")
 
   $(echo -e "${BOLD}Bot${NC}")        message it on Telegram — it is already polling.
-$(if [ -z "${ADMIN_IDS:-}" ]; then echo "               No admin id was set: send /start, then approve yourself."; fi)
+$(if [ -z "${ADMIN_IDS:-}${ADMIN_USERNAMES:-}" ]; then
+    echo "               No admin was configured, so this node is UNCLAIMED: the FIRST person"
+    echo "               who sends it a private message becomes its admin — once, no time limit."
+    echo "               Message it NOW, before anybody else does."
+  fi)
   $(echo -e "${BOLD}Mini App${NC}")   $(case "$HTTPS_MODE" in
       none) echo "not published (bot-only install). Add it: re-run with --domain <host>." ;;
       *)    echo "${MINIAPP_URL:-<pending>} — open it from the bot's menu button or /app." ;;
