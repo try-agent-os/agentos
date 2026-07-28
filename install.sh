@@ -22,10 +22,24 @@
 #                              so existing command lines keep working. Needs x86_64 + apt (Debian 12 /
 #                              Ubuntu 24.04); --tunnel-token/--quick are not supported in this mode yet
 #                              — use --domain or --no-https.
-#   --dir <path>               Install root. Default /opt/agentos.
+#   --dir <path>               Install root. Default /opt/<user>.
+#   --user <name>              Unix service account to run the node as. Default agentos. Everything
+#                              else keys off it, so a second instance on the same host is just a
+#                              second --user: install root /opt/<user>, unit agentos-<user>.service,
+#                              CLI /usr/local/bin/agentos-<user>. Pair it with --port. (systemd mode.)
+#   --port <n>                 Loopback port for the node + Mini App origin. Default 8787. Two
+#                              instances on one host need two ports. (systemd mode.)
 #   --channel <name>           Release channel to resolve. Default stable. (Docker mode.)
 #   --image <ref>              Pin an exact image (repo@sha256:...). Skips the channel. (Docker mode.)
 #   -y, --yes                  Never prompt; fail instead of asking.
+#
+# TWO NODES ON ONE HOST: same install, twice, with a different --user/--port and
+# its own .env — that is the whole story. Nothing is shared between instances
+# except the machine: separate service account, separate install root (its $HOME,
+# so separate ~/.ssh deploy key and ~/.claude state), separate data dir, separate
+# unit, separate auto-update timer, separate CLI entry point. The default install
+# is unchanged down to the last path — `agentos`, /opt/agentos, agentos.service —
+# so an existing single-node box sees no rename.
 #
 # WHO IS ADMIN: an id is the durable form. A username is resolved to its numeric
 # id on that person's first private message and the id is canonical from then on,
@@ -57,7 +71,12 @@
 set -euo pipefail
 
 IMAGE_REPO="${AGENTOS_IMAGE_REPO:-ghcr.io/try-agent-os/agentos-core}"
-INSTALL_DIR="${AGENTOS_DIR:-/opt/agentos}"
+SERVICE_USER="${AGENTOS_USER:-agentos}"
+# Empty → resolved from SERVICE_USER after args (/opt/<user>), so --user alone is
+# enough to move the whole install. An explicit --dir/$AGENTOS_DIR still wins.
+INSTALL_DIR="${AGENTOS_DIR:-}"
+SERVICE_NAME=""                  # resolved after args: agentos | agentos-<user>
+PORT="${AGENTOS_PORT:-8787}"
 CHANNEL="${AGENTOS_CHANNEL:-stable}"
 IMAGE_REF="${AGENTOS_IMAGE:-}"   # set → skip channel resolution, pin exactly this
 COMPOSE_FILE="docker-compose.node.yml"
@@ -100,15 +119,45 @@ while [ $# -gt 0 ]; do
     --docker)       INSTALL_MODE="docker"; shift ;;
     --no-docker)    INSTALL_MODE="systemd"; shift ;;
     --dir)          INSTALL_DIR="${2:?--dir needs a value}"; shift 2 ;;
+    --user)         SERVICE_USER="${2:?--user needs a value}"; shift 2 ;;
+    --port)         PORT="${2:?--port needs a value}"; shift 2 ;;
     --channel)      CHANNEL="${2:?--channel needs a value}"; shift 2 ;;
     --image)        IMAGE_REF="${2:?--image needs a value}"; shift 2 ;;
     -y|--yes)       ASSUME_YES=1; shift ;;
     # Line range = the whole header block above (ends one line before
     # `set -euo pipefail`). Grow the header, grow this range, or --help truncates.
-    -h|--help)      sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              die "unknown option: $1 (try --help)" ;;
   esac
 done
+
+# ─── instance identity: user → install root, unit name, CLI name ────────────
+#
+# One knob. A second node on the same host is the same install run again with a
+# different --user (and --port), each with its own .env — there is no instance
+# registry, no templating, nothing to keep in sync. Everything derives here so
+# no later step has to re-decide it.
+#
+# The default user reproduces the historical layout EXACTLY (/opt/agentos,
+# agentos.service, /usr/local/bin/agentos): a box installed before this flag
+# existed must not see a rename on its next re-run.
+case "$SERVICE_USER" in
+  ''|*[!a-z0-9_-]*|[!a-z_]*)
+    die "--user: expected a lowercase unix account name ([a-z_][a-z0-9_-]*), got '${SERVICE_USER}'" ;;
+esac
+case "$PORT" in
+  ''|*[!0-9]*) die "--port: expected a number, got '${PORT}'" ;;
+esac
+
+[ -n "$INSTALL_DIR" ] || INSTALL_DIR="/opt/${SERVICE_USER}"
+if [ "$SERVICE_USER" = "agentos" ]; then
+  SERVICE_NAME="agentos"
+else
+  # Always prefixed, never doubled: --user symoditi and --user agentos-symoditi
+  # both land on agentos-symoditi.service, so the unit is findable by `systemctl
+  # list-units 'agentos*'` no matter which spelling the operator picked.
+  SERVICE_NAME="agentos-${SERVICE_USER#agentos-}"
+fi
 
 # ─── install mode ───────────────────────────────────────────────────────────
 #
@@ -147,6 +196,22 @@ fi
 # node they inherited.
 if [ -n "${AGENTOS_PRINT_MODE:-}" ]; then
   echo "$INSTALL_MODE"
+  exit 0
+fi
+
+# Multi-instance is a bare-metal capability today. Docker mode keys everything —
+# project name, volume, published port — off one compose file per host, so
+# honouring --user there would need a second compose project, not a second flag.
+# Fail loudly instead of installing something that quietly collides.
+if [ "$INSTALL_MODE" = "docker" ] && { [ "$SERVICE_USER" != "agentos" ] || [ "$PORT" != "8787" ]; }; then
+  die "--user/--port are systemd-mode only today — drop --docker, or run the second instance bare metal"
+fi
+
+# "Where would this command line install to?" — answered without touching the
+# machine, same contract as AGENTOS_PRINT_MODE above.
+# scripts/tests/install-identity.test.sh drives the matrix through it.
+if [ -n "${AGENTOS_PRINT_IDENTITY:-}" ]; then
+  echo "${SERVICE_USER}|${INSTALL_DIR}|${SERVICE_NAME}|${PORT}"
   exit 0
 fi
 
@@ -292,7 +357,7 @@ ask_admin() {
 # this addition, on purpose.
 wait_healthz() {
   for _ in $(seq 1 45); do
-    curl -fsS --max-time 3 "http://127.0.0.1:8787/healthz" >/dev/null 2>&1 && return 0
+    curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1 && return 0
     sleep 2
   done
   return 1
@@ -349,8 +414,8 @@ write_env_systemd() {
 TELEGRAM_BOT_TOKEN=${BOT_TOKEN}
 TELEGRAM_ADMIN_USER_IDS=${ADMIN_IDS}
 TELEGRAM_ADMIN_USERNAMES=${ADMIN_USERNAMES}
-PORT=8787
-MINIAPP_PORT=8787
+PORT=${PORT}
+MINIAPP_PORT=${PORT}
 # Loopback bind: only Caddy (443) faces the network; the origin stays private.
 HOST=127.0.0.1
 AGENTOS_VERSION=${tag}
@@ -395,7 +460,8 @@ install_systemd() {
   step "Service user + layout"
   # $HOME must live inside the writable install root (ProtectSystem=strict in
   # the unit): ~/.claude and ~/.ssh break under a custom --dir otherwise.
-  id agentos >/dev/null 2>&1 || $SUDO useradd -r -m -d "$INSTALL_DIR" -s /usr/sbin/nologin agentos
+  id "$SERVICE_USER" >/dev/null 2>&1 || \
+    $SUDO useradd -r -m -d "$INSTALL_DIR" -s /usr/sbin/nologin "$SERVICE_USER"
   $SUDO mkdir -p "$INSTALL_DIR"/{versions,data,backups}
 
   step "Node ${node_ver} (vendored)"
@@ -442,11 +508,18 @@ install_systemd() {
   # service account's $HOME (useradd -r -m), which can be 0700 — under sudo
   # (not already root), plain `sed` as the invoking user would fail to even
   # open the template before `tee` ever runs.
-  $SUDO sed "s|/opt/agentos|${INSTALL_DIR}|g" "$INSTALL_DIR/current/profiles/agentos.service" \
-    | $SUDO tee /etc/systemd/system/agentos.service >/dev/null
-  $SUDO chown -R agentos:agentos "$INSTALL_DIR"
+  # User=/Group= are substituted on their own anchored lines, AFTER the path
+  # rewrite: the account name is a substring of every install path, so a global
+  # s|agentos|<user>| would corrupt them. Anchored ^User= can only ever hit the
+  # two lines it is meant to.
+  $SUDO sed -e "s|/opt/agentos|${INSTALL_DIR}|g" \
+            -e "s|^User=agentos$|User=${SERVICE_USER}|" \
+            -e "s|^Group=agentos$|Group=${SERVICE_USER}|" \
+            "$INSTALL_DIR/current/profiles/agentos.service" \
+    | $SUDO tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null
+  $SUDO chown -R "${SERVICE_USER}:${SERVICE_USER}" "$INSTALL_DIR"
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable --now agentos
+  $SUDO systemctl enable --now "$SERVICE_NAME"
 
   if [ "$HTTPS_MODE" = "caddy" ]; then
     step "HTTPS (Caddy)"
@@ -455,21 +528,41 @@ install_systemd() {
     # env-substitution placeholder and the docker-network upstream hostname
     # swapped for what a bare-metal box actually has: a known domain and the
     # node listening on loopback.
+    # /etc/caddy/Caddyfile is one file per host: a second instance would
+    # overwrite the first instance's vhost instead of adding to it. Until this
+    # renders a per-instance snippet, only the default install may claim it.
+    [ "$SERVICE_NAME" = "agentos" ] || \
+      die "--domain writes the single /etc/caddy/Caddyfile — a second instance would clobber the first. Use --no-https here and put this instance behind your own vhost on 127.0.0.1:${PORT}"
     $SUDO apt-get -o DPkg::Lock::Timeout=120 install -y -qq caddy
     # Same $SUDO-on-the-read reasoning as the unit render above: this template
-    # also lives under $INSTALL_DIR (the agentos account's $HOME).
-    $SUDO sed -e "s/{\$AGENTOS_DOMAIN}/${DOMAIN}/" -e "s/node:8787/127.0.0.1:8787/" \
+    # also lives under $INSTALL_DIR (the service account's $HOME).
+    $SUDO sed -e "s/{\$AGENTOS_DOMAIN}/${DOMAIN}/" -e "s/node:8787/127.0.0.1:${PORT}/" \
       "$INSTALL_DIR/current/profiles/docker/Caddyfile" | $SUDO tee /etc/caddy/Caddyfile >/dev/null
     $SUDO systemctl reload caddy 2>/dev/null || $SUDO systemctl restart caddy
-    ok "caddy → https://${DOMAIN} (127.0.0.1:8787)"
+    ok "caddy → https://${DOMAIN} (127.0.0.1:${PORT})"
   fi
 
   step "Health"
-  wait_healthz || { $SUDO journalctl -u agentos -n 50 --no-pager; die "node did not become healthy"; }
+  wait_healthz || { $SUDO journalctl -u "$SERVICE_NAME" -n 50 --no-pager; die "node did not become healthy"; }
   ok "node is healthy"
 
-  $SUDO ln -sfn "$INSTALL_DIR/current/profiles/agentos" /usr/local/bin/agentos
-  ok "agentos CLI → /usr/local/bin/agentos"
+  # The CLI needs to know WHICH install it operates on. For the default node
+  # that is its own built-in default, so it stays the plain symlink it has
+  # always been; a named instance gets a two-line wrapper that pins the three
+  # coordinates (root, unit, port) before exec'ing the very same script.
+  if [ "$SERVICE_NAME" = "agentos" ]; then
+    $SUDO ln -sfn "$INSTALL_DIR/current/profiles/agentos" /usr/local/bin/agentos
+  else
+    $SUDO tee "/usr/local/bin/${SERVICE_NAME}" >/dev/null <<EOF
+#!/bin/sh
+# AgentOS CLI for the '${SERVICE_USER}' instance — written by install.sh.
+AGENTOS_DIR=${INSTALL_DIR} AGENTOS_SERVICE=${SERVICE_NAME} \\
+AGENTOS_USER=${SERVICE_USER} AGENTOS_PORT=${PORT} \\
+  exec ${INSTALL_DIR}/current/profiles/agentos "\$@"
+EOF
+    $SUDO chmod 755 "/usr/local/bin/${SERVICE_NAME}"
+  fi
+  ok "agentos CLI → /usr/local/bin/${SERVICE_NAME}"
 
   install_autoupdate_timer "$INSTALL_DIR/current/profiles"
 }
@@ -488,21 +581,30 @@ install_autoupdate_timer() { # install_autoupdate_timer <profiles-dir>
     return 0
   fi
   [ -f "$pdir/agentos-autoupdate.service" ] || { warn "auto-update units missing from $pdir — skipping timer."; return 0; }
-  $SUDO sed "s|/opt/agentos|${INSTALL_DIR}|g" "$pdir/agentos-autoupdate.service" \
-    | $SUDO tee /etc/systemd/system/agentos-autoupdate.service >/dev/null
-  $SUDO cp "$pdir/agentos-autoupdate.timer" /etc/systemd/system/agentos-autoupdate.timer
+  # Per instance, like the service itself: its own poller unit, its own timer,
+  # its own policy drop-in. ExecStart is retargeted at THIS instance's CLI entry
+  # point, which is what carries the root/unit/port coordinates.
+  local au="${SERVICE_NAME}-autoupdate"
+  $SUDO sed -e "s|/opt/agentos|${INSTALL_DIR}|g" \
+            -e "s|^ExecStart=/usr/local/bin/agentos |ExecStart=/usr/local/bin/${SERVICE_NAME} |" \
+            "$pdir/agentos-autoupdate.service" \
+    | $SUDO tee "/etc/systemd/system/${au}.service" >/dev/null
+  # The timer names the unit it fires, so it is rendered too, never copied.
+  $SUDO sed -e "s|^Unit=agentos-autoupdate.service$|Unit=${au}.service|" \
+            "$pdir/agentos-autoupdate.timer" \
+    | $SUDO tee "/etc/systemd/system/${au}.timer" >/dev/null
   # The operator's auto-apply appetite, when they set one. Default lives in the
   # unit (patch): patch/security land unattended, minor/major wait for a button.
   if [ -n "${AGENTOS_AUTOUPDATE_POLICY:-}" ]; then
-    $SUDO mkdir -p /etc/systemd/system/agentos-autoupdate.service.d
+    $SUDO mkdir -p "/etc/systemd/system/${au}.service.d"
     printf '[Service]\nEnvironment=AGENTOS_AUTOUPDATE_POLICY=%s\n' "${AGENTOS_AUTOUPDATE_POLICY}" \
-      | $SUDO tee /etc/systemd/system/agentos-autoupdate.service.d/policy.conf >/dev/null
+      | $SUDO tee "/etc/systemd/system/${au}.service.d/policy.conf" >/dev/null
   fi
   $SUDO systemctl daemon-reload
-  if $SUDO systemctl enable --now agentos-autoupdate.timer >/dev/null 2>&1; then
+  if $SUDO systemctl enable --now "${au}.timer" >/dev/null 2>&1; then
     ok "auto-update timer armed (policy=${AGENTOS_AUTOUPDATE_POLICY:-patch})"
   else
-    warn "could not enable agentos-autoupdate.timer — arm it with: systemctl enable --now agentos-autoupdate.timer"
+    warn "could not enable ${au}.timer — arm it with: systemctl enable --now ${au}.timer"
   fi
 }
 
@@ -595,11 +697,11 @@ $(if [ -z "${ADMIN_IDS:-}${ADMIN_USERNAMES:-}" ]; then
       none) echo "not published (bot-only install). Add it: re-run with --domain <host>." ;;
       *)    echo "https://${DOMAIN}/app — open it from the bot's menu button or /app." ;;
     esac)
-  $(echo -e "${BOLD}Install${NC}")    $INSTALL_DIR
+  $(echo -e "${BOLD}Install${NC}")    $INSTALL_DIR ($SERVICE_USER, 127.0.0.1:$PORT)
 
-  logs      journalctl -u agentos -f
-  status    systemctl status agentos
-  cli       agentos status | logs [n] | version | upgrade [--to <tag>] | rollback | backup
+  logs      journalctl -u $SERVICE_NAME -f
+  status    systemctl status $SERVICE_NAME
+  cli       $SERVICE_NAME status | logs [n] | version | upgrade [--to <tag>] | rollback | backup
 
 EOF
   exit 0

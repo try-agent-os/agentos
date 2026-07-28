@@ -15,6 +15,11 @@
 set -euo pipefail
 
 AGENTOS_HOME="${AGENTOS_DIR:-/opt/agentos}"
+# Which install this invocation operates on. install.sh writes a tiny wrapper
+# per named instance (--user) that pins these three; the default node needs no
+# wrapper because these defaults ARE its layout.
+AGENTOS_SERVICE="${AGENTOS_SERVICE:-agentos}"
+AGENTOS_ACCOUNT="${AGENTOS_USER:-agentos}"
 DIST_REPO="try-agent-os/agentos"
 # shellcheck disable=SC2034  # kept for parity with install.sh/resolve-image.sh
 # and reserved for later use (systemd mode, and a future manifest-trust check
@@ -305,7 +310,7 @@ systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores 
   # "<dir>/." carries the snapshot dir's OWN ownership onto data/ itself — the
   # rolled-back User=agentos node would then hit SQLITE_READONLY_DIRECTORY and
   # never start. Give the whole data dir back to the service account.
-  chown -R agentos:agentos "$AGENTOS_HOME/data"
+  chown -R "$AGENTOS_ACCOUNT:$AGENTOS_ACCOUNT" "$AGENTOS_HOME/data"
   ok "restored $(basename "$src")"
 }
 
@@ -383,10 +388,10 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   # install root on first install; mirror that for every version this CLI
   # materializes, BEFORE `current` ever points at it. Unconditional on
   # purpose: it also repairs a pre-existing root-owned dir from an older CLI.
-  chown -R agentos:agentos "$AGENTOS_HOME/versions/$tag"
+  chown -R "$AGENTOS_ACCOUNT:$AGENTOS_ACCOUNT" "$AGENTOS_HOME/versions/$tag"
 
   step "Upgrading $prev → $tag"
-  systemctl stop agentos
+  systemctl stop "$AGENTOS_SERVICE"
   snap="$(systemd_backup_sqlite "$prev" | tail -1)"   # consistent copy: the unit is stopped
   [ -n "$snap" ] && echo "$snap" > "$BACKUP_DIR/.last-upgrade"   # pairs snapshot + code tag atomically, before the swap
   ln -sfn "$AGENTOS_HOME/versions/$tag" "$AGENTOS_HOME/current"
@@ -394,7 +399,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   # rollback below as a failed healthz — a bare call here would abort under
   # set -e with the node down and no rollback.
   started=0
-  if systemctl start agentos; then started=1; fi
+  if systemctl start "$AGENTOS_SERVICE"; then started=1; fi
 
   if [ "$started" = 1 ] && wait_healthz; then
     ok "upgraded: $prev → $tag"
@@ -403,14 +408,14 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     if uses_managed_postgres; then
       echo "new version unhealthy" >&2
       docker_managed_postgres_warning "$prev"
-      die "refusing an unsafe automatic rollback in managed-PostgreSQL mode; inspect: journalctl -u agentos"
+      die "refusing an unsafe automatic rollback in managed-PostgreSQL mode; inspect: journalctl -u $AGENTOS_SERVICE"
     fi
     echo "unhealthy — rolling back to $prev (code + database)" >&2
-    systemctl stop agentos
+    systemctl stop "$AGENTOS_SERVICE"
     systemd_restore_sqlite "$snap"
     ln -sfn "$AGENTOS_HOME/versions/$prev" "$AGENTOS_HOME/current"
-    systemctl start agentos || true   # a failed activation IS a failed healthz below
-    wait_healthz || die "rollback ALSO unhealthy — inspect: journalctl -u agentos"
+    systemctl start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
+    wait_healthz || die "rollback ALSO unhealthy — inspect: journalctl -u $AGENTOS_SERVICE"
     die "upgrade to $tag failed; $prev restored"
   fi
 }
@@ -426,14 +431,14 @@ systemd_rollback() { # undo the last recorded upgrade — code + database togeth
   [ -n "$prev" ] || die "backup dir $src has no recorded version (corrupt snapshot)"
   [ -d "$AGENTOS_HOME/versions/$prev" ] || die "version dir gone: $AGENTOS_HOME/versions/$prev"
   step "Rolling back to $prev"
-  systemctl stop agentos
+  systemctl stop "$AGENTOS_SERVICE"
   systemd_restore_sqlite "$src"
   ln -sfn "$AGENTOS_HOME/versions/$prev" "$AGENTOS_HOME/current"
-  systemctl start agentos || true   # a failed activation IS a failed healthz below
+  systemctl start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
   if wait_healthz; then
     ok "rolled back to $prev and healthy"
   else
-    journalctl -u agentos -n 30 --no-pager || true
+    journalctl -u "$AGENTOS_SERVICE" -n 30 --no-pager || true
     die "still unhealthy after rollback — the pre-upgrade snapshot is at $src."
   fi
 }
@@ -441,11 +446,11 @@ systemd_rollback() { # undo the last recorded upgrade — code + database togeth
 systemd_backup() { # manual, standalone backup — leaves the unit running afterward; NEVER touches .last-upgrade
   local tag out
   tag="$(basename "$(readlink "$AGENTOS_HOME/current")")"
-  systemctl stop agentos
+  systemctl stop "$AGENTOS_SERVICE"
   out="$(systemd_backup_sqlite "$tag" | tail -1)"
-  systemctl start agentos || true   # a failed activation IS a failed healthz below
+  systemctl start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
   if ! wait_healthz; then
-    journalctl -u agentos -n 30 --no-pager || true
+    journalctl -u "$AGENTOS_SERVICE" -n 30 --no-pager || true
     die "node did not come back healthy after the backup stop/start cycle."
   fi
   if [ -n "$out" ]; then
@@ -467,7 +472,7 @@ cmd_version() {
 
 cmd_status() {
   case "$(detect_mode)" in
-    systemd) systemctl status agentos --no-pager ;;
+    systemd) systemctl status "$AGENTOS_SERVICE" --no-pager ;;
     docker)  (cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" ps) ;;
     none)    die "no install found under $AGENTOS_HOME" ;;
   esac
@@ -475,7 +480,7 @@ cmd_status() {
 
 cmd_logs() {
   case "$(detect_mode)" in
-    systemd) journalctl -u agentos -n "${1:-200}" --no-pager ;;
+    systemd) journalctl -u "$AGENTOS_SERVICE" -n "${1:-200}" --no-pager ;;
     docker)  (cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" logs --tail "${1:-200}") ;;
     none)    die "no install found under $AGENTOS_HOME" ;;
   esac
