@@ -353,6 +353,20 @@ prune_versions() { # keep current + 2 previous version dirs under versions/ — 
 # new version rolls back CODE AND DATABASE TOGETHER — a code-only rollback
 # would leave the node unable to boot at all.
 
+# Keep .env's AGENTOS_VERSION honest about which code is actually live. It is
+# informational (the symlink is the source of truth), but a stale value shows up
+# in support output and in a re-run of install.sh, so a version swap updates it.
+# Absent key => nothing to do; this never CREATES the key.
+set_env_version() { # set_env_version <tag>
+  local tag="$1" env_file="$AGENTOS_HOME/.env"
+  [ -f "$env_file" ] || return 0
+  grep -q '^AGENTOS_VERSION=' "$env_file" || return 0
+  local tmp; tmp="$(mktemp)"
+  sed "s|^AGENTOS_VERSION=.*|AGENTOS_VERSION=${tag}|" "$env_file" > "$tmp"
+  cat "$tmp" > "$env_file"   # preserve the original file's owner/mode (0600)
+  rm -f "$tmp"
+}
+
 systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   local to="${1:-}" manifest tag tarball sha url prev tmp_dir snap started
   if [ -n "$to" ]; then
@@ -402,6 +416,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   if systemctl start "$AGENTOS_SERVICE"; then started=1; fi
 
   if [ "$started" = 1 ] && wait_healthz; then
+    set_env_version "$tag"
     ok "upgraded: $prev → $tag"
     prune_versions
   else
@@ -414,6 +429,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     systemctl stop "$AGENTOS_SERVICE"
     systemd_restore_sqlite "$snap"
     ln -sfn "$AGENTOS_HOME/versions/$prev" "$AGENTOS_HOME/current"
+    set_env_version "$prev"
     systemctl start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
     wait_healthz || die "rollback ALSO unhealthy — inspect: journalctl -u $AGENTOS_SERVICE"
     die "upgrade to $tag failed; $prev restored"
@@ -434,6 +450,7 @@ systemd_rollback() { # undo the last recorded upgrade — code + database togeth
   systemctl stop "$AGENTOS_SERVICE"
   systemd_restore_sqlite "$src"
   ln -sfn "$AGENTOS_HOME/versions/$prev" "$AGENTOS_HOME/current"
+  set_env_version "$prev"
   systemctl start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
   if wait_healthz; then
     ok "rolled back to $prev and healthy"

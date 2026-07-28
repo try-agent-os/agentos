@@ -31,6 +31,11 @@
 #                              instances on one host need two ports. (systemd mode.)
 #   --channel <name>           Release channel to resolve. Default stable. (Docker mode.)
 #   --image <ref>              Pin an exact image (repo@sha256:...). Skips the channel. (Docker mode.)
+#   --upgrade                  Re-running over an existing install? By default the installed version
+#                              is KEPT (config is refreshed, the version is not moved) — moving it
+#                              belongs to `agentos upgrade`, which backs up the database first and
+#                              can roll back. Pass --upgrade to follow the channel; the version
+#                              change is then performed BY that CLI, backup and all.
 #   -y, --yes                  Never prompt; fail instead of asking.
 #
 # TWO NODES ON ONE HOST: same install, twice, with a different --user/--port and
@@ -79,6 +84,7 @@ SERVICE_NAME=""                  # resolved after args: agentos | agentos-<user>
 PORT="${AGENTOS_PORT:-8787}"
 CHANNEL="${AGENTOS_CHANNEL:-stable}"
 IMAGE_REF="${AGENTOS_IMAGE:-}"   # set → skip channel resolution, pin exactly this
+ALLOW_UPGRADE=0                  # re-run over an existing install: follow the channel? (#106)
 COMPOSE_FILE="docker-compose.node.yml"
 INSTALL_MODE=""                  # docker | systemd; empty → resolved after args (default: systemd)
 
@@ -122,6 +128,7 @@ while [ $# -gt 0 ]; do
     --user)         SERVICE_USER="${2:?--user needs a value}"; shift 2 ;;
     --port)         PORT="${2:?--port needs a value}"; shift 2 ;;
     --channel)      CHANNEL="${2:?--channel needs a value}"; shift 2 ;;
+    --upgrade)      ALLOW_UPGRADE=1; shift ;;
     --image)        IMAGE_REF="${2:?--image needs a value}"; shift 2 ;;
     -y|--yes)       ASSUME_YES=1; shift ;;
     # Line range = the whole header block above (ends one line before
@@ -196,6 +203,28 @@ fi
 # node they inherited.
 if [ -n "${AGENTOS_PRINT_MODE:-}" ]; then
   echo "$INSTALL_MODE"
+  exit 0
+fi
+
+# What a run should do about VERSIONS, as a pure function of (channel, what is
+# already installed, --upgrade). Kept separate from the install path so the rule
+# is testable without root, network or a box: see scripts/tests/install-upgrade.test.sh.
+#
+# The rule (#106): a re-run over an existing install refreshes config but never
+# moves the version on its own. Moving versions belongs to `agentos upgrade`,
+# which snapshots the database first and leaves a rollback pointer; this script
+# does neither, so following the channel silently would run new migrations on
+# live data with no way back.
+version_decision() { # version_decision <channel-tag> <installed-tag> <allow-upgrade> → install|keep|upgrade
+  local channel="$1" installed="$2" allow="$3"
+  if [ -z "$installed" ]; then printf 'install %s\n' "$channel"; return 0; fi
+  if [ "$installed" = "$channel" ]; then printf 'install %s\n' "$channel"; return 0; fi
+  if [ "$allow" = "1" ]; then printf 'upgrade %s %s\n' "$installed" "$channel"; return 0; fi
+  printf 'keep %s\n' "$installed"
+}
+
+if [ -n "${AGENTOS_PRINT_VERSION_DECISION:-}" ]; then
+  version_decision "${AGENTOS_TEST_CHANNEL_TAG:-}" "${AGENTOS_TEST_INSTALLED_TAG:-}" "$ALLOW_UPGRADE"
   exit 0
 fi
 
@@ -457,6 +486,31 @@ install_systemd() {
   url="https://github.com/try-agent-os/agentos/releases/download/${tag}/${tarball}"
   ok "channel stable → ${tag}"
 
+  # A re-run over an EXISTING install must not move versions behind the
+  # operator's back. `agentos upgrade` snapshots the database first and records
+  # a rollback pointer; this script does neither, so silently following the
+  # channel here would run new migrations on live data with no way back
+  # (issue #106 — observed on a live node: a config-only re-run took it from
+  # v2.3.0 to v2.4.0 with no backup). Config is still refreshed either way;
+  # only the version is pinned.
+  local installed="" deferred_upgrade="" decision=""
+  if [ -L "$INSTALL_DIR/current" ]; then
+    installed="$(basename "$($SUDO readlink "$INSTALL_DIR/current")")"
+  fi
+  decision="$(version_decision "$tag" "$installed" "$ALLOW_UPGRADE")"
+  case "$decision" in
+    keep\ *)
+      warn "installed ${installed}; channel has ${tag} — keeping ${installed}"
+      info "this re-run refreshes config only. To move versions:"
+      info "  agentos upgrade          — snapshots the database first, health-gated"
+      info "  or re-run with --upgrade"
+      tag="$installed"; url="" ;;
+    upgrade\ *)
+      deferred_upgrade="$tag"
+      info "will upgrade ${installed} → ${tag} through the CLI (it takes the backup)"
+      tag="$installed"; url="" ;;
+  esac
+
   step "Service user + layout"
   # $HOME must live inside the writable install root (ProtectSystem=strict in
   # the unit): ~/.claude and ~/.ssh break under a custom --dir otherwise.
@@ -563,6 +617,16 @@ EOF
     $SUDO chmod 755 "/usr/local/bin/${SERVICE_NAME}"
   fi
   ok "agentos CLI → /usr/local/bin/${SERVICE_NAME}"
+
+  # Explicit --upgrade: hand the version change to the CLI rather than swapping
+  # the symlink here, so the pre-upgrade snapshot, the .last-upgrade pointer and
+  # the health-gated auto-rollback all apply exactly as they do for a normal
+  # `agentos upgrade`.
+  if [ -n "$deferred_upgrade" ]; then
+    step "Upgrade ${tag} → ${deferred_upgrade}"
+    "/usr/local/bin/${SERVICE_NAME}" upgrade --to "$deferred_upgrade" \
+      || die "upgrade to ${deferred_upgrade} failed; the node is still on ${tag}"
+  fi
 
   install_autoupdate_timer "$INSTALL_DIR/current/profiles"
 }
@@ -786,6 +850,24 @@ else
     || die "could not resolve ${IMAGE_REPO}:${CHANNEL} to a digest — the registry did not answer with one.
     If the package is private, anonymous pull is refused. Check:
       curl -sI https://${IMAGE_REPO%%/*}/v2/${IMAGE_REPO#*/}/manifests/${CHANNEL}"
+fi
+
+# Same rule as the bare-metal path (#106): a re-run over an existing install
+# keeps the image it is already pinned to. Following :stable here would pull a
+# newer image and run its migrations on the existing volume WITHOUT the
+# pre-upgrade backup `agentos upgrade` takes. An explicit --image is the
+# operator naming a version, so it wins; --upgrade opts into following the
+# channel.
+if [ -z "${AGENTOS_IMAGE:-}" ] && [ "${ALLOW_UPGRADE:-0}" != "1" ] && \
+   [ -f "$INSTALL_DIR/.env" ] && grep -qs '^AGENTOS_IMAGE=' "$INSTALL_DIR/.env"; then
+  pinned="$(grep '^AGENTOS_IMAGE=' "$INSTALL_DIR/.env" | cut -d= -f2-)"
+  if [ -n "$pinned" ] && [ "$pinned" != "$IMAGE_REF" ]; then
+    warn "installed image is already pinned; channel has a newer one — keeping the pin"
+    info "this re-run refreshes config only. To move versions:"
+    info "  agentos upgrade          — backs up first, health-gated"
+    info "  or re-run with --upgrade"
+    IMAGE_REF="$pinned"
+  fi
 fi
 ok "$IMAGE_REF"
 
