@@ -131,6 +131,24 @@ agentos status | logs | upgrade | rollback | backup | version
 `agentos upgrade` backs up your data before switching versions;
 `agentos rollback` undoes the last upgrade.
 
+**Re-running the install command is safe, and it will not move your version.**
+A re-run refreshes configuration — add `--domain`, change the port, fix a flag —
+and leaves the node on the version it is already running, saying so:
+
+```
+! installed v2.5.0; channel has v2.6.1 — keeping v2.5.0
+  this re-run refreshes config only. To move versions:
+    agentos upgrade          — snapshots the database first, health-gated
+    or re-run with --upgrade
+```
+
+The reason is your data. Moving versions runs forward-only migrations against a
+live database, so `agentos upgrade` stops the node, snapshots it, and rolls the
+whole thing back — code and database together — if the new version does not come
+up healthy. The installer has no such snapshot, so it stays out of that business
+unless you pass `--upgrade` (which hands the version change to `agentos upgrade`
+anyway, backup and all).
+
 ## Releases
 
 [Releases](https://github.com/try-agent-os/agentos/releases) carry the
