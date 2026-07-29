@@ -84,6 +84,11 @@ SERVICE_NAME=""                  # resolved after args: agentos | agentos-<user>
 PORT="${AGENTOS_PORT:-8787}"
 CHANNEL="${AGENTOS_CHANNEL:-stable}"
 IMAGE_REF="${AGENTOS_IMAGE:-}"   # set → skip channel resolution, pin exactly this
+# Did the OPERATOR name the image (env now, --image below)? A named version is a
+# deliberate choice and outranks the "keep what is installed" rule; the channel
+# moving on its own does not.
+IMAGE_PINNED_BY_USER=0
+[ -n "$IMAGE_REF" ] && IMAGE_PINNED_BY_USER=1
 ALLOW_UPGRADE=0                  # re-run over an existing install: follow the channel? (#106)
 COMPOSE_FILE="docker-compose.node.yml"
 INSTALL_MODE=""                  # docker | systemd; empty → resolved after args (default: systemd)
@@ -129,7 +134,7 @@ while [ $# -gt 0 ]; do
     --port)         PORT="${2:?--port needs a value}"; shift 2 ;;
     --channel)      CHANNEL="${2:?--channel needs a value}"; shift 2 ;;
     --upgrade)      ALLOW_UPGRADE=1; shift ;;
-    --image)        IMAGE_REF="${2:?--image needs a value}"; shift 2 ;;
+    --image)        IMAGE_REF="${2:?--image needs a value}"; IMAGE_PINNED_BY_USER=1; shift 2 ;;
     -y|--yes)       ASSUME_YES=1; shift ;;
     # Line range = the whole header block above (ends one line before
     # `set -euo pipefail`). Grow the header, grow this range, or --help truncates.
@@ -498,8 +503,10 @@ install_systemd() {
     installed="$(basename "$($SUDO readlink "$INSTALL_DIR/current")")"
   fi
   decision="$(version_decision "$tag" "$installed" "$ALLOW_UPGRADE")"
+  local keep_version=0
   case "$decision" in
     keep\ *)
+      keep_version=1
       warn "installed ${installed}; channel has ${tag} — keeping ${installed}"
       info "this re-run refreshes config only. To move versions:"
       info "  agentos upgrade          — snapshots the database first, health-gated"
@@ -519,7 +526,13 @@ install_systemd() {
   $SUDO mkdir -p "$INSTALL_DIR"/{versions,data,backups}
 
   step "Node ${node_ver} (vendored)"
-  if [ ! -x "$INSTALL_DIR/node/bin/node" ] || \
+  # A kept version keeps the runtime it has: node_ver comes from the CHANNEL's
+  # manifest, so swapping it here would run an older release under a newer Node
+  # than it shipped with — the same "don't move things behind the operator" rule
+  # as the version itself. A missing runtime is still installed (repair path).
+  if [ "$keep_version" = 1 ] && [ -x "$INSTALL_DIR/node/bin/node" ]; then
+    info "keeping the runtime this release was installed with"
+  elif [ ! -x "$INSTALL_DIR/node/bin/node" ] || \
      [ "$("$INSTALL_DIR/node/bin/node" --version)" != "v${node_ver}" ]; then
     curl -fsSL "https://nodejs.org/dist/v${node_ver}/node-v${node_ver}-linux-x64.tar.xz" \
       -o /tmp/node.tar.xz
@@ -858,7 +871,7 @@ fi
 # pre-upgrade backup `agentos upgrade` takes. An explicit --image is the
 # operator naming a version, so it wins; --upgrade opts into following the
 # channel.
-if [ -z "${AGENTOS_IMAGE:-}" ] && [ "${ALLOW_UPGRADE:-0}" != "1" ] && \
+if [ "$IMAGE_PINNED_BY_USER" != "1" ] && [ "${ALLOW_UPGRADE:-0}" != "1" ] && \
    [ -f "$INSTALL_DIR/.env" ] && grep -qs '^AGENTOS_IMAGE=' "$INSTALL_DIR/.env"; then
   pinned="$(grep '^AGENTOS_IMAGE=' "$INSTALL_DIR/.env" | cut -d= -f2-)"
   if [ -n "$pinned" ] && [ "$pinned" != "$IMAGE_REF" ]; then
