@@ -623,9 +623,29 @@ install_systemd() {
     $SUDO tee "/usr/local/bin/${SERVICE_NAME}" >/dev/null <<EOF
 #!/bin/sh
 # AgentOS CLI for the '${SERVICE_USER}' instance — written by install.sh.
+#
+# The CLI this execs lives in the RELEASE TREE, so its behaviour depends on
+# which release is currently installed. A tree older than per-instance support
+# IGNORES the four variables below and operates on the default instance
+# instead: it stops \`agentos.service\`, chowns this install to \`agentos\`, waits
+# on a health check that the still-running old process answers — and reports
+# success while leaving THIS node one restart away from not starting at all.
+# That is not hypothetical; it is what an upgrade from such a tree did.
+#
+# So probe the CLI for the concept before handing it the instance. A source
+# probe, not a --flag: the whole point is that the old CLI does not know the
+# question, so it cannot answer it truthfully either.
+CLI=${INSTALL_DIR}/current/profiles/agentos
+if ! grep -q AGENTOS_SERVICE "\$CLI" 2>/dev/null; then
+  echo "agentos: the CLI in ${INSTALL_DIR}/current predates per-instance support," >&2
+  echo "         so it would manage the DEFAULT instance instead of '${SERVICE_USER}'." >&2
+  echo "         Refresh this install first, then retry:" >&2
+  echo "         install.sh --user ${SERVICE_USER} --port ${PORT} …" >&2
+  exit 3
+fi
 AGENTOS_DIR=${INSTALL_DIR} AGENTOS_SERVICE=${SERVICE_NAME} \\
 AGENTOS_USER=${SERVICE_USER} AGENTOS_PORT=${PORT} \\
-  exec ${INSTALL_DIR}/current/profiles/agentos "\$@"
+  exec "\$CLI" "\$@"
 EOF
     $SUDO chmod 755 "/usr/local/bin/${SERVICE_NAME}"
   fi
