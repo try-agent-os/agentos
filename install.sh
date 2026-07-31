@@ -38,6 +38,18 @@
 #                              change is then performed BY that CLI, backup and all.
 #   -y, --yes                  Never prompt; fail instead of asking.
 #
+# CONTOUR ACCESS — an instance gets ALL of its contour's access at install time,
+# so nothing has to be handed to it by hand afterwards (secrets, gh/git to its
+# repos, checkouts). Three flags declare it; all are systemd-mode and re-run safe:
+#   --secrets <file>           Env-file (KEY=VALUE per line) of the contour's secrets. Its keys are merged
+#                              into /opt/<user>/.env (0600) on install AND every re-run. Values are read
+#                              from the FILE, never from argv — nothing lands in `ps`, a journal or a log.
+#   --repo <url>               A contour repo to check out under the instance ($INSTALL_DIR/repos/<name>),
+#                              cloned as the service account with the token below. Repeatable — pass the
+#                              context-repo and every working repo (e.g. platform).
+#   --gh-token-key <KEY>       Which key in the merged .env holds the GitHub token used for `gh auth
+#                              setup-git` and the clones above. Default: GH_TOKEN, then GITHUB_TOKEN.
+#
 # TWO NODES ON ONE HOST: same install, twice, with a different --user/--port and
 # its own .env — that is the whole story. Nothing is shared between instances
 # except the machine: separate service account, separate install root (its $HOME,
@@ -90,6 +102,17 @@ IMAGE_REF="${AGENTOS_IMAGE:-}"   # set → skip channel resolution, pin exactly 
 IMAGE_PINNED_BY_USER=0
 [ -n "$IMAGE_REF" ] && IMAGE_PINNED_BY_USER=1
 ALLOW_UPGRADE=0                  # re-run over an existing install: follow the channel? (#106)
+# ─── contour access (secrets + repos) ───────────────────────────────────────
+# An instance's contour — its secrets and its repos — is DECLARED here and laid
+# down at install time, so a fresh node can gh/git to its own repos and read its
+# own secrets with nothing added by hand afterwards. All read from files/env,
+# never argv (secret hygiene): $SECRETS_FILE is a path, tokens live in .env.
+SECRETS_FILE="${AGENTOS_SECRETS_FILE:-}"   # env-file whose keys merge into .env
+CONTOUR_REPOS=()                            # --repo, repeatable: checkouts under the instance
+if [ -n "${AGENTOS_CONTOUR_REPOS:-}" ]; then # space/comma list also accepted via env
+  IFS=', ' read -r -a CONTOUR_REPOS <<< "${AGENTOS_CONTOUR_REPOS}"
+fi
+GH_TOKEN_KEY="${AGENTOS_GH_TOKEN_KEY:-}"    # which .env key holds the gh token (else GH_TOKEN/GITHUB_TOKEN)
 COMPOSE_FILE="docker-compose.node.yml"
 INSTALL_MODE=""                  # docker | systemd; empty → resolved after args (default: systemd)
 
@@ -134,11 +157,14 @@ while [ $# -gt 0 ]; do
     --port)         PORT="${2:?--port needs a value}"; shift 2 ;;
     --channel)      CHANNEL="${2:?--channel needs a value}"; shift 2 ;;
     --upgrade)      ALLOW_UPGRADE=1; shift ;;
+    --secrets)      SECRETS_FILE="${2:?--secrets needs a value}"; shift 2 ;;
+    --repo)         CONTOUR_REPOS+=("${2:?--repo needs a value}"); shift 2 ;;
+    --gh-token-key) GH_TOKEN_KEY="${2:?--gh-token-key needs a value}"; shift 2 ;;
     --image)        IMAGE_REF="${2:?--image needs a value}"; IMAGE_PINNED_BY_USER=1; shift 2 ;;
     -y|--yes)       ASSUME_YES=1; shift ;;
     # Line range = the whole header block above (ends one line before
     # `set -euo pipefail`). Grow the header, grow this range, or --help truncates.
-    -h|--help)      sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,86p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              die "unknown option: $1 (try --help)" ;;
   esac
 done
@@ -161,6 +187,20 @@ case "$PORT" in
   ''|*[!0-9]*) die "--port: expected a number, got '${PORT}'" ;;
 esac
 
+# Contour declarations are validated for SHAPE here (existence, url form) — never
+# for content, and the secrets file is never read into a variable at this stage:
+# a value must not enter the process just to be shape-checked. Real ingestion is
+# merge_contour_secrets, which streams the file straight into .env.
+if [ -n "$SECRETS_FILE" ] && [ ! -e "$SECRETS_FILE" ]; then
+  die "--secrets: no such file: ${SECRETS_FILE}"
+fi
+for _repo in ${CONTOUR_REPOS+"${CONTOUR_REPOS[@]}"}; do
+  case "$_repo" in
+    https://*|git@*|ssh://*) : ;;
+    *) die "--repo: expected an https://, git@ or ssh:// git URL, got '${_repo}'" ;;
+  esac
+done
+
 [ -n "$INSTALL_DIR" ] || INSTALL_DIR="/opt/${SERVICE_USER}"
 if [ "$SERVICE_USER" = "agentos" ]; then
   SERVICE_NAME="agentos"
@@ -170,6 +210,153 @@ else
   # list-units 'agentos*'` no matter which spelling the operator picked.
   SERVICE_NAME="agentos-${SERVICE_USER#agentos-}"
 fi
+
+# ─── contour access: secrets + repo checkouts ───────────────────────────────
+#
+# The whole point of these helpers is that an instance leaves install.sh with
+# EVERYTHING its contour needs — its secrets in .env, gh authenticated to its
+# repos, its checkouts on disk — so a human never has to hand-carry a token or
+# clone a repo into a running node afterwards (the failure this task fixes).
+#
+# Secret hygiene is load-bearing here, not decoration: a token value never
+# appears on a command line (world-readable /proc/<pid>/cmdline), never in a log
+# or an `ok`/`info` line, and never in a variable that outlives the write. Files
+# are streamed; the gh token rides the ENVIRONMENT into a child, not its argv.
+
+# Read a file we may not own as the invoking user, falling back to $SUDO. Used
+# for the operator's --secrets file and for the 0600 .env root writes.
+read_maybe_sudo() { # read_maybe_sudo <path> — echoes contents, or fails
+  local f="$1"
+  if [ -r "$f" ]; then cat "$f"; return 0; fi
+  [ -n "${SUDO:-}" ] && $SUDO cat "$f" 2>/dev/null && return 0
+  return 1
+}
+
+# Merge the contour secrets env-file into $INSTALL_DIR/.env, idempotently: any
+# key the file declares REPLACES that key in .env (last write wins), every other
+# line in .env is left exactly as it was. The result is rewritten 0600 in one
+# shot. Values move file→file only; the log prints key NAMES, never values.
+merge_contour_secrets() {
+  [ -n "$SECRETS_FILE" ] || return 0
+  local envfile="$INSTALL_DIR/.env" secrets declared keypat current filtered lines new n
+  # Docker mode owns .env as the INVOKING user (docker compose reads it as them),
+  # so writing it through sudo would lock them out; systemd mode's .env is
+  # root/service-owned and needs sudo. $su selects the right hand for the write.
+  local su="${SUDO:-}"
+  [ "${INSTALL_MODE:-}" = "docker" ] && su=""
+  secrets="$(read_maybe_sudo "$SECRETS_FILE")" || die "cannot read --secrets file: ${SECRETS_FILE}"
+  # Only well-formed KEY=VALUE lines count; comments/blanks in the source are fine
+  # and simply ignored. The captured names are safe to print — they are keys.
+  declared="$(printf '%s\n' "$secrets" | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p')"
+  if [ -z "$declared" ]; then
+    warn "--secrets file has no KEY=VALUE lines — nothing merged (${SECRETS_FILE})"
+    return 0
+  fi
+  keypat="$(printf '%s\n' "$declared" | paste -sd'|' -)"
+  current="$(read_maybe_sudo "$envfile" 2>/dev/null || true)"
+  # Drop the keys we are about to redeclare, and any pre-existing blank lines, so
+  # a re-run cannot pile up duplicates or grow a gap on every pass.
+  filtered="$(printf '%s\n' "$current" | grep -Ev "^(${keypat})=" | grep -v '^[[:space:]]*$' || true)"
+  lines="$(printf '%s\n' "$secrets" | grep -E '^[A-Za-z_][A-Za-z0-9_]*=')"
+  new="$(printf '%s\n%s' "$filtered" "$lines")"
+  # 0600 from birth (install /dev/null first), then stream the content in — the
+  # values reach the file through a pipe, never an argument.
+  $su install -m 600 /dev/null "$envfile"
+  printf '%s\n' "$new" | $su tee "$envfile" >/dev/null
+  $su chmod 600 "$envfile"
+  # Hand it to the service account only in systemd mode (docker leaves it with the
+  # invoking user). Guarded: the account may not exist yet in a dry run.
+  [ "${INSTALL_MODE:-}" = "systemd" ] && [ -n "${SUDO:-}" ] \
+    && $SUDO chown "${SERVICE_USER}:${SERVICE_USER}" "$envfile" 2>/dev/null || true
+  n="$(printf '%s\n' "$declared" | grep -c . || true)"
+  ok "merged ${n} contour secret key(s) into .env: $(printf '%s ' $declared)"
+}
+
+# Resolve the GitHub token from the merged .env, by the operator's chosen key if
+# any, else the two gh honours natively. Echoes the value on stdout for a caller
+# to capture into a local and pass by environment — it is never logged.
+resolve_gh_token() { # resolve_gh_token — echoes the token, or empty
+  local key val
+  for key in ${GH_TOKEN_KEY:+"$GH_TOKEN_KEY"} GH_TOKEN GITHUB_TOKEN; do
+    val="$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null | sed -n "s/^${key}=//p" | tail -1)"
+    [ -n "$val" ] && { printf '%s' "$val"; return 0; }
+  done
+  return 0
+}
+
+# Run a command AS the service account, with its install root as $HOME (so gh
+# and git read that account's ~/.config/gh and ~/.gitconfig) and GH_TOKEN carried
+# in from the caller's ENVIRONMENT — never placed on argv.
+run_as_service() { # run_as_service <cmd> [args...]
+  if [ "$(id -u)" = 0 ]; then
+    HOME="$INSTALL_DIR" runuser -u "$SERVICE_USER" -- "$@"
+  else
+    $SUDO -u "$SERVICE_USER" --preserve-env=GH_TOKEN env HOME="$INSTALL_DIR" "$@"
+  fi
+}
+
+# Ensure the GitHub CLI is present — the acceptance is `gh pr view/checks`, which
+# needs the binary, not just a token. Try the distro first (Ubuntu 24.04 ships
+# it), then GitHub's own apt repo; degrade to a warning rather than failing the
+# install (git-over-https still works through the credential helper).
+ensure_gh() {
+  command -v gh >/dev/null 2>&1 && return 0
+  $SUDO apt-get -o DPkg::Lock::Timeout=120 install -y -qq gh >/dev/null 2>&1 \
+    && command -v gh >/dev/null 2>&1 && { ok "gh installed (apt)"; return 0; }
+  info "adding the GitHub CLI apt repo"
+  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg 2>/dev/null \
+    | $SUDO tee /usr/share/keyrings/githubcli-archive-keyring.gpg >/dev/null 2>&1 || true
+  $SUDO chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null || true
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    | $SUDO tee /etc/apt/sources.list.d/github-cli.list >/dev/null 2>&1 || true
+  $SUDO apt-get -o DPkg::Lock::Timeout=120 update -qq >/dev/null 2>&1 || true
+  $SUDO apt-get -o DPkg::Lock::Timeout=120 install -y -qq gh >/dev/null 2>&1 \
+    && command -v gh >/dev/null 2>&1 && { ok "gh installed (github apt repo)"; return 0; }
+  warn "could not install gh — 'gh pr view/checks' stays unavailable until it is; git over https still works"
+  return 0
+}
+
+# Lay down the contour's checkouts under the instance and authenticate gh/git to
+# them, all as the service account. Clones/fetches are best-effort per repo: one
+# unreachable repo must not abort the install or the others.
+setup_contour_repos() {
+  [ "${#CONTOUR_REPOS[@]}" -gt 0 ] || return 0
+  step "Contour repos"
+  ensure_gh
+  local token reposdir="$INSTALL_DIR/repos" url name
+  token="$(resolve_gh_token)"
+  if [ -z "$token" ]; then
+    warn "no GitHub token in .env (looked for ${GH_TOKEN_KEY:+${GH_TOKEN_KEY}, }GH_TOKEN, GITHUB_TOKEN)"
+    warn "repos will be attempted unauthenticated — declare the token in --secrets for private repos"
+  fi
+  $SUDO mkdir -p "$reposdir"
+  $SUDO chown "${SERVICE_USER}:${SERVICE_USER}" "$reposdir"
+  # Authenticate git to GitHub via gh's credential helper, once, for the account.
+  # GH_TOKEN is exported into run_as_service's environment — never onto its argv.
+  if [ -n "$token" ] && command -v gh >/dev/null 2>&1; then
+    if GH_TOKEN="$token" run_as_service gh auth setup-git >/dev/null 2>&1; then
+      ok "gh auth setup-git configured for ${SERVICE_USER}"
+    else
+      warn "gh auth setup-git failed — check the token's scope (repo, read:org)"
+    fi
+  fi
+  for url in "${CONTOUR_REPOS[@]}"; do
+    name="$(basename "${url%.git}")"
+    if [ -d "$reposdir/$name/.git" ]; then
+      if GH_TOKEN="$token" run_as_service git -C "$reposdir/$name" fetch --all --prune >/dev/null 2>&1; then
+        ok "fetched ${name}"
+      else
+        warn "git fetch ${name} failed — check the token or the URL"
+      fi
+    else
+      if GH_TOKEN="$token" run_as_service git clone "$url" "$reposdir/$name" >/dev/null 2>&1; then
+        ok "cloned ${name} → ${reposdir}/${name}"
+      else
+        warn "git clone ${name} failed — check the token or the URL (${url})"
+      fi
+    fi
+  done
+}
 
 # ─── install mode ───────────────────────────────────────────────────────────
 #
@@ -356,6 +543,33 @@ inherit_admin_from_dotenv
 if [ -n "${AGENTOS_PRINT_ADMIN:-}" ]; then
   echo "ids=${ADMIN_IDS}"
   echo "usernames=${ADMIN_USERNAMES}"
+  exit 0
+fi
+
+# "What would this contour declaration DO to .env, and which repos would it check
+# out?" — answered against a real (temp, --dir) install root, without touching a
+# machine, network, or root. Same early-exit contract as the print hooks above;
+# it actually RUNS merge_contour_secrets so the test asserts the real merge (upsert,
+# idempotency, 0600, no value ever printed), then prints only key names + repos.
+# Driven by scripts/tests/install-contour.test.sh.
+if [ -n "${AGENTOS_PRINT_CONTOUR:-}" ]; then
+  SUDO="${SUDO:-}"                       # not yet resolved this early; merge tolerates empty
+  $SUDO mkdir -p "$INSTALL_DIR"
+  merge_contour_secrets >/dev/null 2>&1 || true
+  if [ -f "$INSTALL_DIR/.env" ]; then
+    # Print KEYS only — a value must never reach stdout, even in a dry run.
+    echo "env_keys=$(sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$INSTALL_DIR/.env" | paste -sd, -)"
+    echo "env_mode=$(stat -c '%a' "$INSTALL_DIR/.env" 2>/dev/null || echo '?')"
+  else
+    echo "env_keys="
+    echo "env_mode=none"
+  fi
+  _rnames=""
+  for _r in ${CONTOUR_REPOS+"${CONTOUR_REPOS[@]}"}; do
+    _n="$(basename "${_r%.git}")"; _rnames="${_rnames:+${_rnames},}${_n}"
+  done
+  echo "repos=${_rnames}"
+  echo "gh_token_key=${GH_TOKEN_KEY}"
   exit 0
 fi
 
@@ -564,6 +778,10 @@ install_systemd() {
 
   step "Config + unit"
   write_env_systemd
+  # Contour secrets land in .env right after the base keys, so the systemd unit's
+  # EnvironmentFile=.env carries them into the running node from its very first
+  # boot — GH_TOKEN and the rest are present with nothing added by hand later.
+  merge_contour_secrets
   # scripts/release/agentos.service ships with every path spelled as the
   # literal default install root — that IS its placeholder convention (see the
   # comment at the top of that file). A plain cp only works for the default
@@ -612,6 +830,11 @@ install_systemd() {
   step "Health"
   wait_healthz || { $SUDO journalctl -u "$SERVICE_NAME" -n 50 --no-pager; die "node did not become healthy"; }
   ok "node is healthy"
+
+  # Check out the contour's repos and authenticate gh/git — as the service
+  # account, using the token now in .env. Best-effort per repo: a repo that will
+  # not clone must not fail an otherwise-healthy install.
+  setup_contour_repos
 
   # The CLI needs to know WHICH install it operates on. For the default node
   # that is its own built-in default, so it stays the plain symlink it has
@@ -733,6 +956,15 @@ if [ "$INSTALL_MODE" = "systemd" ]; then
   ok "x86_64, apt-get present"
 
   step "Configuration"
+  # Re-run inherits the bot token from the existing 0600 .env, exactly like docker
+  # mode does (§3). Without this a hands-off re-run — the contour BACKFILL path,
+  # `install.sh --user X --secrets f --repo r -y` — would die for want of --token
+  # even though the token is right there in .env. $SUDO exists from §0, so the
+  # 0600 root/service-owned file is readable here.
+  if [ -z "$BOT_TOKEN" ] && [ -e "$INSTALL_DIR/.env" ]; then
+    BOT_TOKEN="$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null | sed -n 's/^TELEGRAM_BOT_TOKEN=//p' | tail -1 || true)"
+    [ -n "$BOT_TOKEN" ] && info "reusing the bot token from the existing .env"
+  fi
   if [ -z "$BOT_TOKEN" ]; then
     info "Get one from @BotFather → /newbot. Looks like 123456:ABC-..."
     BOT_TOKEN="$(ask 'Telegram bot token' '')"
@@ -1099,6 +1331,15 @@ else
 fi
 chmod 600 .env
 ok ".env written (mode 600 — it holds the bot token)"
+
+# Contour secrets merge into .env here too, so a container install's env-file
+# carries them into the node. Repo checkouts, though, need a unix service account
+# ($INSTALL_DIR is a container in docker mode), so they stay systemd-only — warn
+# rather than silently ignore a --repo the operator passed.
+merge_contour_secrets
+if [ "${#CONTOUR_REPOS[@]}" -gt 0 ]; then
+  warn "--repo is systemd-mode only (docker has no service account to check out under); secrets were still merged. Run the bare-metal install for repo checkouts."
+fi
 
 # ─── 6. up ──────────────────────────────────────────────────────────────────
 

@@ -353,9 +353,12 @@ prune_versions() { # keep current + 2 previous version dirs under versions/ — 
 # new version rolls back CODE AND DATABASE TOGETHER — a code-only rollback
 # would leave the node unable to boot at all.
 
-# Keep .env's AGENTOS_VERSION honest about which code is actually live. It is
-# informational (the symlink is the source of truth), but a stale value shows up
-# in support output and in a re-run of install.sh, so a version swap updates it.
+# Keep .env's AGENTOS_VERSION honest about which code is actually live. The
+# symlink is the source of truth for WHICH TREE RUNS, but this value is not
+# merely cosmetic: .env is the unit's EnvironmentFile and core/build-info.ts
+# reads AGENTOS_VERSION ahead of the release tree's build-info.json, so
+# whatever the process is started with is the version /info reports until it
+# restarts. Every caller must therefore write it BEFORE `systemctl start`.
 # Absent key => nothing to do; this never CREATES the key.
 set_env_version() { # set_env_version <tag>
   local tag="$1" env_file="$AGENTOS_HOME/.env"
@@ -409,6 +412,13 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   snap="$(systemd_backup_sqlite "$prev" | tail -1)"   # consistent copy: the unit is stopped
   [ -n "$snap" ] && echo "$snap" > "$BACKUP_DIR/.last-upgrade"   # pairs snapshot + code tag atomically, before the swap
   ln -sfn "$AGENTOS_HOME/versions/$tag" "$AGENTOS_HOME/current"
+  # Paired with the symlink flip, BEFORE the start — .env is the unit's
+  # EnvironmentFile, so a process started against the old value keeps reporting
+  # the PREVIOUS release (env outranks the release tree's build-info.json in
+  # core/build-info.ts) for its entire life, and /info lies until the next
+  # restart. The rollback branch below restores $prev the same way, also before
+  # its start.
+  set_env_version "$tag"
   # A start that fails to ACTIVATE (non-zero systemctl) must land in the same
   # rollback below as a failed healthz — a bare call here would abort under
   # set -e with the node down and no rollback.
@@ -416,7 +426,6 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   if systemctl start "$AGENTOS_SERVICE"; then started=1; fi
 
   if [ "$started" = 1 ] && wait_healthz; then
-    set_env_version "$tag"
     ok "upgraded: $prev → $tag"
     prune_versions
   else
@@ -532,6 +541,16 @@ cmd_autoupdate() {
   exec "$poller" "$@"
 }
 
+# Plugin authoring surface (scaffold / validate / install). Delegates to the
+# sibling agentos-plugin.sh shipped next to this CLI, so a node has a single
+# `agentos` command surface. See docs/plugin-authoring.md.
+cmd_plugin() {
+  local here; here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+  local tool="$here/agentos-plugin.sh"
+  [ -x "$tool" ] || die "plugin tool not found at $tool"
+  exec "$tool" "$@"
+}
+
 cmd_rollback() {
   case "$(detect_mode)" in
     systemd) systemd_rollback ;;
@@ -558,6 +577,7 @@ agentos — operate an AgentOS Core node
                               (--check: report the verdict, change nothing)
   rollback                    undo the last upgrade (code + database)
   backup                      take a manual backup without upgrading
+  plugin <new|validate|add|list> ...  author, validate and install plugins
   status | logs [n] | version
 EOF
 }
@@ -567,6 +587,7 @@ case "${1:-}" in
   upgrade)    shift; cmd_upgrade "$@" ;;
   autoupdate) shift; cmd_autoupdate "$@" ;;
   rollback)   cmd_rollback ;;
+  plugin)     shift; cmd_plugin "$@" ;;
   status)   cmd_status ;;
   logs)     shift || true; cmd_logs "${1:-200}" ;;
   version)  cmd_version ;;
