@@ -1241,9 +1241,10 @@ fi
 # $INSTALL_DIR/agentos — symlink it onto PATH so a docker-mode install gets
 # the same `agentos upgrade|rollback|status|logs` operator surface --no-docker
 # gets (the finish banner below points at it instead of a script a curl|bash
-# install never had). Known limitation: `agentos upgrade` swaps the running
-# node's image but does not re-fetch this CLI file itself — a materially
-# changed CLI needs a re-run of this installer to pick up.
+# install never had). `agentos upgrade` re-extracts this CLI (plus the
+# auto-update poller and, when unedited, the compose file/Caddyfile) from every
+# new image it installs — docker_refresh_profiles() in scripts/agentos — so a
+# materially changed CLI lands on the next upgrade without re-running install.
 if [ -f "$INSTALL_DIR/agentos" ]; then
   chmod +x "$INSTALL_DIR/agentos"
   $SUDO ln -sfn "$INSTALL_DIR/agentos" /usr/local/bin/agentos

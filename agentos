@@ -88,6 +88,94 @@ docker_set_image() {
   rm -f "$AGENTOS_HOME/.env.bak"
 }
 
+# ─── docker mode: refresh the operator tooling that ships in the image ───────
+#
+# The run profiles (compose file + Caddyfile + the `agentos` CLI itself + the
+# auto-update poller) travel INSIDE the image under /app/profiles and are
+# `docker cp`'d out to $AGENTOS_HOME by install.sh (install.sh §Run profile).
+# docker_upgrade swaps the node's IMAGE but, before this, left those extracted
+# files frozen at install time (issue #112): the on-PATH `agentos`,
+# agentos-autoupdate.sh and compose file kept the shape they had the day the box
+# was installed, so a materially changed CLI needed a full installer re-run to
+# land. Bare-metal (systemd) mode has no such gap — its CLI is a symlink through
+# current/profiles/agentos, so a version flip repoints it for free.
+#
+# So, after a HEALTHY docker upgrade, re-extract /app/profiles from the new image
+# and reconcile the on-disk copies:
+#   • The CLI + the auto-update poller are OUR operator tooling, not user config
+#     — always track the image. The overwrite is a same-filesystem `mv` (atomic
+#     rename): the running CLI keeps executing its already-open inode, so a CLI
+#     refreshing ITSELF mid-run is safe.
+#   • The compose file + Caddyfile are run config a self-hoster may have hand
+#     edited. NEVER clobber a local edit silently: adopt the new image's copy
+#     only when the on-disk file still byte-matches what the PREVIOUS image
+#     shipped (i.e. untouched since the last extraction). If it diverged — a
+#     local customization, or we cannot obtain the old copy to be sure — keep it
+#     and warn, so a structural compose change surfaces without eating edits.
+# A source checkout ($AGENTOS_HOME/.git) is left entirely alone, mirroring
+# install.sh's guard: its files are the working tree, owned by git, not us.
+# Best-effort throughout — a hiccup here never fails an upgrade that is already
+# live and healthy.
+docker_refresh_profiles() { # docker_refresh_profiles <new-image> [prev-image]
+  local new_image="${1:?docker_refresh_profiles needs the new image}" prev_image="${2:-}"
+  if [ -d "$AGENTOS_HOME/.git" ]; then
+    info "source checkout — leaving the CLI, compose file and Caddyfile as the git tree has them"
+    return 0
+  fi
+  local stage oldstage="" c f rel
+  stage="$AGENTOS_HOME/.profiles-new.$$"
+  rm -rf "$stage"; mkdir -p "$stage"
+  if ! c="$(docker create "$new_image" 2>/dev/null)" || [ -z "$c" ]; then
+    warn "could not stage the new image to refresh the CLI — leaving on-disk tooling unchanged"
+    rm -rf "$stage"; return 0
+  fi
+  if ! docker cp "${c}:/app/profiles/." "$stage/" >/dev/null 2>&1; then
+    warn "new image has no /app/profiles — leaving on-disk tooling unchanged"
+    docker rm "$c" >/dev/null 2>&1 || true; rm -rf "$stage"; return 0
+  fi
+  docker rm "$c" >/dev/null 2>&1 || true
+
+  # 1. Self-updating operator tooling — always tracks the image, atomic rename.
+  for f in agentos agentos-autoupdate.sh; do
+    [ -f "$stage/$f" ] || continue
+    if [ -f "$AGENTOS_HOME/$f" ] && cmp -s "$stage/$f" "$AGENTOS_HOME/$f"; then
+      continue   # already current — no needless churn
+    fi
+    chmod +x "$stage/$f" 2>/dev/null || true
+    mv -f "$stage/$f" "$AGENTOS_HOME/$f"   # same-fs rename: atomic, safe self-overwrite
+    ok "refreshed $f from the new image"
+  done
+
+  # 2. Run config — refresh only if untouched since the last extraction. Compare
+  #    against what the PREVIOUS image shipped; if we cannot get it, stay safe
+  #    and treat every difference as a local edit (warn, keep).
+  if [ -n "$prev_image" ]; then
+    local pc
+    if pc="$(docker create "$prev_image" 2>/dev/null)" && [ -n "$pc" ]; then
+      oldstage="$AGENTOS_HOME/.profiles-old.$$"
+      rm -rf "$oldstage"; mkdir -p "$oldstage"
+      docker cp "${pc}:/app/profiles/." "$oldstage/" >/dev/null 2>&1 || { rm -rf "$oldstage"; oldstage=""; }
+      docker rm "$pc" >/dev/null 2>&1 || true
+    fi
+  fi
+  for rel in "$COMPOSE_FILE" "docker/Caddyfile"; do
+    local newf="$stage/$rel" curf="$AGENTOS_HOME/$rel" oldf="$oldstage/$rel"
+    [ -f "$newf" ] || continue
+    if [ ! -f "$curf" ]; then
+      mkdir -p "$(dirname "$curf")"; cp "$newf" "$curf"; ok "installed $rel from the new image"; continue
+    fi
+    cmp -s "$newf" "$curf" && continue   # already identical
+    if [ -n "$oldstage" ] && [ -f "$oldf" ] && cmp -s "$oldf" "$curf"; then
+      cp "$newf" "$curf"; ok "refreshed $rel from the new image"
+    else
+      warn "kept your $rel — the new image ships a different one; diff and merge by hand to adopt it"
+    fi
+  done
+
+  rm -rf "$stage" "$oldstage"
+  return 0
+}
+
 # ─── docker mode: data-volume backup/restore ────────────────────────────────
 #
 # Mirrors scripts/agentos-upgrade.sh:88-160 (backup_now / restore_backup): a
@@ -204,6 +292,11 @@ docker_upgrade() { # docker_upgrade [tag] [image-ref]  — empty tag = latest st
     ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" up -d )
     die "upgrade failed; previous version restored"
   fi
+  # The node is live and healthy on the new image; now pull the operator tooling
+  # (the CLI itself, the auto-update poller, the compose file) forward too, so
+  # `agentos upgrade` upgrades itself and not merely the container (issue #112).
+  # Best-effort: never let a refresh snag undo a good upgrade.
+  docker_refresh_profiles "$image" "$prev" || warn "profile refresh hit a snag; the node upgrade itself succeeded"
   ok "upgraded: $prev → $image"
 }
 
