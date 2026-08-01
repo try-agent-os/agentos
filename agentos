@@ -541,14 +541,38 @@ cmd_autoupdate() {
   exec "$poller" "$@"
 }
 
-# Plugin authoring surface (scaffold / validate / install). Delegates to the
-# sibling agentos-plugin.sh shipped next to this CLI, so a node has a single
-# `agentos` command surface. See docs/plugin-authoring.md.
+# Plugin surface — two sibling tools, one `agentos plugin` front door:
+#   • agentos-plugins.sh (RUNTIME): install/manage plugins declared in
+#     .agentos/plugins.yaml — add|ls|rm|enable|disable|secret|update|slot.
+#   • agentos-plugin.sh (AUTHORING): scaffold/validate a plugin dir — new|validate|list.
+# Routing: the runtime subcommands (and `add` given an npm:/git:/path: source)
+# go to the runtime tool; new/validate/list and a bare-dir `add` stay on the
+# authoring tool, so both surfaces coexist without ambiguity. See
+# docs/plugin-authoring.md.
 cmd_plugin() {
   local here; here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-  local tool="$here/agentos-plugin.sh"
-  [ -x "$tool" ] || die "plugin tool not found at $tool"
-  exec "$tool" "$@"
+  local runtime="$here/agentos-plugins.sh" authoring="$here/agentos-plugin.sh"
+  local sub="${1:-}"
+  case "$sub" in
+    ls|rm|enable|disable|secret|update|slot)
+      [ -x "$runtime" ] || die "plugin runtime tool not found at $runtime"
+      exec "$runtime" "$@" ;;
+    add)
+      # A runtime source (npm:/git:/path:) among the args ⇒ runtime install;
+      # otherwise the authoring `add <dir> --repo` copy.
+      local a
+      for a in "$@"; do
+        case "$a" in npm:*|git:*|path:*)
+          [ -x "$runtime" ] || die "plugin runtime tool not found at $runtime"
+          exec "$runtime" "$@" ;;
+        esac
+      done
+      [ -x "$authoring" ] || die "plugin tool not found at $authoring"
+      exec "$authoring" "$@" ;;
+    *)
+      [ -x "$authoring" ] || die "plugin tool not found at $authoring"
+      exec "$authoring" "$@" ;;
+  esac
 }
 
 cmd_rollback() {
@@ -577,7 +601,8 @@ agentos — operate an AgentOS Core node
                               (--check: report the verdict, change nothing)
   rollback                    undo the last upgrade (code + database)
   backup                      take a manual backup without upgrading
-  plugin <new|validate|add|list> ...  author, validate and install plugins
+  plugin add|ls|rm|enable|disable|secret|update|slot ...  manage runtime plugins
+  plugin new|validate|list ...  author, validate and scaffold plugin dirs
   status | logs [n] | version
 EOF
 }
