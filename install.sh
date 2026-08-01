@@ -436,6 +436,41 @@ if [ -n "${AGENTOS_PRINT_IDENTITY:-}" ]; then
   exit 0
 fi
 
+# ─── per-instance self-management: scoped sudoers drop-in ────────────────────
+#
+# The node runs as its own unprivileged, nologin service account with no access
+# to the host. To let the OPERATOR inside that sandbox manage THIS instance — and
+# nothing else on the box — install_selfmgmt_sudoers (systemd path) drops a file
+# at /etc/sudoers.d/<user>-selfmgmt granting NOPASSWD on EXACTLY three commands
+# against its own unit: restart it, read its status, tail its journal.
+#
+# Deliberately narrow: no bare `systemctl` (host-wide), no other unit's journal.
+# The commands carry absolute binary paths (a sudoers requirement — a bare name
+# would let $PATH decide which `systemctl` runs) and match the unit token
+# exactly, so a neighbour instance's unit (agentos-<other>) can never satisfy
+# these rules. render_selfmgmt_sudoers is a pure function of (user, unit) so the
+# exact drop-in body is testable without root — see AGENTOS_PRINT_SUDOERS below
+# and scripts/tests/install-sudoers.test.sh.
+render_selfmgmt_sudoers() { # render_selfmgmt_sudoers <user> <unit> → drop-in body on stdout
+  local user="$1" unit="$2"
+  cat <<EOF
+# AgentOS per-instance self-management for the '${user}' instance.
+# Written by install.sh — do NOT edit by hand; a re-run or upgrade rewrites it,
+# an uninstall removes it. Grants ${user} NOPASSWD sudo for EXACTLY three
+# commands against its own unit (${unit}.service) and nothing else on this host:
+# restart it, read its status, and read its journal. No bare systemctl, no other
+# unit's journal.
+${user} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${unit}, /usr/bin/systemctl status ${unit}, /usr/bin/journalctl -u ${unit} *
+EOF
+}
+
+# "What sudoers drop-in would this command line write?" — answered without root
+# or a box, same dry-run contract as AGENTOS_PRINT_IDENTITY above.
+if [ -n "${AGENTOS_PRINT_SUDOERS:-}" ]; then
+  render_selfmgmt_sudoers "$SERVICE_USER" "$SERVICE_NAME"
+  exit 0
+fi
+
 # ─── admin identity ─────────────────────────────────────────────────────────
 #
 # --admin takes numeric ids AND usernames, in any mix, comma separated:
@@ -737,7 +772,12 @@ install_systemd() {
   # the unit): ~/.claude and ~/.ssh break under a custom --dir otherwise.
   id "$SERVICE_USER" >/dev/null 2>&1 || \
     $SUDO useradd -r -m -d "$INSTALL_DIR" -s /usr/sbin/nologin "$SERVICE_USER"
-  $SUDO mkdir -p "$INSTALL_DIR"/{versions,data,backups}
+  # logs/: the node's own log file lives here (the unit appends stdout+stderr to
+  # logs/node.log — see agentos.service), so the operator can self-diagnose from
+  # inside the instance sandbox without journalctl or root. Owned by the service
+  # account (chown -R below), under ReadWritePaths, world-readable once systemd
+  # creates the file.
+  $SUDO mkdir -p "$INSTALL_DIR"/{versions,data,backups,logs}
 
   step "Node ${node_ver} (vendored)"
   # A kept version keeps the runtime it has: node_ver comes from the CHANNEL's
@@ -884,7 +924,36 @@ EOF
       || die "upgrade to ${deferred_upgrade} failed; the node is still on ${tag}"
   fi
 
+  install_selfmgmt_sudoers
   install_autoupdate_timer "$INSTALL_DIR/current/profiles"
+}
+
+# Drop the per-instance self-management sudoers file (systemd path). Idempotent:
+# a re-run/upgrade re-renders and overwrites it, so it always tracks the current
+# user/unit. Validated with `visudo -cf` BEFORE it is moved into place — a
+# malformed file in /etc/sudoers.d can lock sudo out of the whole host, so a
+# render that fails validation is discarded, never installed. Degrades to a
+# warning (never a failed install) on a host with no sudo/visudo.
+install_selfmgmt_sudoers() {
+  step "Self-management sudoers"
+  if ! command -v visudo >/dev/null 2>&1; then
+    warn "visudo not found — per-instance self-management sudoers NOT installed."
+    info "install the sudo package, then re-run to grant it."
+    return 0
+  fi
+  local dropin="/etc/sudoers.d/${SERVICE_USER}-selfmgmt"
+  local tmp; tmp="$(mktemp)"
+  render_selfmgmt_sudoers "$SERVICE_USER" "$SERVICE_NAME" > "$tmp"
+  # visudo -cf checks THIS file's syntax in isolation; -f names the file.
+  if $SUDO visudo -cf "$tmp" >/dev/null 2>&1; then
+    # 0440 root:root is the required mode for a sudoers.d drop-in; `install`
+    # sets owner+mode atomically as it copies.
+    $SUDO install -m 0440 -o root -g root "$tmp" "$dropin"
+    ok "self-management → ${dropin} (restart/status/journal on ${SERVICE_NAME} only)"
+  else
+    warn "generated sudoers failed visudo -cf — NOT installed (self-management degraded)."
+  fi
+  rm -f "$tmp"
 }
 
 # Install + arm the unattended update timer. Mode-agnostic: the poller and its

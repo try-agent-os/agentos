@@ -506,7 +506,17 @@ cmd_status() {
 
 cmd_logs() {
   case "$(detect_mode)" in
-    systemd) journalctl -u "$AGENTOS_SERVICE" -n "${1:-200}" --no-pager ;;
+    # The unit appends stdout+stderr to logs/node.log (agentos.service), so the
+    # node's own log is readable from inside the instance sandbox without root.
+    # Prefer it; fall back to the journal only if it is not there yet (an install
+    # from before per-instance logging, or the very first moments before boot).
+    systemd)
+      local logfile="$AGENTOS_HOME/logs/node.log"
+      if [ -r "$logfile" ]; then
+        tail -n "${1:-200}" "$logfile"
+      else
+        journalctl -u "$AGENTOS_SERVICE" -n "${1:-200}" --no-pager
+      fi ;;
     docker)  (cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" logs --tail "${1:-200}") ;;
     none)    die "no install found under $AGENTOS_HOME" ;;
   esac
