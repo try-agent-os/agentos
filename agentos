@@ -482,7 +482,13 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     step "Fetching $tag"
     tmp_dir="$AGENTOS_HOME/versions/.tmp-$tag"
     rm -rf "$tmp_dir"
-    trap 'rm -rf "$tmp_dir"' EXIT
+    # Expand $tmp_dir NOW (still in scope) and bake the literal path into the
+    # trap. Deferring expansion — trap 'rm -rf "$tmp_dir"' — breaks on the
+    # failure path: under `set -u` the EXIT trap fires after this function's
+    # `local` has unwound, so `$tmp_dir` is unbound (the trap aborts with
+    # "tmp_dir: unbound variable" and the versions/.tmp-<tag> staging dir is
+    # left behind after a failed unpack).
+    trap "rm -rf '$tmp_dir'" EXIT
     mkdir -p "$tmp_dir"
     curl -fsSL "$url" -o "$tmp_dir/${tarball}"
     echo "${sha}  $tmp_dir/${tarball}" | sha256sum -c - || die "tarball checksum mismatch"
