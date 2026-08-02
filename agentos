@@ -694,6 +694,33 @@ cmd_plugin() {
   esac
 }
 
+# Preset surface — the routine-preset gallery (docs/product/preset-registry-decision.md).
+#   agentos preset ls | show <id> | add <id> [key=value ...]
+# ls/show are pure catalog reads; add renders a preset into the context repo's
+# .agentos/routines/ (via $AGENTOS_CONTEXT_REPO) so the reconciler picks it up
+# and it ticks on schedule. Delegates to the compiled Node CLI shipped with the
+# core (core/presets/cli.js); in docker mode it runs inside the node container,
+# in systemd mode against the current release checkout.
+cmd_preset() {
+  case "$(detect_mode)" in
+    docker)
+      ( cd "$AGENTOS_HOME" && exec docker compose -f "$COMPOSE_FILE" exec -T node \
+          node dist/core/presets/cli.js "$@" ) ;;
+    systemd)
+      local base="$AGENTOS_HOME/current" cli=""
+      for c in \
+        "$base/dist/core/presets/cli.js" \
+        "$base/apps/api/dist/core/presets/cli.js" \
+        "$base/node_modules/@agent-os/api/dist/core/presets/cli.js"; do
+        [ -f "$c" ] && { cli="$c"; break; }
+      done
+      [ -n "$cli" ] || die "preset CLI not found under $base (is the node installed?)"
+      exec node "$cli" "$@" ;;
+    none)
+      die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
 cmd_rollback() {
   case "$(detect_mode)" in
     systemd) systemd_rollback ;;
@@ -722,6 +749,7 @@ agentos — operate an AgentOS Core node
   backup                      take a manual backup without upgrading
   plugin add|ls|rm|enable|disable|secret|update|slot ...  manage runtime plugins
   plugin new|validate|list ...  author, validate and scaffold plugin dirs
+  preset ls | show <id> | add <id> [key=value ...]  browse + install routine presets
   status | logs [n] | version
 EOF
 }
@@ -732,6 +760,7 @@ case "${1:-}" in
   autoupdate) shift; cmd_autoupdate "$@" ;;
   rollback)   cmd_rollback ;;
   plugin)     shift; cmd_plugin "$@" ;;
+  preset)     shift; cmd_preset "$@" ;;
   status)   cmd_status ;;
   logs)     shift || true; cmd_logs "${1:-200}" ;;
   version)  cmd_version ;;
