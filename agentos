@@ -375,6 +375,10 @@ systemd_backup_sqlite() { # systemd_backup_sqlite <label> — <label> is the cod
   for f in messages.db messages.db-wal messages.db-shm search.db; do
     [ -f "$AGENTOS_HOME/data/$f" ] && cp -a "$AGENTOS_HOME/data/$f" "$dest/"
   done
+  # .aop/ is the agent run-state (in-flight run dirs, cursors) — docker mode
+  # already captures it by tarring the whole /data volume, so bare metal must
+  # snapshot it too or a rollback would strand the node with mismatched runs.
+  [ -d "$AGENTOS_HOME/data/.aop" ] && cp -a "$AGENTOS_HOME/data/.aop" "$dest/"
   echo "$label" > "$dest/version"
   ok "backup: $(basename "$dest")"
   systemd_prune_backups
@@ -398,6 +402,12 @@ systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores 
   fi
   local src="${1:?systemd_restore_sqlite needs a snapshot dir}"
   [ -d "$src" ] || die "backup dir gone: $src"
+  # Wipe the live run-state first so restore REPLACES .aop/ wholesale rather
+  # than overlaying onto it — `cp -a` alone would leave any current run dir the
+  # snapshot lacks in place, mixing old and new state. This mirrors docker mode,
+  # which `rm -rf /data/*` before untarring the snapshot. Restoring a snapshot
+  # taken before .aop/ existed therefore correctly leaves no .aop/ behind.
+  rm -rf "$AGENTOS_HOME/data/.aop"
   cp -a "$src"/. "$AGENTOS_HOME/data/"
   # The snapshots are root-owned (this CLI runs as root), and `cp -a` of
   # "<dir>/." carries the snapshot dir's OWN ownership onto data/ itself — the
