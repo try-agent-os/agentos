@@ -30,7 +30,7 @@ CHANNEL_URL="https://github.com/${DIST_REPO}/releases/latest/download/stable.jso
 COMPOSE_FILE="docker-compose.node.yml"
 BACKUP_DIR="$AGENTOS_HOME/backups"
 
-GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'
 BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 step() { echo -e "\n${CYAN}${BOLD}▸${NC} ${BOLD}$*${NC}"; }
 info() { echo -e "  ${DIM}$*${NC}"; }
@@ -79,6 +79,49 @@ docker_managed_postgres_warning() { # docker_managed_postgres_warning [prev-imag
   warn "point before this upgrade${prev:+, then bring back $prev}."
   warn "To force an old image onto the migrated schema anyway (accepting the risk),"
   warn "set AGENTOS_SCHEMA_COMPAT_OVERRIDE=1 in .env before starting it."
+}
+
+# Pre-flight restore point + LOUD no-rollback notice for managed-PostgreSQL
+# nodes, printed at UPGRADE TIME (both modes call this before flipping current).
+#
+# On a managed-PG node the local SQLite backup is a no-op and BOTH rollback
+# paths — `agentos rollback` and the health-gated auto-rollback inside
+# `agentos upgrade` — are refused: migrations are forward-only and the schema
+# boot-guard (apps/api/src/core/db/schema-guard.ts) will not start old code
+# against a database a newer release already migrated. The only real recovery
+# is EXTERNAL: restore the managed DB to a point BEFORE this upgrade from the
+# provider's PITR, then re-pin the previous version.
+#
+# DECISION (do we snapshot the DB before flipping?): we deliberately do NOT call
+# a provider snapshot API from the node. The node holds no provider credentials,
+# providers differ (Neon / RDS / Fly PG), and Neon-style PITR is CONTINUOUS — an
+# explicit snapshot is redundant inside the retention window. What a failed
+# upgrade actually needs is a DEFINED restore target, so this records the exact
+# pre-flip UTC timestamp + the previous version to
+# $BACKUP_DIR/managed-restore-point and prints them loudly. That timestamp is
+# the point to rewind PITR to. Full procedure: docs/runbooks/managed-pg-recovery.md.
+managed_pg_restore_point() { # managed_pg_restore_point <prev> <target>
+  uses_managed_postgres || return 0
+  local prev="${1:-unknown}" target="${2:-unknown}" now
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  mkdir -p "$BACKUP_DIR"
+  {
+    echo "restore_point_utc=$now"
+    echo "previous_version=$prev"
+    echo "target_version=$target"
+  } > "$BACKUP_DIR/managed-restore-point"
+  echo
+  echo -e "${RED}${BOLD}  ┌─ MANAGED POSTGRESQL — NO AUTOMATIC ROLLBACK ────────────────────${NC}"
+  echo -e "${RED}${BOLD}  │${NC} If this upgrade goes bad, ${BOLD}\`agentos rollback\` will NOT save you${NC}:"
+  echo -e "${RED}${BOLD}  │${NC} the schema migrates forward-only and the boot guard refuses old"
+  echo -e "${RED}${BOLD}  │${NC} code against it. Recovery is EXTERNAL and manual:"
+  echo -e "${RED}${BOLD}  │${NC}   1. restore the managed DB to a point BEFORE ${BOLD}${now}${NC}"
+  echo -e "${RED}${BOLD}  │${NC}      from your provider's PITR / backup, then"
+  echo -e "${RED}${BOLD}  │${NC}   2. re-pin the previous version (${BOLD}${prev}${NC})."
+  echo -e "${RED}${BOLD}  │${NC} Restore point saved: ${DIM}$BACKUP_DIR/managed-restore-point${NC}"
+  echo -e "${RED}${BOLD}  │${NC} Runbook: ${DIM}docs/runbooks/managed-pg-recovery.md${NC}"
+  echo -e "${RED}${BOLD}  └─────────────────────────────────────────────────────────────────${NC}"
+  echo
 }
 
 # Idempotent AGENTOS_IMAGE= rewrite in .env; drops the sed -i.bak leftover on
@@ -276,6 +319,9 @@ docker_upgrade() { # docker_upgrade [tag] [image-ref]  — empty tag = latest st
   fi
   prev="$(grep -E '^AGENTOS_IMAGE=' "$AGENTOS_HOME/.env" | cut -d= -f2-)"
   [ "$image" = "$prev" ] && { echo "already at $image"; return 0; }
+  # Managed PG: record the pre-flip restore point + shout that there is no
+  # automatic rollback here, BEFORE anything changes. No-op on SQLite nodes.
+  managed_pg_restore_point "$prev" "$image"
   snap="$(docker_backup_sqlite | tail -1)"   # consistent copy: the node is stopped
   [ -n "$snap" ] && echo "$snap" > "$BACKUP_DIR/.last-upgrade"   # pairs archive + pre-upgrade image (its .image sidecar), before the flip
   docker_set_image "$image"
@@ -388,7 +434,15 @@ systemd_backup_sqlite() { # systemd_backup_sqlite <label> — <label> is the cod
 systemd_prune_backups() { # AGENTOS_KEEP_BACKUPS (default 5) — never removes the dir $BACKUP_DIR/.last-upgrade points at, regardless of age, so routine backup churn can't strand a pending rollback
   local keep="${AGENTOS_KEEP_BACKUPS:-5}" protect=""
   [ -f "$BACKUP_DIR/.last-upgrade" ] && protect="$(basename "$(cat "$BACKUP_DIR/.last-upgrade" 2>/dev/null || true)")"
-  ls -1dt "$BACKUP_DIR"/*/ 2>/dev/null | tail -n +"$((keep + 1))" | while IFS= read -r d; do
+  # Only AUTO snapshots are subject to keep-N retention. systemd_backup_sqlite
+  # names them <UTC-timestamp>-<tag> (e.g. 20260807T211046Z-v2.30.1); a human's
+  # deliberate backup (manual-<ts>-<label>, incident surgery) does NOT match that
+  # shape and is NEVER counted toward keep-N nor pruned — auto-retention must not
+  # eat a hand-made safety net. Filtering here (not just skipping in the loop)
+  # also stops manual dirs from occupying keep-N slots and evicting real snapshots.
+  ls -1dt "$BACKUP_DIR"/*/ 2>/dev/null \
+    | grep -E '/[0-9]{8}T[0-9]{6}Z-[^/]+/?$' \
+    | tail -n +"$((keep + 1))" | while IFS= read -r d; do
     [ -n "$protect" ] && [ "$(basename "$d")" = "$protect" ] && continue
     rm -rf "$d"
     info "pruned $(basename "$d")"
@@ -432,6 +486,16 @@ prune_versions() { # keep current + 2 previous version dirs under versions/ — 
     src="$(cat "$BACKUP_DIR/.last-upgrade" 2>/dev/null || true)"
     [ -n "$src" ] && [ -f "$src/version" ] && last_upgrade_ver="$(cat "$src/version" 2>/dev/null || true)"
   fi
+  # The .last-upgrade protection exists to keep the DATABASE rollback target's
+  # version tree. Under managed PostgreSQL no local snapshot is ever taken
+  # (systemd_backup_sqlite is a deliberate no-op), so .last-upgrade NEVER
+  # advances past the last SQLite-era snapshot — it freezes, and this protection
+  # would then pin that one ancient version dir on disk forever (observed on a
+  # managed-PG node: a v2.24.0 tree stranded across every later upgrade). And
+  # `agentos rollback` is refused in managed mode anyway, so the pin guards
+  # nothing real. Drop it there; the keep-newest-3 window below still retains the
+  # current release plus the two most recent previous trees for a manual re-pin.
+  if uses_managed_postgres; then last_upgrade_ver=""; fi
   ls -1dt "$AGENTOS_HOME/versions"/*/ 2>/dev/null | tail -n +4 | while IFS= read -r d; do
     local tag; tag="$(basename "$d")"
     [ "$tag" = "$cur" ] && continue
@@ -517,6 +581,9 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   chown -R "$AGENTOS_ACCOUNT:$AGENTOS_ACCOUNT" "$AGENTOS_HOME/versions/$tag"
 
   step "Upgrading $prev → $tag"
+  # Managed PG: record the pre-flip restore point + shout that there is no
+  # automatic rollback here, BEFORE the unit is even stopped. No-op on SQLite.
+  managed_pg_restore_point "$prev" "$tag"
   systemctl stop "$AGENTOS_SERVICE"
   snap="$(systemd_backup_sqlite "$prev" | tail -1)"   # consistent copy: the unit is stopped
   [ -n "$snap" ] && echo "$snap" > "$BACKUP_DIR/.last-upgrade"   # pairs snapshot + code tag atomically, before the swap
@@ -654,9 +721,21 @@ cmd_upgrade() {
 # next to this CLI in profiles/); this is the one entrypoint the systemd timer
 # invokes so a node has a single `agentos` command surface.
 cmd_autoupdate() {
-  local here; here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+  local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
+  local here; here="$(cd "$(dirname "$self")" && pwd)"
   local poller="$here/agentos-autoupdate.sh"
   [ -x "$poller" ] || die "autoupdater not found at $poller"
+  # The poller's apply step runs `$AGENTOS_AUTOUPDATE_APPLY_CMD --to <tag>`. Its
+  # built-in default is the BARE `agentos`, which exists on PATH only for the
+  # DEFAULT slot — a named (--user) instance's CLI is `agentos-<name>` and plain
+  # `agentos` is not installed, so auto-apply died with "agentos: command not
+  # found" and NO named instance ever self-upgraded (the policy layer decided
+  # `auto`, then the apply silently failed). Point the apply command at THIS very
+  # CLI entrypoint — the same file now running, already carrying the instance's
+  # AGENTOS_DIR/SERVICE/USER in its environment — so it upgrades the right node
+  # whatever the instance is called, and the default slot keeps working too.
+  # Still overridable: the test suite substitutes a recorder via this same var.
+  export AGENTOS_AUTOUPDATE_APPLY_CMD="${AGENTOS_AUTOUPDATE_APPLY_CMD:-$self upgrade}"
   exec "$poller" "$@"
 }
 

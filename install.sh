@@ -983,7 +983,8 @@ install_autoupdate_timer() { # install_autoupdate_timer <profiles-dir>
             "$pdir/agentos-autoupdate.timer" \
     | $SUDO tee "/etc/systemd/system/${au}.timer" >/dev/null
   # The operator's auto-apply appetite, when they set one. Default lives in the
-  # unit (patch): patch/security land unattended, minor/major wait for a button.
+  # unit (all): every eligible release lands unattended (incl. breaking/major),
+  # subject only to the engine's safety holds. Set the env var to narrow it.
   if [ -n "${AGENTOS_AUTOUPDATE_POLICY:-}" ]; then
     $SUDO mkdir -p "/etc/systemd/system/${au}.service.d"
     printf '[Service]\nEnvironment=AGENTOS_AUTOUPDATE_POLICY=%s\n' "${AGENTOS_AUTOUPDATE_POLICY}" \
@@ -991,7 +992,7 @@ install_autoupdate_timer() { # install_autoupdate_timer <profiles-dir>
   fi
   $SUDO systemctl daemon-reload
   if $SUDO systemctl enable --now "${au}.timer" >/dev/null 2>&1; then
-    ok "auto-update timer armed (policy=${AGENTOS_AUTOUPDATE_POLICY:-patch})"
+    ok "auto-update timer armed (policy=${AGENTOS_AUTOUPDATE_POLICY:-all})"
   else
     warn "could not enable ${au}.timer — arm it with: systemctl enable --now ${au}.timer"
   fi
