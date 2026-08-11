@@ -200,6 +200,38 @@ valid_policy() { case "${1:-}" in off|security|patch|minor|all) return 0 ;; *) r
 # (which would hand the service account every unit root runs) and =/ (which would
 # chmod 0750 the host's root directory) are both refused without this function
 # having to enumerate them.
+# A validated PATH is still not a safe TARGET, which is what this second guard
+# is for. $AGENTOS_HOME belongs to the unprivileged core (install.sh chowns the
+# tree to the service account on every re-run, and agentos.service grants it
+# ReadWritePaths there), so it can replace a name under that root with a symlink
+# — and root's mkdir/chmod/chown all FOLLOW symlinks. Aimed at
+# /etc/systemd/system, the chown hands the service account every unit root runs.
+# signal_path_ok above cannot catch it: the DEFAULT path is the vector, and the
+# default is legitimate. The attack is on what the name points AT.
+#
+# File scope, not nested in its caller, and the same function under the same
+# name in install.sh — which has three call sites of its own. Hand-copied parity
+# between these two files has already produced two wrong comments and one
+# unreachable helper on this branch alone.
+#
+# Returns 0 when <path> is free (the caller's mkdir is what creates it) or is a
+# real directory. Never for a symlink, and never for anything else that exists.
+plain_dir_ok() { # plain_dir_ok <path> <label> -> 0 when it is safe to create/chmod/chown
+  # -L FIRST. A dangling symlink is -L true, -e false and -d false, so every
+  # other test reads it as "not there yet" and goes on to mkdir — which fails
+  # EEXIST over a link, and reported THAT as "could not create the inbox": a
+  # disk-full story told about an attack, in the one line an operator reading an
+  # upgrade log has to go on.
+  if [ -L "$1" ]; then
+    warn "refusing to touch the $2 ($1): it is a symlink, not a directory — nothing was created, chmod'ed or chowned. Remove it and re-run; the node keeps updating on the six-hourly timer meanwhile"
+    return 1
+  fi
+  [ ! -e "$1" ] && return 0        # free: the caller's mkdir is what creates it
+  [ -d "$1" ] && return 0
+  warn "refusing to touch the $2 ($1): it exists but is not a directory — nothing was created, chmod'ed or chowned"
+  return 1
+}
+
 signal_path_ok() { # signal_path_ok <path> <required-last-component>
   local p="${1:-}"
   case "$p" in
@@ -618,80 +650,77 @@ ensure_signal_dirs() { # ensure_signal_dirs <docker|systemd>
     env_warned=1
     return 0
   }
-  # A validated PATH is not a safe TARGET. $INSTALL_DIR belongs to the service
-  # account (install.sh chowns the tree on every re-run) and agentos.service
-  # grants it ReadWritePaths there, so the core can replace `signals` with a
-  # symlink and have the chmod/chown below land on whatever it points at —
-  # /etc/systemd/system would hand it every unit root runs. resolve_signal_paths
-  # cannot catch this: the default path is the vector, and the default is
-  # legitimate. Refuse rather than `chown -h`-retarget: retargeting as a
-  # SUBSTITUTE for refusing would leave the attacker's symlink in place and the
-  # node quietly dead (the core cannot write through a link it does not own),
+  # The guard is plain_dir_ok, at file scope above — one copy, shared with the
+  # paths install.sh guards, because this rule drifting between the two files is
+  # the standing hazard here. Refuse rather than `chown -h`-retarget: retargeting
+  # as a SUBSTITUTE for refusing would leave the attacker's symlink in place and
+  # the node quietly dead (the core cannot write through a link it does not own),
   # trading a loud failure for a silent one. `-h` IS on the chown below, but only
   # as a backstop on an already-verified directory — see the residual note there.
   # Skipping one directory is never fatal — the node keeps updating on the
   # six-hourly timer, which is what that timer is for.
-  signal_dir_ready() { # signal_dir_ready <path> <label> -> 0 when safe to create/chmod/chown
-    # -L FIRST. A dangling symlink is -L true, -e false and -d false, so every
-    # other test reads it as "not there yet" and goes on to mkdir — which fails
-    # EEXIST over a link, and reported THAT as "could not create the inbox": a
-    # disk-full story told about an attack, in the one line an operator reading
-    # an upgrade log has to go on.
-    if [ -L "$1" ]; then
-      warn "refusing to touch the update-signal $2 ($1): it is a symlink, not a directory — nothing was created, chmod'ed or chowned. Remove it and re-run; the node keeps updating on the six-hourly timer meanwhile"
-      return 1
-    fi
-    [ ! -e "$1" ] && return 0        # free: the mkdir below is what creates it
-    [ -d "$1" ] && return 0
-    warn "refusing to touch the update-signal $2 ($1): it exists but is not a directory — nothing was created, chmod'ed or chowned"
-    return 1
-  }
-  # Guard FIRST, create SECOND — and still TWO mkdir statements, never
-  # `mkdir -p "$inbox" "$outbox"`. One call fails as a unit: an outbox that
-  # cannot be created (a read-only /var, an operator-chosen path) took the
-  # inbox's chmod and chown down with it and returned, leaving exactly the "the
-  # directory exists but the core cannot write to it" state this function exists
-  # to prevent — and saying so in the vaguer of the two messages.
+  #
+  # Guard, create, harden — per directory, in that order, one directory at a
+  # time. Never `mkdir -p "$inbox" "$outbox"`, because one call fails as a unit:
+  # an outbox that cannot be created (a read-only /var, an operator-chosen path)
+  # took the inbox's chmod and chown down with it and returned, leaving exactly
+  # the "the directory exists but the core cannot write to it" state this
+  # function exists to prevent — and saying so in the vaguer of the two messages.
+  #
+  # And never batched — all the guards, then all the mkdirs, then all the chmods
+  # — because batching WIDENS the one window that matters. Interleaved, exactly
+  # one command (the mkdir) stands between a guard and the chmod it protects,
+  # here and in install.sh's copy alike, and the suite reads both windows off an
+  # xtrace so this cannot quietly stop being true. Batched, the outbox's chmod
+  # trailed its guard by six: BOTH mkdirs, the inbox's chmod and chown, and the
+  # two `sed`s of a persist — eight processes, since each of those `sed`s is
+  # piped into a `tail`. Which is why the .env writes are now at the bottom,
+  # after both directories are settled, instead of in between them.
+  #
+  # RESIDUAL, stated as what THIS CODE does and what a winner gets. This block
+  # asserts nothing about what any tool offers on any platform: three such claims
+  # were written here and two were wrong, and the versions that decide them
+  # belong to the operator's host, not to us.
+  #
+  # A guard is a check and what follows is a separate process, so a swap in
+  # between still wins the race. `chown -h` does not close it — nothing here
+  # makes check-and-act atomic — and it is not the response to a planted symlink
+  # either: refusing is, above. It runs on a directory just verified, where it is
+  # a no-op except in the one case that matters, and what it changes is what
+  # LOSING costs. Lost with it, the ownership change lands on the link itself and
+  # the target keeps its own uid/gid. Lost without it, root hands the service
+  # account whatever the link named, and /etc/systemd/system is every unit root
+  # runs.
+  #
+  # The chmod is a plain chmod on that same just-verified path, so a link swapped
+  # in before it runs IS followed. What that wins an attacker: a target that was
+  # tighter, widened to 0750 — a confidentiality loss, and a denial of service
+  # against anything relying on the old mode. What it does not win: ownership,
+  # which does not move; or privilege, because the mode this code passes carries
+  # no special digit and so cannot ADD setuid or setgid to anything. (Only that
+  # half is claimed. Whether such a bit already on the target survives is a
+  # question about the host's chmod, and this block does not answer those.)
+  # Which is why the chmod goes first, while the guard's answer is newest, and
+  # why that ordering is pinned by a test rather than left to prose. Closing the
+  # window needs a chmod that does not follow the link; this code does not
+  # attempt one.
   local have_inbox=1 have_outbox=1
-  signal_dir_ready "$inbox"  "inbox"  || have_inbox=0
-  signal_dir_ready "$outbox" "outbox" || have_outbox=0
+  plain_dir_ok "$inbox" "update-signal inbox" || have_inbox=0
   if [ "$have_inbox" = 1 ] && ! mkdir -p "$inbox" 2>/dev/null; then
     warn "could not create the update-signal inbox ($inbox) — the node cannot write update pokes and will keep updating on the six-hourly timer"
     have_inbox=0
   fi
-  if [ "$have_outbox" = 1 ] && ! mkdir -p "$outbox" 2>/dev/null; then
-    warn "could not create the update-signal outbox ($outbox) — an unattended upgrade cannot report its outcome, so the owner will not be told how it went"
-    have_outbox=0
-  fi
-  # RESIDUAL, stated rather than papered over. The guard above is a check and
-  # what follows is a separate process, so a swap in between still wins the race.
-  # `chown -h` does NOT close it — nothing in bash makes check-and-act atomic —
-  # and it is NOT the response to a planted symlink either: refusing is, above.
-  # It runs on a directory already verified, where it is a no-op except in the
-  # one case that matters. What it changes is what LOSING costs. Lost with it,
-  # the ownership lands on the link itself and the target keeps its own uid/gid.
-  # Lost without it, root hands the service account whatever the link named, and
-  # /etc/systemd/system is every unit root runs.
-  #
-  # chmod stays exposed either way, so it goes first, while the guard's answer is
-  # newest. There is no no-follow chmod where it matters: BSD has `chmod -h`, but
-  # Linux has no lchmod(2), so GNU chmod has neither -h nor --no-dereference —
-  # and Linux is what a node runs. Winning that window redirects permission BITS
-  # onto a path of the attacker's choosing, which transfers nothing. Closing it
-  # needs openat(O_NOFOLLOW|O_DIRECTORY)+fchmod: bash cannot express it, and the
-  # /proc/<pid>/fd approximation is Linux-only, so it would fall back to exactly
-  # this code on the macOS boxes this ships from.
   if [ "$have_inbox" = 1 ]; then
     chmod 0750 "$inbox" 2>/dev/null || true
     if [ -n "$inbox_owner" ] && ! chown -h "$inbox_owner" "$inbox" 2>/dev/null; then
       fix="sudo chown $inbox_owner $inbox"
       warn "could not give $inbox to ${inbox_owner} — the node cannot write update pokes and will fall back to the six-hourly timer. Fix with: ${fix}"
     fi
-    persist_signal_key AGENTOS_SIGNAL_INBOX "$inbox"
-    # docker only: the key compose interpolates for the mount SOURCE. On bare
-    # metal there is no mount and install.sh writes no such key, so inventing
-    # one here would put a second name for the same idea in the file.
-    [ "$mode" = docker ] && persist_signal_key AGENTOS_SIGNAL_INBOX_HOST "$inbox"
+  fi
+  plain_dir_ok "$outbox" "update-signal outbox" || have_outbox=0
+  if [ "$have_outbox" = 1 ] && ! mkdir -p "$outbox" 2>/dev/null; then
+    warn "could not create the update-signal outbox ($outbox) — an unattended upgrade cannot report its outcome, so the owner will not be told how it went"
+    have_outbox=0
   fi
   if [ "$have_outbox" = 1 ]; then
     chmod 0750 "$outbox" 2>/dev/null || true
@@ -703,6 +732,18 @@ ensure_signal_dirs() { # ensure_signal_dirs <docker|systemd>
       fix="sudo chown root:${outbox_group} $outbox"
       warn "could not give $outbox to group ${outbox_group} — the node cannot read upgrade results, so unattended upgrades will complete without telling the owner. Fix with: ${fix}"
     fi
+  fi
+  # .env last, once both directories are settled. These are two `sed`s apiece,
+  # and between a guard and the chmod it protects is the one place they must not
+  # run.
+  if [ "$have_inbox" = 1 ]; then
+    persist_signal_key AGENTOS_SIGNAL_INBOX "$inbox"
+    # docker only: the key compose interpolates for the mount SOURCE. On bare
+    # metal there is no mount and install.sh writes no such key, so inventing
+    # one here would put a second name for the same idea in the file.
+    [ "$mode" = docker ] && persist_signal_key AGENTOS_SIGNAL_INBOX_HOST "$inbox"
+  fi
+  if [ "$have_outbox" = 1 ]; then
     persist_signal_key AGENTOS_SIGNAL_OUTBOX "$outbox"
     [ "$mode" = docker ] && persist_signal_key AGENTOS_SIGNAL_OUTBOX_HOST "$outbox"
   fi

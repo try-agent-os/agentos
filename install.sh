@@ -147,6 +147,42 @@ ok()    { echo -e "  ${GREEN}✓${NC} $*"; }
 warn()  { echo -e "  ${YELLOW}!${NC} $*"; }
 die()   { echo -e "\n${RED}✗ $*${NC}\n" >&2; exit 1; }
 
+# ─── is this name safe for root to create and chown? ────────────────────────
+#
+# Every directory this script hands to the service account lives under
+# $INSTALL_DIR, and $INSTALL_DIR belongs to that account — install_systemd
+# chowns the whole tree to it on every re-run, and agentos.service grants the
+# core ReadWritePaths over it. So for any such name the core may have got there
+# first and left a symlink, and root's `mkdir -p`/`chmod`/`chown` all FOLLOW
+# symlinks: aimed at /etc/systemd/system, the chown hands the service account
+# every unit root runs.
+#
+# No string check reaches this. The paths are the product's own legitimate
+# defaults; the attack is on what the name points AT.
+#
+# Three call sites share this rule (the two signal directories and the contour
+# repos checkout), and the CLI carries the same function under the same name for
+# its own copy of the signal directories. It is ONE function per file rather
+# than one per caller because hand-copied parity between these two files has
+# already produced two wrong comments and one unreachable helper.
+#
+# Returns 0 when <path> is free (the caller's mkdir is what creates it) or is a
+# real directory. Never for a symlink, and never for anything else that exists.
+plain_dir_ok() { # plain_dir_ok <path> <label> -> 0 when it is safe to create/chmod/chown
+  # -L FIRST. A dangling symlink is -L true, -e false and -d false, so every
+  # other test reads it as "not there yet" and goes on to mkdir — which fails
+  # EEXIST over a link, and under `set -e` that took the whole install down
+  # before this guard could say a word about it.
+  if [ -L "$1" ]; then
+    warn "refusing to touch the $2 ($1): it is a symlink, not a directory — nothing was created, chmod'ed or chowned. Move it aside and re-run"
+    return 1
+  fi
+  [ ! -e "$1" ] && return 0        # free: the caller's mkdir is what creates it
+  [ -d "$1" ] && return 0
+  warn "refusing to touch the $2 ($1): it exists but is not a directory — nothing was created, chmod'ed or chowned"
+  return 1
+}
+
 # ─── args ───────────────────────────────────────────────────────────────────
 
 while [ $# -gt 0 ]; do
@@ -273,8 +309,22 @@ merge_contour_secrets() {
   $su chmod 600 "$envfile"
   # Hand it to the service account only in systemd mode (docker leaves it with the
   # invoking user). Guarded: the account may not exist yet in a dry run.
+  #
+  # -h, because $envfile sits in a directory the core owns and this is root. It
+  # cannot follow a link, so a link planted at that name takes the ownership
+  # change on itself instead of passing it to whatever it points at. Costs
+  # nothing: the line already ends in `|| true`, so it cannot abort either way.
+  #
+  # What -h does NOT close, stated because it is the more valuable half: the
+  # `tee` three lines up writes the merged secrets to that same name, so a link
+  # planted before it puts the contents — a bot token, a GitHub token — into a
+  # path of the core's choosing. Nothing available in bash closes that: the file
+  # is written by redirecting into a name, and naming a path is the whole of the
+  # exposure. A guard here would only narrow the window, not remove it, and the
+  # honest fix is that the core should not be able to reach this directory at
+  # all. Filed, not attempted here.
   [ "${INSTALL_MODE:-}" = "systemd" ] && [ -n "${SUDO:-}" ] \
-    && $SUDO chown "${SERVICE_USER}:${SERVICE_USER}" "$envfile" 2>/dev/null || true
+    && $SUDO chown -h "${SERVICE_USER}:${SERVICE_USER}" "$envfile" 2>/dev/null || true
   n="$(printf '%s\n' "$declared" | grep -c . || true)"
   ok "merged ${n} contour secret key(s) into .env: $(printf '%s ' $declared)"
 }
@@ -336,8 +386,23 @@ setup_contour_repos() {
     warn "no GitHub token in .env (looked for ${GH_TOKEN_KEY:+${GH_TOKEN_KEY}, }GH_TOKEN, GITHUB_TOKEN)"
     warn "repos will be attempted unauthenticated — declare the token in --secrets for private repos"
   fi
+  # Same guard as the signal directories, and this site needs it MORE. There is
+  # no race to win here: the installer has just blocked in wait_healthz until the
+  # core answered, and there is no `systemctl stop` anywhere in the install path,
+  # so on a re-run the core is live and running while root does this. It owns
+  # $INSTALL_DIR; it can point `repos` wherever it likes and be certain root will
+  # arrive.
+  #
+  # `return 0`, not a skipped chown: the clone loop below writes into
+  # $reposdir/$name, so continuing would clone THROUGH the link — root creating
+  # trees wherever it points. `return`, never `die`: a refusal must not abort an
+  # otherwise healthy install, exactly as in create_signal_dirs.
+  plain_dir_ok "$reposdir" "contour repos directory" || return 0
   $SUDO mkdir -p "$reposdir"
-  $SUDO chown "${SERVICE_USER}:${SERVICE_USER}" "$reposdir"
+  # -h for the same reason it is on the signal directories: it cannot follow a
+  # link, so if one is planted between the guard and here, the ownership change
+  # lands on the link and not on what it names.
+  $SUDO chown -h "${SERVICE_USER}:${SERVICE_USER}" "$reposdir"
   # Authenticate git to GitHub via gh's credential helper, once, for the account.
   # GH_TOKEN is exported into run_as_service's environment — never onto its argv.
   if [ -n "$token" ] && command -v gh >/dev/null 2>&1; then
@@ -846,9 +911,17 @@ create_signal_dirs() {
     inbox_owner="${CORE_CONTAINER_UID}:${CORE_CONTAINER_GID}"
     outbox_group="${CORE_CONTAINER_GID}"
   fi
-  # Same guard, same reason, same order as the CLI's ensure_signal_dirs — kept in
-  # step BY HAND, and the two differ only where the message does (this one has no
-  # six-hourly timer to reassure anyone about yet). $INSTALL_DIR belongs to the
+  # Same guard, same reason, and the same PER-DIRECTORY order as the CLI's
+  # ensure_signal_dirs — guard, mkdir, chmod, chown, one directory at a time, so
+  # that in both files exactly one process stands between a guard and the chmod it
+  # protects. Kept in step BY HAND; the two differ only where the message does
+  # (this one has no six-hourly timer to reassure anyone about yet). The ordering
+  # claim is checked, not merely checkable: scripts/tests/agentos-signals.test.sh
+  # traces BOTH functions — this one through its AGENTOS_PRINT_SIGNAL_DIRS
+  # dry-run — and reads the commands that run between each `plain_dir_ok` and the
+  # `chmod` it guards. Anything but the one mkdir fails. That test was blind to
+  # this file until it was made to trace it, and blind to guards altogether
+  # before that, so the claim stood while the code drifted. $INSTALL_DIR belongs to the
   # service account (the chown -R below runs on every re-run) and agentos.service
   # grants it ReadWritePaths there, so the core can swap `signals` for a symlink
   # and have the chown/chmod land on its target; /etc/systemd/system would hand it
@@ -858,46 +931,41 @@ create_signal_dirs() {
   # goes on the chown below — as a belt on top of the refusal, never instead of
   # it; see the ordering note there.) Skipping one directory is never fatal here
   # either — the timer still covers the node.
-  signal_dir_ready() { # signal_dir_ready <path> <label> -> 0 when safe to create/chmod/chown
-    # -L FIRST. A dangling symlink is -L true, -e false and -d false, so every
-    # other test reads it as "not there yet" and goes on to mkdir — which fails
-    # EEXIST over a link, and under `set -e` that took the whole install down
-    # before this guard could say a word about it.
-    if [ -L "$1" ]; then
-      warn "refusing to touch the update-signal $2 ($1): it is a symlink, not a directory — nothing was created, chmod'ed or chowned. Move it aside and re-run"
-      return 1
-    fi
-    [ ! -e "$1" ] && return 0        # free: the mkdir below is what creates it
-    [ -d "$1" ] && return 0
-    warn "refusing to touch the update-signal $2 ($1): it exists but is not a directory — nothing was created, chmod'ed or chowned"
-    return 1
-  }
   # Guard FIRST, create SECOND, and one mkdir per directory: `mkdir -p` over a
   # symlink to a directory succeeds silently (so its exit status says nothing
   # about what is there), over a dangling one it fails — and a single
   # `mkdir -p a b` would let either name take the other down with it.
   #
-  # chmod, then `chown -h`. The mode goes first because it is the exposed step:
-  # there is no no-follow chmod where it matters — BSD has `chmod -h`, but Linux
-  # has no lchmod(2), so GNU chmod has neither -h nor --no-dereference, and Linux
-  # is what a node runs — so it goes on while the guard's answer is newest.
+  # chmod, then `chown -h` — and the residual stated as what THIS CODE does and
+  # what a winner gets. This block asserts nothing about what any tool offers on
+  # any platform: three such claims were written here and two were wrong, and the
+  # versions that decide them belong to the operator's host, not to us.
   #
-  # `-h` does NOT close the race, and it is NOT the response to a planted
-  # symlink: refusing is, above. It runs on a directory this function has already
-  # verified, where it is a no-op — except in the one case that matters, a link
-  # swapped in after the guard. Nothing in bash makes check-and-act atomic; what
-  # `-h` changes is what LOSING costs. Lost with it, the ownership lands on the
-  # link itself and the target keeps its own uid/gid. Lost without it, root hands
-  # the service account whatever the link named, and /etc/systemd/system is every
-  # unit root runs. The chmod stays exposed either way: winning that window can
-  # still redirect permission BITS onto a path of the attacker's choosing, which
-  # transfers nothing.
-  if signal_dir_ready "$INSTALL_DIR/signals" "inbox"; then
+  # `chown -h` does not close the race and is not the response to a planted
+  # symlink: refusing is, above. It runs on a directory just verified, where it
+  # is a no-op except in the one case that matters. Nothing here makes
+  # check-and-act atomic; what `-h` changes is what LOSING costs. Lost with it,
+  # the ownership change lands on the link itself and the target keeps its own
+  # uid/gid. Lost without it, root hands the service account whatever the link
+  # named, and /etc/systemd/system is every unit root runs.
+  #
+  # The chmod is a plain chmod on that same just-verified path, so a link
+  # swapped in before it runs IS followed. What that wins an attacker: a target
+  # that was tighter, widened to 0750 or 0755 — a confidentiality loss, and a
+  # denial of service against anything relying on the old mode. What it does not
+  # win: ownership, which does not move; or privilege, because the modes this
+  # code passes carry no special digit and so cannot ADD setuid or setgid to
+  # anything. (Only that half is claimed. Whether such a bit already on the
+  # target survives is a question about the host's chmod, and this block does not
+  # answer those.) Which is why the chmod goes first, while the guard's answer is
+  # newest, and why that ordering is pinned by a test — of BOTH files' windows —
+  # rather than left to prose.
+  if plain_dir_ok "$INSTALL_DIR/signals" "update-signal inbox"; then
     $SUDO mkdir -p "$INSTALL_DIR/signals"
     $SUDO chmod 0750 "$INSTALL_DIR/signals"
     $SUDO chown -h "$inbox_owner" "$INSTALL_DIR/signals"
   fi
-  if signal_dir_ready "$outbox" "outbox"; then
+  if plain_dir_ok "$outbox" "update-signal outbox"; then
     $SUDO mkdir -p "$outbox"
     $SUDO chmod 0750 "$outbox"
     $SUDO chown -h "root:${outbox_group}" "$outbox"
@@ -906,12 +974,20 @@ create_signal_dirs() {
   # allowed to list. Guarded like the other two rather than argued about: it is
   # root's, under a root-owned /var/lib, so no unprivileged process can plant a
   # link here today — and "today" is not a property a root chmod should rest on.
-  # The mkdir is not redundant with the outbox's: the guard passes on a name that
-  # is simply FREE, and if the outbox above was refused this directory may never
-  # have been created — `chmod` on a path that does not exist fails, and under
-  # `set -e` that would abort the install over a refusal that was supposed to be
-  # survivable.
-  if signal_dir_ready "${HOST_PREFIX}/var/lib/${SERVICE_NAME}" "state directory"; then
+  # The mkdir is idempotent and is NOT here to cover a reachable case: refusing
+  # the outbox above requires something to exist at $STATE/outbox, which requires
+  # $STATE itself to exist, so by the time this runs it always does. It is here
+  # so that this block does not silently depend on the block above having created
+  # it for us — which is the kind of coupling that becomes false later, and a
+  # `chmod` on a path that does not exist fails under `set -e`.
+  #
+  # NOT handled, and stated because the benign case beside it IS an asserted
+  # property: a DANGLING symlink at this path still kills the install at rc 1,
+  # with a bare `mkdir` error, before the guard below is ever consulted — the
+  # outbox above is created first, and its `mkdir -p` walks this component. The
+  # guard is leaf-only: it covers the name it is handed, never that name's
+  # parents. Both need /var/lib to be writable by the core, which it is not.
+  if plain_dir_ok "${HOST_PREFIX}/var/lib/${SERVICE_NAME}" "update-signal state directory"; then
     $SUDO mkdir -p "${HOST_PREFIX}/var/lib/${SERVICE_NAME}"
     $SUDO chmod 0755 "${HOST_PREFIX}/var/lib/${SERVICE_NAME}"
   fi
