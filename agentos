@@ -131,6 +131,300 @@ docker_set_image() {
   rm -f "$AGENTOS_HOME/.env.bak"
 }
 
+# ─── what may be believed out of .env ───────────────────────────────────────
+#
+# .env is the node's configuration AND a file the UNPRIVILEGED core owns and can
+# rewrite: install.sh chowns the whole install root to the service account, the
+# core's unit grants it ReadWritePaths= over that root, and agent sessions run as
+# that account with a shell. This CLI reads that file as ROOT — inside an upgrade
+# it mkdir/chmod 0750/chowns the two directories it names, and it copies two of
+# its values into the root poller's unit (which has no EnvironmentFile= precisely
+# so that the core cannot hand root an environment; see
+# scripts/release/agentos-autoupdate.service). So nothing leaves this file
+# unchecked. install.sh has the same three rules; the two are separate by
+# necessity (this CLI ships inside the image, install.sh arrives by curl) and
+# must be kept in step by hand, exactly like create_signal_dirs/ensure_signal_dirs.
+dotenv_val() { # dotenv_val <key> — the last assignment of <key> in .env, or empty
+  sed -n "s/^$1=//p" "$AGENTOS_HOME/.env" 2>/dev/null | tail -1 || true
+}
+
+# One key into .env, atomically, without disturbing the file's identity.
+# Every step is checked and the ORIGINAL is only replaced by a complete temp
+# file, because the alternatives both lose data on a full disk: a `>` redirect
+# onto .env truncates at open, so an ENOSPC mid-write leaves the node's .env
+# partial — bot token and database credentials gone — and an unchecked write
+# leaves a caller acting on the strength of a rewrite that never happened.
+#
+# The temp file lives in the SAME directory as .env (never /tmp: that is a
+# cross-filesystem rename, and a world-listable place to stage a file that holds
+# secrets), and the original's mode and owner are copied onto it before the
+# rename: .env is 0600 owned by the service account while this CLI runs as root,
+# and a bare `mv` would hand the node its own config file back as root-owned and
+# unreadable. --reference is GNU coreutils, which is what a node runs; the
+# fallback keeps the mode right anywhere else.
+#
+# Never CREATES .env: a node without one is a node this CLI has no business
+# inventing an install root config for, and a root-owned 0600 file appearing
+# under an install root the service account owns would be its own small outage.
+write_env_key() { # write_env_key <key> <value> — 0 only if .env now holds it
+  local key="$1" value="$2" env_file="$AGENTOS_HOME/.env" tmp rc
+  [ -f "$env_file" ] || return 1
+  tmp="$(mktemp "${env_file}.XXXXXX")" || return 1
+  if grep -v "^${key}=" "$env_file" > "$tmp"; then rc=0; else rc=$?; fi
+  # grep exits 1 when it merely selected nothing (an .env holding only the key
+  # being replaced, or an empty one) — that is not a failure. 2 is.
+  if [ "$rc" -gt 1 ] || ! printf '%s=%s\n' "$key" "$value" >> "$tmp"; then
+    rm -f "$tmp"; return 1
+  fi
+  chmod --reference="$env_file" "$tmp" 2>/dev/null || chmod 600 "$tmp"
+  chown --reference="$env_file" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$env_file" || { rm -f "$tmp"; return 1; }
+  return 0
+}
+
+# The five words the policy may be — the same enum the core's env schema accepts
+# (apps/api/src/app/config/env.ts), so a value refused here would have refused to
+# let the node boot anyway. It matters beyond tidiness because this value is
+# written into the poller's unit as `Environment=AGENTOS_AUTOUPDATE_POLICY=<it>`,
+# and systemd reads ONE such line as SEVERAL assignments when the value contains
+# whitespace: `all AGENTOS_AUTOUPDATE_NOTIFY_CMD=/bin/sh -c …` would hand the root
+# oneshot a command to run.
+valid_policy() { case "${1:-}" in off|security|patch|minor|all) return 0 ;; *) return 1 ;; esac; }
+
+# A path this CLI is willing to create, chmod, chown as root and copy into a unit.
+# Absolute, at least two components, no traversal, no character that would split
+# or be expanded inside a systemd Environment= line — and ending in the component
+# the product actually uses. That last rule is the one that does the work, and it
+# is a whitelist rather than a blacklist of dangerous paths: nothing on a Linux
+# host is called `signals` or `outbox`, so AGENTOS_SIGNAL_INBOX=/etc/systemd/system
+# (which would hand the service account every unit root runs) and =/ (which would
+# chmod 0750 the host's root directory) are both refused without this function
+# having to enumerate them.
+signal_path_ok() { # signal_path_ok <path> <required-last-component>
+  local p="${1:-}"
+  case "$p" in
+    /*/*) ;;                        # absolute AND at least two components
+    *) return 1 ;;
+  esac
+  case "$p" in
+    */../*|*/..)   return 1 ;;
+    *[[:space:]]*) return 1 ;;
+    *\"*|*\'*|*\$*|*%*|*\\*) return 1 ;;
+  esac
+  [ "${p##*/}" = "$2" ]
+}
+
+# Both signal paths, as this node should use them: from .env when .env states
+# something usable, from the values install.sh would have written otherwise.
+# Sets SIGNAL_INBOX / SIGNAL_OUTBOX. <mode> picks which key pair is preferred —
+# docker mode's *_HOST keys are the ones compose interpolates for the mount
+# sources, so what gets created there is exactly what will be mounted — but
+# either pair holds the same HOST paths, so both are consulted.
+#
+# A refused value falls back rather than aborting: the .path unit watches
+# <install root>/signals whatever .env says, so the default is the coherent
+# answer, and an upgrade that is already live and healthy must not be undone
+# over a bad line in a config file. It is never silent, though — the whole point
+# is that someone learns .env is lying.
+resolve_signal_paths() { # resolve_signal_paths <docker|systemd>
+  local first="AGENTOS_SIGNAL_INBOX" second="AGENTOS_SIGNAL_INBOX_HOST"
+  [ "$1" = docker ] && { first="AGENTOS_SIGNAL_INBOX_HOST"; second="AGENTOS_SIGNAL_INBOX"; }
+  SIGNAL_INBOX="$(dotenv_val "$first")"
+  [ -n "$SIGNAL_INBOX" ] || SIGNAL_INBOX="$(dotenv_val "$second")"
+  if [ -n "$SIGNAL_INBOX" ] && ! signal_path_ok "$SIGNAL_INBOX" signals; then
+    warn "refusing the update-signal inbox '${SIGNAL_INBOX}' from .env — it is not an absolute path ending in /signals; using ${AGENTOS_HOME}/signals instead"
+    SIGNAL_INBOX=""
+  fi
+  [ -n "$SIGNAL_INBOX" ] || SIGNAL_INBOX="$AGENTOS_HOME/signals"
+
+  first="AGENTOS_SIGNAL_OUTBOX"; second="AGENTOS_SIGNAL_OUTBOX_HOST"
+  [ "$1" = docker ] && { first="AGENTOS_SIGNAL_OUTBOX_HOST"; second="AGENTOS_SIGNAL_OUTBOX"; }
+  SIGNAL_OUTBOX="$(dotenv_val "$first")"
+  [ -n "$SIGNAL_OUTBOX" ] || SIGNAL_OUTBOX="$(dotenv_val "$second")"
+  if [ -n "$SIGNAL_OUTBOX" ] && ! signal_path_ok "$SIGNAL_OUTBOX" outbox; then
+    warn "refusing the update-signal outbox '${SIGNAL_OUTBOX}' from .env — it is not an absolute path ending in /outbox; using /var/lib/${AGENTOS_SERVICE}/outbox instead"
+    SIGNAL_OUTBOX=""
+  fi
+  # Keyed off the UNIT name, never the install root's basename: `--user hub`
+  # gives /opt/hub but the unit is agentos-hub.
+  [ -n "$SIGNAL_OUTBOX" ] || SIGNAL_OUTBOX="/var/lib/${AGENTOS_SERVICE}/outbox"
+  # Explicit, so no future edit can leave a false test as this function's status
+  # and have `set -e` kill an upgrade at the call site.
+  return 0
+}
+SIGNAL_INBOX=""; SIGNAL_OUTBOX=""
+
+# ─── both modes: reconcile the systemd unit set with the release ────────────
+#
+# Units are the one part of an install that no upgrade path has ever touched:
+# systemd_upgrade only flips the `current` symlink and never enters
+# /etc/systemd/system, and docker_refresh_profiles stopped at the CLI, the
+# poller and the run config. That was harmless while the unit set was static.
+# It stopped being harmless the moment a release started shipping a NEW unit
+# (agentos-autoupdate.path) that a node MUST have for the in-core detector's
+# pokes to be heard: without this, every existing node upgrades to a core that
+# writes pokes nobody listens to, keeps updating on the six-hourly backstop,
+# and nothing anywhere says the fast path never armed.
+#
+# Both modes share it because both get their units the same way: the templates
+# ride the profiles/ layer (docker/Dockerfile.node copies all three into
+# /app/profiles; a release tarball carries them at current/profiles/), and a
+# docker node's auto-update poller is a HOST systemd unit exactly like a
+# bare-metal one.
+#
+# Only what changed is rewritten, so an upgrade that finds the unit set already
+# current does not reload systemd or restart anything at all.
+reconcile_units() { # reconcile_units <profiles-dir>
+  local pdir="$1" au="${AGENTOS_SERVICE}-autoupdate" changed=0
+  # Overridable so the suite can assert the rendered output without root.
+  local units_dir="${AGENTOS_UNITS_DIR:-/etc/systemd/system}"
+  command -v systemctl >/dev/null 2>&1 || return 0
+  [ -d "$pdir" ] || return 0
+  [ -d "$units_dir" ] || return 0
+
+  # No User=/Group= rewriting here: the oneshot runs as root by design and the
+  # .timer/.path carry no User= at all. Only the install-root placeholder, the
+  # CLI entry point and the unit reference need substitution — and the two are
+  # NOT interchangeable: `--user foo` gives install root /opt/foo but unit name
+  # agentos-foo, so the .path must watch $AGENTOS_HOME while being called
+  # ${au}.path. Same three substitutions install.sh's install_autoupdate_timer
+  # makes, against the same templates.
+  render_unit() { # render_unit <src> <dst> [lines appended to the render]
+    # A node upgrading from a release that predates a template simply has no
+    # source file — never an error, and never a unit invented out of nothing.
+    [ -f "$1" ] || return 0
+    local rendered
+    rendered="$(sed -e "s|/opt/agentos|${AGENTOS_HOME}|g" \
+                    -e "s|^ExecStart=/usr/local/bin/agentos |ExecStart=/usr/local/bin/${AGENTOS_SERVICE} |" \
+                    -e "s|^Unit=agentos-autoupdate.service$|Unit=${au}.service|" "$1")"
+    # An `if`, never `[ -n … ] && rendered=…`: as a bare statement a false test
+    # is the command's exit status, and `set -e` would kill the upgrade here.
+    if [ -n "${3:-}" ]; then
+      rendered="${rendered}
+$3"
+    fi
+    if [ ! -f "$2" ] || [ "$rendered" != "$(cat "$2" 2>/dev/null)" ]; then
+      if printf '%s\n' "$rendered" > "$2"; then
+        changed=1
+      else
+        warn "could not write $2 — the old unit stays in place"
+      fi
+    fi
+  }
+
+  # The atomic single-key rewrite lives at the top of this file now
+  # (write_env_key), because ensure_signal_dirs needs the identical guarantees
+  # — .env keeps its owner and 0600 mode, and a failed write leaves the old file
+  # whole rather than a truncated one missing the bot token. This name stays as
+  # the caller's vocabulary: the migration below decides whether to delete the
+  # operator's only record of their policy on this return value.
+  write_env_policy() { # write_env_policy <value> — 0 only if .env now holds it
+    write_env_key AGENTOS_AUTOUPDATE_POLICY "$1"
+  }
+
+  render_unit "$pdir/agentos-autoupdate.timer"   "$units_dir/${au}.timer"
+  render_unit "$pdir/agentos-autoupdate.path"    "$units_dir/${au}.path"
+
+  # The oneshot is rendered further down, after the drop-in migration: it now
+  # carries the policy, and the migration is what settles the policy.
+
+  # The drop-in migration must happen HERE, not only in install.sh: existing
+  # nodes get their units through this path and never re-run the installer. A
+  # unit that starts reading EnvironmentFile= while a stale policy.conf is still
+  # on disk leaves the winner ambiguous — and the operator who narrowed the
+  # policy silently back on `all` is the worst possible outcome of this feature.
+  local dropin_dir="$units_dir/${au}.service.d" conf="$units_dir/${au}.service.d/policy.conf"
+  if [ -f "$conf" ]; then
+    # Read the value the way SYSTEMD would, not the way install.sh happened to
+    # write it — docs/self-host.md tells operators to set the policy "in the
+    # drop-in", so this file is hand-edited in the field. Same extraction as
+    # install.sh's migrate_policy_dropin, and for the same reason: the strict
+    # `^Environment=K=` pattern matched only the bare form, so a quoted, indented
+    # or CRLF spelling came back empty, nothing reached .env, and the `rm -f`
+    # below then deleted the operator's only record of their choice. Take
+    # everything after `Environment=`, drop the quotes whichever spelling used
+    # them, split on whitespace (which puts each assignment — and a trailing CR —
+    # on its own line), and only then match the key. tail -1 keeps last-wins.
+    local migrated
+    migrated="$(sed -n 's/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*//p' "$conf" 2>/dev/null \
+      | sed "s/[\"']//g" \
+      | tr ' \t\r' '\n\n\n' \
+      | sed -n 's/^AGENTOS_AUTOUPDATE_POLICY=//p' | tail -1 || true)"
+    # The drop-in is the operator's ONLY record of the value until it is safely
+    # in .env, so it is deleted only once the rewrite has actually landed. An
+    # unchecked write here would be the same silent return to `all` the tolerant
+    # parsing above exists to prevent, reached by another route — and the
+    # realistic trigger is not permissions on a root-run CLI but ENOSPC or a
+    # read-only remount, seconds after a tarball unpack or a `docker pull`.
+    local keep_dropin=0
+    if [ -n "$migrated" ]; then
+      if [ ! -f "$AGENTOS_HOME/.env" ]; then
+        warn "policy '$migrated' is still in ${conf} — no $AGENTOS_HOME/.env to move it into"
+        keep_dropin=1
+      elif write_env_policy "$migrated"; then
+        ok "migrated auto-update policy '$migrated' into .env"
+      else
+        warn "could not write $AGENTOS_HOME/.env — policy '$migrated' left in $conf"
+        keep_dropin=1
+      fi
+    fi
+    if [ "$keep_dropin" = 0 ]; then
+      rm -f "$conf"
+      # Only when it is now empty — an operator may have their own drop-ins here.
+      rmdir "$dropin_dir" 2>/dev/null || true
+      changed=1
+    fi
+  fi
+
+  # The oneshot, and only now: it CARRIES the policy, so rendering it before the
+  # migration above would arm the poller with `all` while .env said `minor` —
+  # until some later upgrade happened to re-render it. That is the very
+  # two-source ambiguity the migration exists to remove, one layer down.
+  #
+  # It carries the policy at all because the unit has no EnvironmentFile=: .env
+  # belongs to the unprivileged core, and a root unit that read it would let the
+  # core name AGENTOS_AUTOUPDATE_NOTIFY_CMD / _APPLY_CMD (both `bash -c`'d as
+  # root) and AGENTOS_UPDATES_URL. So root reads .env, validates, and writes the
+  # two values the poller and the in-core detector must agree on into the unit
+  # itself. Same single source, opposite direction of trust.
+  local policy svc_env
+  policy="$(dotenv_val AGENTOS_AUTOUPDATE_POLICY)"
+  if [ -n "$policy" ] && ! valid_policy "$policy"; then
+    warn "ignoring AGENTOS_AUTOUPDATE_POLICY='${policy}' in .env — not one of off|security|patch|minor|all; arming the poller with 'all'"
+    policy=""
+  fi
+  [ -n "$policy" ] || policy=all
+  resolve_signal_paths systemd     # either key pair; both hold the HOST paths
+  svc_env="$(printf 'Environment=AGENTOS_AUTOUPDATE_POLICY=%s\nEnvironment=AGENTOS_SIGNAL_INBOX=%s\nEnvironment=AGENTOS_SIGNAL_OUTBOX=%s' \
+    "$policy" "$SIGNAL_INBOX" "$SIGNAL_OUTBOX")"
+  render_unit "$pdir/agentos-autoupdate.service" "$units_dir/${au}.service" "$svc_env"
+
+  # OUTSIDE the changed-gate on purpose, and this is the whole point of the
+  # call: a poke storm trips StartLimitBurst=5 and leaves the oneshot failed,
+  # and that oneshot is what BOTH the .path and the .timer fire — nothing
+  # unattended runs again, so the node cannot upgrade itself out of it. The way
+  # back is a human running `agentos upgrade`, and on a node whose units are
+  # already current that run has nothing to change. Gated on `changed`, the
+  # clearing would never fire in the one scenario it exists for. It is a no-op
+  # on a healthy unit, so running it every time is free.
+  if [ -f "$units_dir/${au}.service" ]; then
+    systemctl reset-failed "${au}.path" "${au}.service" >/dev/null 2>&1 || true
+  fi
+
+  if [ "$changed" = 1 ]; then
+    systemctl daemon-reload || warn "daemon-reload failed; units will apply on next boot"
+    # Never ask systemd to arm a unit this node has no file for: a release that
+    # predates the .path leaves nothing to enable, and the error would be the
+    # only thing an operator saw from an otherwise clean upgrade.
+    if [ -f "$units_dir/${au}.path" ]; then
+      systemctl enable --now "${au}.path" >/dev/null 2>&1 || true
+    fi
+    systemctl enable --now "${au}.timer" >/dev/null 2>&1 || true
+    ok "reconciled auto-update units"
+  fi
+  return 0
+}
+
 # ─── docker mode: refresh the operator tooling that ships in the image ───────
 #
 # The run profiles (compose file + Caddyfile + the `agentos` CLI itself + the
@@ -215,7 +509,203 @@ docker_refresh_profiles() { # docker_refresh_profiles <new-image> [prev-image]
     fi
   done
 
+  # 3. The host's systemd unit set, from the SAME staged profiles (the image
+  #    ships the units next to the CLI), while the staging dir still exists.
+  reconcile_units "$stage" || warn "unit reconciliation hit a snag"
+
   rm -rf "$stage" "$oldstage"
+  return 0
+}
+
+# ─── both modes: the host side of the update signal channel ─────────────────
+#
+# install.sh creates these two directories on a fresh install. An UPGRADED node
+# never re-runs the installer — and both upgrade paths otherwise leave it without
+# them, in two different ways:
+#
+#   docker — docker_refresh_profiles above hands the node a compose file that
+#     BIND-MOUNTS both. Left to docker, a missing mount source is invented
+#     root-owned 0755 and the core (uid 1001) takes EACCES on every poke. That is
+#     strictly worse than having no mounts at all: SignalChannel.available() sees
+#     a directory and returns true, so the detector never emits its "signal
+#     channel is unavailable" warning and never falls back. poke() throws out of
+#     tick() once a minute instead, and the node stops updating IN SILENCE — the
+#     announced-once degradation the spec requires, defeated.
+#   systemd — the DEFAULT install mode. systemd_upgrade only flips the `current`
+#     symlink, so the node arrives here with the .path unit freshly reconciled
+#     onto it (reconcile_units above) and no inbox for it to watch. It degrades
+#     correctly there — no directory, available() false, announce once, six-hourly
+#     backstop — but the plan's whole point is ≤1 minute at idle, and without this
+#     no existing node on the majority install mode would ever get it.
+#
+# The ownership split is install.sh's create_signal_dirs, restated rather than
+# reused: that function lives in install.sh, which this CLI never sources — the
+# CLI ships INSIDE the image at /app/profiles and reaches disk by `docker cp`,
+# while install.sh arrives standalone through curl|bash, so there is no import
+# path between them at any point in the lifecycle. Keep the two in step by hand.
+#
+#   inbox  — writable by whoever the core is, the only writer of pokes.
+#   outbox — root's, group = the core, so it can READ result.json without being
+#            able to create or swap one. 0750 both, never world-anything.
+#
+# WHO the core is, and it is the only thing that differs between the modes:
+#   docker  — uid:gid 1001, the image's runtime user (docker/Dockerfile.node).
+#             A NUMBER, not the name `agentos`: docker mode creates no unix
+#             account at all, and a bind mount carries ids numerically.
+#   systemd — the real service account, by name. It exists on any node this runs
+#             on, but it is CHECKED first: `chown` against an unknown user exits
+#             non-zero, and under `set -e` that would abort an upgrade mid-flight,
+#             with the unit stopped and the symlink already flipped.
+#
+# Two deliberate departures from create_signal_dirs, both safety:
+#   • the outbox's PARENT is not chmod'ed 0755. install.sh computes that path;
+#     here it comes out of .env, so `chmod "$(dirname …)"` on an operator-chosen
+#     value would reach somewhere this CLI has no business (/srv, /mnt, /).
+#   • everything is best-effort, like the profile refresh: a hiccup must never
+#     undo an upgrade that is already live and healthy. But a chown that CANNOT
+#     be done is ANNOUNCED with the command that fixes it — a silent fallback
+#     here would be the same class of failure this function exists to remove.
+#
+# Paths come from .env, which is where install.sh put them and where every other
+# consumer reads them; in docker mode from the *_HOST pair, which is the one
+# compose interpolates for the mount sources, so what is created is exactly what
+# will be mounted. They come through resolve_signal_paths, never raw: this runs
+# as root and chowns what it is told, and .env is a file the core can rewrite.
+CORE_CONTAINER_UID=1001   # docker/Dockerfile.node: useradd -u 1001 -g nodejs
+CORE_CONTAINER_GID=1001   # docker/Dockerfile.node: groupadd -g 1001 nodejs
+ensure_signal_dirs() { # ensure_signal_dirs <docker|systemd>
+  local mode="$1" inbox outbox inbox_owner outbox_group fix
+  # Both paths through resolve_signal_paths, never read raw: this function then
+  # runs mkdir / chmod 0750 / chown against them AS ROOT, so an unchecked
+  # AGENTOS_SIGNAL_INBOX=/etc/systemd/system out of a file the core can rewrite
+  # would hand the service account every unit root runs, and =/ would chmod the
+  # host's root directory. The resolver also carries the `|| true` that keeps a
+  # sed which cannot open .env from killing a mid-flight upgrade under
+  # `set -o pipefail`.
+  resolve_signal_paths "$mode"
+  inbox="$SIGNAL_INBOX"; outbox="$SIGNAL_OUTBOX"
+  if [ "$mode" = docker ]; then
+    inbox_owner="${CORE_CONTAINER_UID}:${CORE_CONTAINER_GID}"
+    outbox_group="${CORE_CONTAINER_GID}"
+  else
+    inbox_owner="${AGENTOS_ACCOUNT}:${AGENTOS_ACCOUNT}"
+    outbox_group="${AGENTOS_ACCOUNT}"
+    if ! id "$AGENTOS_ACCOUNT" >/dev/null 2>&1; then
+      # Not fatal, and not silent: the directories are still worth creating (the
+      # .path unit needs the inbox to exist at all), but say which one is unowned.
+      warn "no unix account '${AGENTOS_ACCOUNT}' on this host — leaving ${inbox} unowned; the node cannot write update pokes and will fall back to the six-hourly timer"
+      inbox_owner=""; outbox_group=""
+    fi
+  fi
+  # .env should STATE what this function actually created, rather than leave
+  # every consumer on a default that happens to agree: compose interpolates
+  # `${AGENTOS_SIGNAL_INBOX_HOST:-./signals}` for the mount source, the core
+  # derives from AGENTOS_DIR (wiring.ts), the poller's unit is rendered from
+  # these same keys, and this CLI defaults to /var/lib/<unit>/outbox. Four
+  # independent defaults that line up today is not the same thing as one
+  # recorded fact, and a node installed before these keys existed has none of
+  # them — writing them here is what converges it on the state a fresh install
+  # produces. Never CREATES .env (write_env_key refuses), and never rewrites a
+  # key that already holds this value, so an unchanged node touches nothing.
+  local env_warned=0
+  persist_signal_key() { # persist_signal_key <key> <value>
+    [ -f "$AGENTOS_HOME/.env" ] || return 0
+    [ "$(dotenv_val "$1")" = "$2" ] && return 0
+    write_env_key "$1" "$2" && return 0
+    # Once per run, not once per key: four identical lines about the same
+    # unwritable file is noise, and this is best-effort either way.
+    [ "$env_warned" = 1 ] || warn "could not record the update-signal paths in $AGENTOS_HOME/.env — the directories exist, but a consumer reading that file keeps its old value"
+    env_warned=1
+    return 0
+  }
+  # A validated PATH is not a safe TARGET. $INSTALL_DIR belongs to the service
+  # account (install.sh chowns the tree on every re-run) and agentos.service
+  # grants it ReadWritePaths there, so the core can replace `signals` with a
+  # symlink and have the chmod/chown below land on whatever it points at —
+  # /etc/systemd/system would hand it every unit root runs. resolve_signal_paths
+  # cannot catch this: the default path is the vector, and the default is
+  # legitimate. Refuse rather than `chown -h`-retarget: retargeting as a
+  # SUBSTITUTE for refusing would leave the attacker's symlink in place and the
+  # node quietly dead (the core cannot write through a link it does not own),
+  # trading a loud failure for a silent one. `-h` IS on the chown below, but only
+  # as a backstop on an already-verified directory — see the residual note there.
+  # Skipping one directory is never fatal — the node keeps updating on the
+  # six-hourly timer, which is what that timer is for.
+  signal_dir_ready() { # signal_dir_ready <path> <label> -> 0 when safe to create/chmod/chown
+    # -L FIRST. A dangling symlink is -L true, -e false and -d false, so every
+    # other test reads it as "not there yet" and goes on to mkdir — which fails
+    # EEXIST over a link, and reported THAT as "could not create the inbox": a
+    # disk-full story told about an attack, in the one line an operator reading
+    # an upgrade log has to go on.
+    if [ -L "$1" ]; then
+      warn "refusing to touch the update-signal $2 ($1): it is a symlink, not a directory — nothing was created, chmod'ed or chowned. Remove it and re-run; the node keeps updating on the six-hourly timer meanwhile"
+      return 1
+    fi
+    [ ! -e "$1" ] && return 0        # free: the mkdir below is what creates it
+    [ -d "$1" ] && return 0
+    warn "refusing to touch the update-signal $2 ($1): it exists but is not a directory — nothing was created, chmod'ed or chowned"
+    return 1
+  }
+  # Guard FIRST, create SECOND — and still TWO mkdir statements, never
+  # `mkdir -p "$inbox" "$outbox"`. One call fails as a unit: an outbox that
+  # cannot be created (a read-only /var, an operator-chosen path) took the
+  # inbox's chmod and chown down with it and returned, leaving exactly the "the
+  # directory exists but the core cannot write to it" state this function exists
+  # to prevent — and saying so in the vaguer of the two messages.
+  local have_inbox=1 have_outbox=1
+  signal_dir_ready "$inbox"  "inbox"  || have_inbox=0
+  signal_dir_ready "$outbox" "outbox" || have_outbox=0
+  if [ "$have_inbox" = 1 ] && ! mkdir -p "$inbox" 2>/dev/null; then
+    warn "could not create the update-signal inbox ($inbox) — the node cannot write update pokes and will keep updating on the six-hourly timer"
+    have_inbox=0
+  fi
+  if [ "$have_outbox" = 1 ] && ! mkdir -p "$outbox" 2>/dev/null; then
+    warn "could not create the update-signal outbox ($outbox) — an unattended upgrade cannot report its outcome, so the owner will not be told how it went"
+    have_outbox=0
+  fi
+  # RESIDUAL, stated rather than papered over. The guard above is a check and
+  # what follows is a separate process, so a swap in between still wins the race.
+  # `chown -h` does NOT close it — nothing in bash makes check-and-act atomic —
+  # and it is NOT the response to a planted symlink either: refusing is, above.
+  # It runs on a directory already verified, where it is a no-op except in the
+  # one case that matters. What it changes is what LOSING costs. Lost with it,
+  # the ownership lands on the link itself and the target keeps its own uid/gid.
+  # Lost without it, root hands the service account whatever the link named, and
+  # /etc/systemd/system is every unit root runs.
+  #
+  # chmod stays exposed either way, so it goes first, while the guard's answer is
+  # newest. There is no no-follow chmod where it matters: BSD has `chmod -h`, but
+  # Linux has no lchmod(2), so GNU chmod has neither -h nor --no-dereference —
+  # and Linux is what a node runs. Winning that window redirects permission BITS
+  # onto a path of the attacker's choosing, which transfers nothing. Closing it
+  # needs openat(O_NOFOLLOW|O_DIRECTORY)+fchmod: bash cannot express it, and the
+  # /proc/<pid>/fd approximation is Linux-only, so it would fall back to exactly
+  # this code on the macOS boxes this ships from.
+  if [ "$have_inbox" = 1 ]; then
+    chmod 0750 "$inbox" 2>/dev/null || true
+    if [ -n "$inbox_owner" ] && ! chown -h "$inbox_owner" "$inbox" 2>/dev/null; then
+      fix="sudo chown $inbox_owner $inbox"
+      warn "could not give $inbox to ${inbox_owner} — the node cannot write update pokes and will fall back to the six-hourly timer. Fix with: ${fix}"
+    fi
+    persist_signal_key AGENTOS_SIGNAL_INBOX "$inbox"
+    # docker only: the key compose interpolates for the mount SOURCE. On bare
+    # metal there is no mount and install.sh writes no such key, so inventing
+    # one here would put a second name for the same idea in the file.
+    [ "$mode" = docker ] && persist_signal_key AGENTOS_SIGNAL_INBOX_HOST "$inbox"
+  fi
+  if [ "$have_outbox" = 1 ]; then
+    chmod 0750 "$outbox" 2>/dev/null || true
+    # Warned, not `|| true`: the inbox failure is announced and this one was
+    # silent, against this function's own stated rule. An outbox that stayed
+    # root-only is invisible to the core — result.json is written and never
+    # read — so every unattended upgrade would land without a word to the owner.
+    if [ -n "$outbox_group" ] && ! chown -h "root:${outbox_group}" "$outbox" 2>/dev/null; then
+      fix="sudo chown root:${outbox_group} $outbox"
+      warn "could not give $outbox to group ${outbox_group} — the node cannot read upgrade results, so unattended upgrades will complete without telling the owner. Fix with: ${fix}"
+    fi
+    persist_signal_key AGENTOS_SIGNAL_OUTBOX "$outbox"
+    [ "$mode" = docker ] && persist_signal_key AGENTOS_SIGNAL_OUTBOX_HOST "$outbox"
+  fi
   return 0
 }
 
@@ -318,13 +808,27 @@ docker_upgrade() { # docker_upgrade [tag] [image-ref]  — empty tag = latest st
     [ -n "$digest" ] && image="${image%:*}@${digest}"
   fi
   prev="$(grep -E '^AGENTOS_IMAGE=' "$AGENTOS_HOME/.env" | cut -d= -f2-)"
-  [ "$image" = "$prev" ] && { echo "already at $image"; return 0; }
+  if [ "$image" = "$prev" ]; then
+    echo "already at $image"
+    # Same as the systemd branch: reconcile the units even when the image does
+    # not move, so an operator who narrowed AGENTOS_AUTOUPDATE_POLICY in .env has
+    # a command that carries it into the root poller's unit (which reads no .env
+    # of its own). Docker mode keeps the templates in the install root, where
+    # install.sh's `docker cp` of profiles/ put them.
+    reconcile_units "$AGENTOS_HOME" || warn "unit reconciliation hit a snag"
+    return 0
+  fi
   # Managed PG: record the pre-flip restore point + shout that there is no
   # automatic rollback here, BEFORE anything changes. No-op on SQLite nodes.
   managed_pg_restore_point "$prev" "$image"
   snap="$(docker_backup_sqlite | tail -1)"   # consistent copy: the node is stopped
   [ -n "$snap" ] && echo "$snap" > "$BACKUP_DIR/.last-upgrade"   # pairs archive + pre-upgrade image (its .image sidecar), before the flip
   docker_set_image "$image"
+  # BEFORE any `up`: the compose file this node runs may already carry the two
+  # signal bind-mounts (a previous upgrade's docker_refresh_profiles installed
+  # it), and a mount source docker has to invent is one the core cannot write.
+  # Unconditional and idempotent, so a run whose chown failed last time retries.
+  ensure_signal_dirs docker
   ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" pull && docker compose -f "$COMPOSE_FILE" up -d )
   if ! wait_healthz; then
     if uses_managed_postgres; then
@@ -547,7 +1051,19 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   fi
   tag="$(jq -r .version <<<"$manifest")"
   prev="$(basename "$(readlink "$AGENTOS_HOME/current")")"
-  [ "$tag" = "$prev" ] && { echo "already at $tag"; return 0; }
+  if [ "$tag" = "$prev" ]; then
+    echo "already at $tag"
+    # Not a no-op run: the unit set is reconciled here too. The auto-update
+    # oneshot carries the policy and the signal paths that .env states — root
+    # copies them in, because that unit reads no file the unprivileged core can
+    # write — so THIS is the command an operator has after editing .env, and a
+    # node already on the newest release is exactly the node that would
+    # otherwise have no way to re-arm its poller short of re-running install.sh.
+    # It also runs the policy.conf migration, which an up-to-date node needs as
+    # much as any other. Idempotent: unchanged units mean no daemon-reload.
+    reconcile_units "$AGENTOS_HOME/current/profiles" || warn "unit reconciliation hit a snag"
+    return 0
+  fi
   tarball="$(jq -r .tarball <<<"$manifest")"
   sha="$(jq -r .tarball_sha256 <<<"$manifest")"
   url="https://github.com/${DIST_REPO}/releases/download/${tag}/${tarball}"
@@ -595,6 +1111,12 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   # restart. The rollback branch below restores $prev the same way, also before
   # its start.
   set_env_version "$tag"
+  # Also before the start, and for the same reason .env is: the core that reads
+  # this inbox is the one about to boot. reconcile_units below would be too late
+  # (it runs only after a healthy start, and returns early on a host with no
+  # systemd) — and it is the unit set it installs, the .path watching this very
+  # directory, that makes the inbox's absence matter.
+  ensure_signal_dirs systemd
   # A start that fails to ACTIVATE (non-zero systemctl) must land in the same
   # rollback below as a failed healthz — a bare call here would abort under
   # set -e with the node down and no rollback.
@@ -603,6 +1125,10 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
 
   if [ "$started" = 1 ] && wait_healthz; then
     ok "upgraded: $prev → $tag"
+    # Only now: the units belong to the release that is actually live, and the
+    # branch below can still put $prev back. Best-effort — a snag here never
+    # undoes an upgrade that is already healthy.
+    reconcile_units "$AGENTOS_HOME/current/profiles" || warn "unit reconciliation hit a snag"
     prune_versions
   else
     if uses_managed_postgres; then

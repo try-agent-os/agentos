@@ -115,6 +115,13 @@ fi
 GH_TOKEN_KEY="${AGENTOS_GH_TOKEN_KEY:-}"    # which .env key holds the gh token (else GH_TOKEN/GITHUB_TOKEN)
 COMPOSE_FILE="docker-compose.node.yml"
 INSTALL_MODE=""                  # docker | systemd; empty → resolved after args (default: systemd)
+# Prefix for the absolute HOST paths the auto-update channel writes OUTSIDE the
+# install root — /etc/systemd/system (its units) and /var/lib/<service> (the
+# root-owned outbox). Empty in production, and there is no flag or env var that
+# fills it: the dry-run hook below sets it so the unit render, the policy
+# migration and the signal-directory ownership are testable without root
+# (scripts/tests/agentos-signals.test.sh).
+HOST_PREFIX=""
 
 BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 # --admin's raw value: one comma list mixing numeric ids and usernames, split by
@@ -677,6 +684,82 @@ wait_for_first_boot() {
   esac
 }
 
+# Idempotent key upsert into an EXISTING .env, usable from both install modes.
+# Deliberately not the docker section's set_env(): that one is defined below both
+# call sites of install_autoupdate_timer, so calling it from there would be
+# `command not found` under `set -euo pipefail` — in exactly the branch that
+# repairs an old node.
+#
+# `cp` onto the original file rather than `install`/`mv`: the destination keeps
+# its own owner and mode that way. On bare metal .env belongs to the service
+# account (install_systemd chowns the tree), and handing it back as a root-owned
+# copy would take the instance's own config away from it.
+env_upsert() { # env_upsert <file> <key> <value>
+  local file="$1" key="$2" value="$3" tmp
+  [ -f "$file" ] || return 0
+  tmp="$(mktemp)"
+  { $SUDO grep -v "^${key}=" "$file" 2>/dev/null || true; printf '%s=%s\n' "$key" "$value"; } > "$tmp"
+  $SUDO cp "$tmp" "$file"
+  rm -f "$tmp"
+}
+
+# The node's auto-apply appetite is STICKY across re-runs — the same exception
+# the admin pair gets (inherit_admin_from_dotenv above), for the same reason.
+# write_env_systemd rewrites .env wholesale from the current flags, and the
+# policy migration below rescues the operator's value only while policy.conf
+# still exists, which the very run that migrates it deletes. Without this, any
+# LATER run of the installer — a contour backfill, --upgrade, a repair run —
+# would hand the node back to policy=all and it would silently resume taking
+# every eligible release unattended, breaking and major included. The drop-in
+# used to give this for free (it was written only when the var was set, and
+# never deleted otherwise, so a re-run preserved it); .env has to carry it now.
+#
+# The precedence this establishes, in full:
+#
+#   explicit flag/env  >  policy.conf drop-in  >  inherited .env  >  default all
+#
+# POLICY_INHERITED is what keeps the middle pair the right way round, and it is
+# the same device ADMIN_INHERITED is for the admin pair. Inheriting is not the
+# same act as being TOLD: every node installed from this release onward has a
+# non-empty policy in .env (write_env_systemd writes the default
+# unconditionally), so a plain "is it set?" test would let that inherited value
+# outrank a drop-in the operator wrote afterwards — and migrate_policy_dropin's
+# `rm -f` would then delete their only record of it. Only a flag/env on THIS run
+# outranks a drop-in.
+#
+# An .env written before this key existed yields empty, which is what leaves the
+# first run's policy.conf migration free to fire.
+#
+# What comes back from .env is VALIDATED, because .env is a file the unprivileged
+# core owns and can rewrite, and this value is copied into the root poller's unit
+# as `Environment=AGENTOS_AUTOUPDATE_POLICY=<value>`. systemd reads one
+# Environment= line as SEVERAL assignments when the value contains whitespace, so
+# `all AGENTOS_AUTOUPDATE_NOTIFY_CMD=/bin/sh -c …` would hand that root oneshot a
+# command to run — the escalation the missing EnvironmentFile= closes, walked back
+# in through the value. The enum is the whole defence, and it is also what the
+# core's own env schema accepts (apps/api/src/app/config/env.ts), so a value that
+# fails here would have refused to let the node boot anyway.
+valid_policy() { # valid_policy <value> — the five words the enum admits
+  case "${1:-}" in off|security|patch|minor|all) return 0 ;; *) return 1 ;; esac
+}
+POLICY_INHERITED=0
+inherit_policy_from_dotenv() {
+  [ -z "${AGENTOS_AUTOUPDATE_POLICY:-}" ] || return 0
+  local found
+  found="$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null \
+    | sed -n 's/^AGENTOS_AUTOUPDATE_POLICY=//p' | tail -1 || true)"
+  [ -n "$found" ] || return 0
+  if ! valid_policy "$found"; then
+    # Not adopted, so this run falls through to the flag/default — and
+    # write_env_systemd then rewrites the key with that value, which is how a
+    # node whose .env was scribbled on heals itself instead of staying broken.
+    warn "ignoring AGENTOS_AUTOUPDATE_POLICY='${found}' in ${INSTALL_DIR}/.env — not one of off|security|patch|minor|all"
+    return 0
+  fi
+  AGENTOS_AUTOUPDATE_POLICY="$found"
+  POLICY_INHERITED=1
+}
+
 # ─── --no-docker (bare metal / systemd) ────────────────────────────────────
 #
 # No image, no compose profile: the unit of distribution here is a release
@@ -706,6 +789,16 @@ TELEGRAM_MCP_DB_PATH=${INSTALL_DIR}/data/messages.db
 AGENTOS_SEARCH_DB_PATH=${INSTALL_DIR}/data/search.db
 AOP_STATE_DIR=${INSTALL_DIR}/data/.aop
 MINIAPP_DIST_DIR=${INSTALL_DIR}/current/miniapp-dist
+# The update channel, in the one place both halves of it read: the in-core
+# detector (which pokes) and the root poller (which decides and applies) load
+# this same file, so they can never disagree about the channel, the node's
+# appetite, or where the signal files are. The paths are written out rather than
+# derived per consumer — a named instance has install root /opt/<user> but unit
+# name agentos-<user>, so two derivations would land in two directories.
+AGENTOS_CHANNEL=${CHANNEL}
+AGENTOS_AUTOUPDATE_POLICY=${AGENTOS_AUTOUPDATE_POLICY:-all}
+AGENTOS_SIGNAL_INBOX=${INSTALL_DIR}/signals
+AGENTOS_SIGNAL_OUTBOX=${HOST_PREFIX}/var/lib/${SERVICE_NAME}/outbox
 EOF
   $SUDO chmod 600 "$INSTALL_DIR/.env"
   # Explicit if, NOT `[ -n ] && …`: as the function's last command, a false
@@ -715,6 +808,171 @@ EOF
     echo "MINIAPP_URL=https://${DOMAIN}/app" | $SUDO tee -a "$INSTALL_DIR/.env" >/dev/null
   fi
 }
+
+# The two signal directories, and why they are TWO. The core writes pokes, root
+# writes results; one shared writable directory would let a compromised core
+# replace result.json with a symlink and have root write through it. Separate
+# ownership removes that without a single check in either program.
+#
+#   inbox  — $INSTALL_DIR/signals, owned by the service account so the core can
+#            write. Inside the install root because agentos.service's
+#            ReadWritePaths already covers it.
+#   outbox — /var/lib/<unit>/outbox, root-owned, group = the service account so
+#            the core can READ result.json without being able to create
+#            anything there. Deliberately OUTSIDE the install root: install.sh
+#            chowns that whole tree to the service account on every re-run.
+#
+# Keyed off SERVICE_NAME, not the install root's basename: `--user hub` gives
+# /opt/hub but the unit is agentos-hub, and the poller's own fallback would
+# derive /var/lib/hub. write_env_systemd writes the resulting path into .env,
+# which is what keeps every consumer on this one directory.
+#
+# WHO the core is differs by install mode, and only that differs — same split,
+# same modes, two spellings of one identity:
+#
+#   systemd — the unix service account this script creates.
+#   docker  — uid 1001 inside the image, and NO host account at all (`--user` is
+#             refused in docker mode, and useradd only ever runs on the systemd
+#             path). `chown agentos:agentos` there would fail outright on a
+#             docker-only host, and would still be wrong if some unrelated
+#             `agentos` account happened to exist: the container writes as 1001
+#             whatever the host calls it.
+CORE_CONTAINER_UID=1001   # docker/Dockerfile.node: useradd -u 1001 -g nodejs
+CORE_CONTAINER_GID=1001   # docker/Dockerfile.node: groupadd -g 1001 nodejs
+create_signal_dirs() {
+  local outbox="${HOST_PREFIX}/var/lib/${SERVICE_NAME}/outbox"
+  local inbox_owner="${SERVICE_USER}:${SERVICE_USER}" outbox_group="${SERVICE_USER}"
+  if [ "$INSTALL_MODE" = "docker" ]; then
+    inbox_owner="${CORE_CONTAINER_UID}:${CORE_CONTAINER_GID}"
+    outbox_group="${CORE_CONTAINER_GID}"
+  fi
+  # Same guard, same reason, same order as the CLI's ensure_signal_dirs — kept in
+  # step BY HAND, and the two differ only where the message does (this one has no
+  # six-hourly timer to reassure anyone about yet). $INSTALL_DIR belongs to the
+  # service account (the chown -R below runs on every re-run) and agentos.service
+  # grants it ReadWritePaths there, so the core can swap `signals` for a symlink
+  # and have the chown/chmod land on its target; /etc/systemd/system would hand it
+  # every unit root runs. Refuse rather than `chown -h`-retarget: retargeting as a
+  # SUBSTITUTE for refusing would leave the attacker's link in place and the node
+  # quietly unable to poke, trading a loud failure for a silent one. (`-h` still
+  # goes on the chown below — as a belt on top of the refusal, never instead of
+  # it; see the ordering note there.) Skipping one directory is never fatal here
+  # either — the timer still covers the node.
+  signal_dir_ready() { # signal_dir_ready <path> <label> -> 0 when safe to create/chmod/chown
+    # -L FIRST. A dangling symlink is -L true, -e false and -d false, so every
+    # other test reads it as "not there yet" and goes on to mkdir — which fails
+    # EEXIST over a link, and under `set -e` that took the whole install down
+    # before this guard could say a word about it.
+    if [ -L "$1" ]; then
+      warn "refusing to touch the update-signal $2 ($1): it is a symlink, not a directory — nothing was created, chmod'ed or chowned. Move it aside and re-run"
+      return 1
+    fi
+    [ ! -e "$1" ] && return 0        # free: the mkdir below is what creates it
+    [ -d "$1" ] && return 0
+    warn "refusing to touch the update-signal $2 ($1): it exists but is not a directory — nothing was created, chmod'ed or chowned"
+    return 1
+  }
+  # Guard FIRST, create SECOND, and one mkdir per directory: `mkdir -p` over a
+  # symlink to a directory succeeds silently (so its exit status says nothing
+  # about what is there), over a dangling one it fails — and a single
+  # `mkdir -p a b` would let either name take the other down with it.
+  #
+  # chmod, then `chown -h`. The mode goes first because it is the exposed step:
+  # there is no no-follow chmod where it matters — BSD has `chmod -h`, but Linux
+  # has no lchmod(2), so GNU chmod has neither -h nor --no-dereference, and Linux
+  # is what a node runs — so it goes on while the guard's answer is newest.
+  #
+  # `-h` does NOT close the race, and it is NOT the response to a planted
+  # symlink: refusing is, above. It runs on a directory this function has already
+  # verified, where it is a no-op — except in the one case that matters, a link
+  # swapped in after the guard. Nothing in bash makes check-and-act atomic; what
+  # `-h` changes is what LOSING costs. Lost with it, the ownership lands on the
+  # link itself and the target keeps its own uid/gid. Lost without it, root hands
+  # the service account whatever the link named, and /etc/systemd/system is every
+  # unit root runs. The chmod stays exposed either way: winning that window can
+  # still redirect permission BITS onto a path of the attacker's choosing, which
+  # transfers nothing.
+  if signal_dir_ready "$INSTALL_DIR/signals" "inbox"; then
+    $SUDO mkdir -p "$INSTALL_DIR/signals"
+    $SUDO chmod 0750 "$INSTALL_DIR/signals"
+    $SUDO chown -h "$inbox_owner" "$INSTALL_DIR/signals"
+  fi
+  if signal_dir_ready "$outbox" "outbox"; then
+    $SUDO mkdir -p "$outbox"
+    $SUDO chmod 0750 "$outbox"
+    $SUDO chown -h "root:${outbox_group}" "$outbox"
+  fi
+  # The outbox's PARENT, 0755 so the core can traverse into a directory it is not
+  # allowed to list. Guarded like the other two rather than argued about: it is
+  # root's, under a root-owned /var/lib, so no unprivileged process can plant a
+  # link here today — and "today" is not a property a root chmod should rest on.
+  # The mkdir is not redundant with the outbox's: the guard passes on a name that
+  # is simply FREE, and if the outbox above was refused this directory may never
+  # have been created — `chmod` on a path that does not exist fails, and under
+  # `set -e` that would abort the install over a refusal that was supposed to be
+  # survivable.
+  if signal_dir_ready "${HOST_PREFIX}/var/lib/${SERVICE_NAME}" "state directory"; then
+    $SUDO mkdir -p "${HOST_PREFIX}/var/lib/${SERVICE_NAME}"
+    $SUDO chmod 0755 "${HOST_PREFIX}/var/lib/${SERVICE_NAME}"
+  fi
+}
+
+# The docker channel's .env keys for the same two directories. Three readers
+# share that file on a docker host, and two of them need DIFFERENT values for
+# the same idea, so the mount sources get keys of their own:
+#
+#   AGENTOS_SIGNAL_INBOX / _OUTBOX       host paths. What the ROOT POLLER is
+#       given — not by reading this file (its unit has no EnvironmentFile=: the
+#       core owns .env and a root unit must not take an environment from it) but
+#       because install_autoupdate_timer and the CLI's reconcile_units copy these
+#       values into the unit as Environment= lines. The poller runs on the host in
+#       docker mode exactly as it does on bare metal, and its own fallback would
+#       derive /var/lib/<basename of --dir>/outbox, so these are what keep it on
+#       the directory this script actually created.
+#       They also ride into the container through compose's `env_file:`, where
+#       the compose `environment:` block overrides them with /signals and
+#       /signals-out (environment: outranks env_file for one key).
+#   AGENTOS_SIGNAL_INBOX_HOST / _OUTBOX_HOST   the same host paths, read by
+#       COMPOSE's ${…} interpolation for the two bind-mount sources, and by
+#       nothing else. Separate names rather than reusing the pair above because
+#       that pair already means "the container's path" everywhere inside the
+#       container: one key with two meanings three lines apart in one file is
+#       how someone later deletes the "redundant" override. Compose interpolation
+#       also prefers an exported shell variable over .env, so reusing the plain
+#       key would let a stray AGENTOS_SIGNAL_INBOX=/signals in the operator's
+#       shell silently turn the MOUNT SOURCE into the host's /signals.
+#
+# env_upsert, not the docker section's set_env(): same reason install_autoupdate_timer
+# gives above — set_env is defined 750 lines below this, so only env_upsert can
+# also be exercised by the AGENTOS_PRINT_SIGNAL_DIRS dry-run.
+write_signal_env_docker() {
+  local envfile="$INSTALL_DIR/.env" outbox="${HOST_PREFIX}/var/lib/${SERVICE_NAME}/outbox"
+  # In §5 .env already exists (set_env AGENTOS_IMAGE made it); env_upsert is a
+  # no-op on a missing file, so create it here rather than silently write nothing.
+  [ -f "$envfile" ] || install -m 600 /dev/null "$envfile"
+  env_upsert "$envfile" AGENTOS_SIGNAL_INBOX       "${INSTALL_DIR}/signals"
+  env_upsert "$envfile" AGENTOS_SIGNAL_OUTBOX      "$outbox"
+  env_upsert "$envfile" AGENTOS_SIGNAL_INBOX_HOST  "${INSTALL_DIR}/signals"
+  env_upsert "$envfile" AGENTOS_SIGNAL_OUTBOX_HOST "$outbox"
+}
+
+# "What would this command line lay down for the signal channel, and for whom?"
+# The docker path cannot be dry-run as a whole — it wants a daemon, a registry
+# and a compose up — so the two functions above are exercised here directly,
+# against a temp install root (--dir) and a temp stand-in for the host's /
+# ($AGENTOS_PRINT_SIGNAL_DIRS), the same early-exit contract as
+# AGENTOS_PRINT_AUTOUPDATE below. The MODE is not passed in: it is resolved from
+# the real flags, so what the test observes is the real branch.
+# Driven by scripts/tests/agentos-signals.test.sh.
+if [ -n "${AGENTOS_PRINT_SIGNAL_DIRS:-}" ]; then
+  SUDO="${SUDO:-}"                       # not yet resolved this early
+  HOST_PREFIX="$AGENTOS_PRINT_SIGNAL_DIRS"
+  $SUDO mkdir -p "$INSTALL_DIR"
+  create_signal_dirs
+  if [ "$INSTALL_MODE" = "docker" ]; then write_signal_env_docker; fi
+  echo "mode=${INSTALL_MODE}"
+  exit 0
+fi
 
 install_systemd() {
   step "System packages"
@@ -778,6 +1036,7 @@ install_systemd() {
   # account (chown -R below), under ReadWritePaths, world-readable once systemd
   # creates the file.
   $SUDO mkdir -p "$INSTALL_DIR"/{versions,data,backups,logs}
+  create_signal_dirs
 
   step "Node ${node_ver} (vendored)"
   # A kept version keeps the runtime it has: node_ver comes from the CHANNEL's
@@ -817,6 +1076,9 @@ install_systemd() {
     install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.205"
 
   step "Config + unit"
+  # Before the wholesale rewrite, never after: .env is the only place a narrowed
+  # auto-update policy still lives once the drop-in is gone.
+  inherit_policy_from_dotenv
   write_env_systemd
   # Contour secrets land in .env right after the base keys, so the systemd unit's
   # EnvironmentFile=.env carries them into the running node from its very first
@@ -971,32 +1233,166 @@ install_autoupdate_timer() { # install_autoupdate_timer <profiles-dir>
   fi
   [ -f "$pdir/agentos-autoupdate.service" ] || { warn "auto-update units missing from $pdir — skipping timer."; return 0; }
   # Per instance, like the service itself: its own poller unit, its own timer,
-  # its own policy drop-in. ExecStart is retargeted at THIS instance's CLI entry
+  # its own .path watcher. ExecStart is retargeted at THIS instance's CLI entry
   # point, which is what carries the root/unit/port coordinates.
   local au="${SERVICE_NAME}-autoupdate"
-  $SUDO sed -e "s|/opt/agentos|${INSTALL_DIR}|g" \
-            -e "s|^ExecStart=/usr/local/bin/agentos |ExecStart=/usr/local/bin/${SERVICE_NAME} |" \
-            "$pdir/agentos-autoupdate.service" \
-    | $SUDO tee "/etc/systemd/system/${au}.service" >/dev/null
+  local units="${HOST_PREFIX}/etc/systemd/system"
+  # BEFORE the oneshot is rendered, not after: the migration is what settles the
+  # policy for this run, and the unit now CARRIES that policy. Rendering first
+  # would arm the poller with `all` while .env said `minor`, until some later
+  # upgrade happened to re-render it — the two-source ambiguity this migration
+  # exists to remove, one layer down.
+  migrate_policy_dropin "${units}/${au}.service.d" "$INSTALL_DIR/.env"
+  # The oneshot runs as root and deliberately has no EnvironmentFile= (see the
+  # long comment in the template): the core owns .env, so the two values both
+  # halves must agree on are copied into the unit BY ROOT instead. They are
+  # written from this script's own variables — the same expressions
+  # write_env_systemd / write_signal_env_docker put into .env and
+  # create_signal_dirs creates on disk — so the unit, the file and the
+  # directories cannot drift apart. The policy is the one value that can have
+  # come from .env (inherit_policy_from_dotenv); it is enum-checked there and
+  # again here, since an explicit AGENTOS_AUTOUPDATE_POLICY=<nonsense> on this
+  # run reaches this point too.
+  local policy="${AGENTOS_AUTOUPDATE_POLICY:-all}"
+  if ! valid_policy "$policy"; then
+    # 'off' rather than 'all': the poller's own unknown-policy branch already
+    # treats a value it cannot read as 'off', and a typo must not be the thing
+    # that widens what a node installs unattended.
+    warn "auto-update policy '${policy}' is not one of off|security|patch|minor|all — arming the poller with 'off'"
+    policy=off
+  fi
+  { $SUDO sed -e "s|/opt/agentos|${INSTALL_DIR}|g" \
+              -e "s|^ExecStart=/usr/local/bin/agentos |ExecStart=/usr/local/bin/${SERVICE_NAME} |" \
+              "$pdir/agentos-autoupdate.service"
+    printf 'Environment=AGENTOS_AUTOUPDATE_POLICY=%s\n' "$policy"
+    printf 'Environment=AGENTOS_SIGNAL_INBOX=%s\n'  "${INSTALL_DIR}/signals"
+    printf 'Environment=AGENTOS_SIGNAL_OUTBOX=%s\n' "${HOST_PREFIX}/var/lib/${SERVICE_NAME}/outbox"
+  } | $SUDO tee "${units}/${au}.service" >/dev/null
   # The timer names the unit it fires, so it is rendered too, never copied.
   $SUDO sed -e "s|^Unit=agentos-autoupdate.service$|Unit=${au}.service|" \
             "$pdir/agentos-autoupdate.timer" \
-    | $SUDO tee "/etc/systemd/system/${au}.timer" >/dev/null
-  # The operator's auto-apply appetite, when they set one. Default lives in the
-  # unit (all): every eligible release lands unattended (incl. breaking/major),
-  # subject only to the engine's safety holds. Set the env var to narrow it.
-  if [ -n "${AGENTOS_AUTOUPDATE_POLICY:-}" ]; then
-    $SUDO mkdir -p "/etc/systemd/system/${au}.service.d"
-    printf '[Service]\nEnvironment=AGENTOS_AUTOUPDATE_POLICY=%s\n' "${AGENTOS_AUTOUPDATE_POLICY}" \
-      | $SUDO tee "/etc/systemd/system/${au}.service.d/policy.conf" >/dev/null
+    | $SUDO tee "${units}/${au}.timer" >/dev/null
+  # The .path unit — what turns the in-core detector's poke into a root run in
+  # seconds instead of at the next backstop tick. It watches this instance's
+  # inbox and fires this instance's oneshot: the SAME unit the timer fires, so
+  # systemd's per-unit start serialization is what stops a poke and a periodic
+  # tick from running two upgrades at once.
+  #
+  # Optional on purpose: a node upgrading from a release that predates this file
+  # has no template, and a bare sed on a missing file would kill the installer
+  # under `set -euo pipefail` — after a successful healthz, the worst possible
+  # moment. Such a node keeps updating on the timer until Task 11's unit
+  # reconciliation gives it the watcher.
+  local have_path=0
+  if [ -f "$pdir/agentos-autoupdate.path" ]; then
+    have_path=1
+    $SUDO sed -e "s|/opt/agentos|${INSTALL_DIR}|g" \
+              -e "s|^Unit=agentos-autoupdate.service$|Unit=${au}.service|" \
+              "$pdir/agentos-autoupdate.path" \
+      | $SUDO tee "${units}/${au}.path" >/dev/null
   fi
   $SUDO systemctl daemon-reload
   if $SUDO systemctl enable --now "${au}.timer" >/dev/null 2>&1; then
-    ok "auto-update timer armed (policy=${AGENTOS_AUTOUPDATE_POLICY:-all})"
+    # $policy, not the raw variable: this is the value the unit was actually
+    # armed with, which is the whole question an operator asks here.
+    ok "auto-update backstop timer armed (policy=${policy})"
   else
     warn "could not enable ${au}.timer — arm it with: systemctl enable --now ${au}.timer"
   fi
+  if [ "$have_path" = 1 ]; then
+    if $SUDO systemctl enable --now "${au}.path" >/dev/null 2>&1; then
+      ok "update pokes armed (${au}.path → ${au}.service)"
+    else
+      warn "could not arm ${au}.path — updates will still arrive on the timer"
+    fi
+  fi
 }
+
+# The node's auto-apply appetite used to live in a systemd drop-in that only the
+# root poller could see. The in-core detector reads it too now, so it moved into
+# .env — and the drop-in is ABOLISHED, not kept as an override: EnvironmentFile=
+# overrides Environment= in systemd, so leaving the drop-in in place would
+# silently stop it working, the exact opposite of what an operator who narrowed
+# their policy expects. One source, and the old value is carried across before
+# the file is deleted.
+#
+# An explicit policy on THIS run still wins: that is the operator speaking now,
+# and honouring a value they set months ago over the flag they just passed would
+# be its own silent surprise. Either way the drop-in goes.
+migrate_policy_dropin() { # migrate_policy_dropin <dropin-dir> <env-file>
+  local dir="$1" env_file="$2" conf="$1/policy.conf" migrated
+  [ -f "$conf" ] || return 0
+  # Read the value the way SYSTEMD would, not the way install.sh happened to
+  # write it. docs/self-host.md tells operators to set the policy "in the
+  # drop-in", so this file is hand-edited in the field, and systemd accepts
+  # several spellings of one assignment: Environment="K=v", Environment=K="v",
+  # a leading indent, spaces around the first =, several assignments on a line,
+  # and a CRLF file. The strict `^Environment=K=` pattern matched only the bare
+  # form: anything else came back empty, nothing reached .env, and the `rm -f`
+  # below then deleted the operator's only record of their choice — the node
+  # silently back on `all`. A quoted VALUE was worse than dropped, it arrived in
+  # .env with its quotes still on.
+  #
+  # So: take everything after `Environment=`, drop the quotes whichever spelling
+  # used them, split on whitespace (which puts each assignment — and a trailing
+  # CR — on its own line), and only then match the key. tail -1 keeps systemd's
+  # last-wins rule.
+  migrated="$($SUDO sed -n 's/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*//p' "$conf" 2>/dev/null \
+    | sed "s/[\"']//g" \
+    | tr ' \t\r' '\n\n\n' \
+    | sed -n 's/^AGENTOS_AUTOUPDATE_POLICY=//p' | tail -1 || true)"
+  # A drop-in is root-owned, so this is the operator's own typo rather than the
+  # core's doing — but it ends up in .env and in the poller's unit all the same,
+  # so it gets the same enum check. Treated as no value at all: the run keeps the
+  # policy it already had instead of adopting a word nothing downstream accepts.
+  if [ -n "$migrated" ] && ! valid_policy "$migrated"; then
+    warn "the policy drop-in says '${migrated}', which is not one of off|security|patch|minor|all — leaving this node's policy as it is"
+    migrated=""
+  fi
+  # The drop-in loses only to an EXPLICIT policy on this run, never to one that
+  # was merely inherited from .env a moment ago — see the ladder above
+  # inherit_policy_from_dotenv. Getting this backwards is silent in the worst
+  # way: the `rm -f` below then destroys a choice nothing recorded.
+  if [ -n "$migrated" ] && \
+     { [ -z "${AGENTOS_AUTOUPDATE_POLICY:-}" ] || [ "${POLICY_INHERITED:-0}" = 1 ]; }; then
+    # Into the VARIABLE as well as the file: the docker channel writes its .env
+    # after this runs (install.sh §5), so a file-only migration would be
+    # overwritten by the default a few steps later.
+    AGENTOS_AUTOUPDATE_POLICY="$migrated"
+    # The value no longer comes from .env, so the flag must stop claiming it does.
+    POLICY_INHERITED=0
+    env_upsert "$env_file" AGENTOS_AUTOUPDATE_POLICY "$migrated"
+    info "auto-update policy '${migrated}' moved from the systemd drop-in into ${env_file}"
+  fi
+  $SUDO rm -f "$conf"
+  # Only when it is now empty — an operator may have their own drop-ins here.
+  $SUDO rmdir "$dir" 2>/dev/null || true
+}
+
+# "What would this command line arm the update channel with?" — the units it
+# renders, the policy it migrates, the signal directories it creates and the
+# .env keys every consumer reads them from. It RUNS the real functions, in the
+# real order install_systemd runs them, against a temp install root (--dir) and
+# a temp stand-in for the host's / ($AGENTOS_PRINT_AUTOUPDATE) — the same
+# early-exit contract as AGENTOS_PRINT_CONTOUR above, extended to functions
+# whose whole job is writing files. Driven by scripts/tests/agentos-signals.test.sh.
+if [ -n "${AGENTOS_PRINT_AUTOUPDATE:-}" ]; then
+  SUDO="${SUDO:-}"                       # not yet resolved this early
+  HOST_PREFIX="$AGENTOS_PRINT_AUTOUPDATE"
+  tag="${AGENTOS_TEST_TAG:-v0.0.0-dryrun}"   # write_env_systemd reads it by dynamic scoping
+  $SUDO mkdir -p "$INSTALL_DIR" "${HOST_PREFIX}/etc/systemd/system"
+  create_signal_dirs
+  inherit_policy_from_dotenv
+  write_env_systemd
+  # An old release's profiles/ has no .path template — AGENTOS_TEST_PROFILES_DIR
+  # is how that node is reproduced here.
+  install_autoupdate_timer "${AGENTOS_TEST_PROFILES_DIR:-$(dirname "$0")/scripts/release}"
+  # Keys only, never a value: .env holds the bot token. The policy is the one
+  # value printed, because "which policy did this run end up with?" is the
+  # question the migration exists to answer.
+  echo "policy=${AGENTOS_AUTOUPDATE_POLICY:-}"
+  exit 0
+fi
 
 echo -e "\n${BOLD}AgentOS Node — install${NC}"
 
@@ -1252,6 +1648,15 @@ if [ -f "$INSTALL_DIR/agentos" ]; then
   ok "agentos CLI → /usr/local/bin/agentos"
 fi
 [ -f "$INSTALL_DIR/agentos-autoupdate.sh" ] && chmod +x "$INSTALL_DIR/agentos-autoupdate.sh"
+# The policy this node already has, BEFORE the unit that now carries it is
+# rendered. §5 below does the same inherit for .env's sake, and on the bare-metal
+# path write_env_systemd has already run by the time the timer is installed — but
+# here the units go in two hundred lines EARLIER than .env is written, so without
+# this the oneshot would be armed with `all` while §5 wrote the operator's
+# narrowed policy into .env: the file and the unit disagreeing on a re-run, which
+# is precisely the failure the drop-in migration was meant to end. Idempotent, so
+# the second call in §5 is a no-op.
+inherit_policy_from_dotenv
 install_autoupdate_timer "$INSTALL_DIR"
 
 # ─── 3. answers ─────────────────────────────────────────────────────────────
@@ -1389,6 +1794,25 @@ set_env TELEGRAM_ADMIN_USER_IDS "${ADMIN_IDS:-}"
 # from a username to an id (or the other way) needs the key they abandoned to end
 # up empty, not to keep a stale value the core would still honour.
 set_env TELEGRAM_ADMIN_USERNAMES "${ADMIN_USERNAMES:-}"
+# The update channel's own keys, exactly as write_env_systemd writes them on
+# bare metal — the container's core, the host's root poller and compose itself
+# all read this file, so the signal paths are stated once here rather than
+# derived three times. The mounts that make those paths reachable from inside
+# the container are the compose file's half of this; a node whose compose file
+# was edited locally keeps its own and simply never gets them, at which point the
+# detector finds no inbox, says so once, and lives on the backstop timer.
+set_env AGENTOS_CHANNEL "$CHANNEL"
+# Sticky across re-runs, exactly as on bare metal: this branch rewrites the key
+# from the env var, so without the inherit an operator's narrowed policy would
+# survive only until the next `install.sh` run. install_autoupdate_timer ran
+# earlier (§2) and may already have filled the var from the migrated drop-in, in
+# which case this is a no-op and that value wins.
+inherit_policy_from_dotenv
+set_env AGENTOS_AUTOUPDATE_POLICY "${AGENTOS_AUTOUPDATE_POLICY:-all}"
+# Both pairs of signal keys — the host paths the root poller reads, and the
+# mount sources compose interpolates. See write_signal_env_docker for which key
+# belongs to whom and why they are not one key.
+write_signal_env_docker
 [ -n "$DOMAIN" ]       && set_env AGENTOS_DOMAIN "$DOMAIN"
 [ -n "$TUNNEL_TOKEN" ] && set_env CLOUDFLARE_TUNNEL_TOKEN "$TUNNEL_TOKEN"
 # --no-https (and quick before the tunnel resolves) leaves MINIAPP_URL empty. A
@@ -1413,6 +1837,16 @@ if [ "${#CONTOUR_REPOS[@]}" -gt 0 ]; then
 fi
 
 # ─── 6. up ──────────────────────────────────────────────────────────────────
+
+# The host side of the signal channel, laid down before the mounts want it.
+# Leaving it to compose is not an option: docker creates a missing bind-mount
+# source itself, root-owned 0755, and the core (uid 1001) would then take EACCES
+# on every poke it writes — a node that looks mounted and never updates.
+#
+# Must run AFTER the `chown -R "$(id -u):$(id -g)" "$INSTALL_DIR"` in §2, which
+# walks the whole install root on every re-run and would otherwise hand the inbox
+# back to the invoking user.
+create_signal_dirs
 
 PROFILE_ARGS=()
 case "$HTTPS_MODE" in
