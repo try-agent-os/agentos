@@ -307,7 +307,7 @@ SIGNAL_INBOX=""; SIGNAL_OUTBOX=""
 # Only what changed is rewritten, so an upgrade that finds the unit set already
 # current does not reload systemd or restart anything at all.
 reconcile_units() { # reconcile_units <profiles-dir>
-  local pdir="$1" au="${AGENTOS_SERVICE}-autoupdate" changed=0
+  local pdir="$1" au="${AGENTOS_SERVICE}-autoupdate" changed=0 main_unit_changed=0
   # Overridable so the suite can assert the rendered output without root.
   local units_dir="${AGENTOS_UNITS_DIR:-/etc/systemd/system}"
   command -v systemctl >/dev/null 2>&1 || return 0
@@ -431,6 +431,49 @@ $3"
     "$policy" "$SIGNAL_INBOX" "$SIGNAL_OUTBOX")"
   render_unit "$pdir/agentos-autoupdate.service" "$units_dir/${au}.service" "$svc_env"
 
+  # ─── the MAIN service unit ──────────────────────────────────────────────
+  #
+  # Everything above reconciles only the auto-update units. The main service
+  # unit (${AGENTOS_SERVICE}.service) was the one file NO upgrade path ever
+  # rewrote: install.sh writes it once, systemd_upgrade only flips `current`,
+  # and reconcile_units stopped at the poller. So a release that changed the
+  # unit template — e.g. TimeoutStopSec=120→660 in v2.47.0, which the node's
+  # shutdown drain reads as AGENTOS_STOP_TIMEOUT_SEC — silently never reached an
+  # already-installed node. The drain's LEGACY_UNIT_DRAIN_TIMEOUT_MS fallback
+  # (apps/api/src/core/session-durability.ts) MASKED the gap rather than closing
+  # it: correct behaviour on a stale unit, but the node keeps running the old
+  # unit and nothing says so. Re-render it here from the SAME template and the
+  # SAME substitutions install.sh's install_systemd() uses.
+  #
+  # ONLY when the node already has one. reconcile keeps an existing unit in step
+  # with the release; it never INVENTS the main unit on a host install.sh did
+  # not write it — a docker node has no main systemd unit at all (its service is
+  # the compose container, only the auto-update poller is a host unit), so the
+  # `-f "$main_unit"` guard makes this correctly skip there.
+  #
+  # Local drop-ins live in ${AGENTOS_SERVICE}.service.d/*.conf — a separate tree
+  # this write never touches — so an operator's override (e.g. Symoditi's manual
+  # 21-stop-timeout.conf) survives the migration untouched.
+  local main_unit="$units_dir/${AGENTOS_SERVICE}.service"
+  if [ -f "$main_unit" ] && [ -f "$pdir/agentos.service" ]; then
+    # The install-root placeholder everywhere, then User=/Group= on their own
+    # anchored lines. NOT a global s|agentos|<user>|: the account name is a
+    # substring of every install path, so only anchored ^User= / ^Group= are
+    # safe to rewrite. Identical to install.sh's main-unit render.
+    local main_rendered
+    main_rendered="$(sed -e "s|/opt/agentos|${AGENTOS_HOME}|g" \
+                         -e "s|^User=agentos$|User=${AGENTOS_ACCOUNT}|" \
+                         -e "s|^Group=agentos$|Group=${AGENTOS_ACCOUNT}|" "$pdir/agentos.service")"
+    if [ "$main_rendered" != "$(cat "$main_unit" 2>/dev/null)" ]; then
+      if printf '%s\n' "$main_rendered" > "$main_unit"; then
+        changed=1; main_unit_changed=1
+        ok "migrated main service unit ${AGENTOS_SERVICE}.service to the release template (local drop-ins preserved)"
+      else
+        warn "could not write $main_unit — the old main service unit stays in place"
+      fi
+    fi
+  fi
+
   # OUTSIDE the changed-gate on purpose, and this is the whole point of the
   # call: a poke storm trips StartLimitBurst=5 and leaves the oneshot failed,
   # and that oneshot is what BOTH the .path and the .timer fire — nothing
@@ -453,6 +496,17 @@ $3"
     fi
     systemctl enable --now "${au}.timer" >/dev/null 2>&1 || true
     ok "reconciled auto-update units"
+  fi
+
+  # The daemon-reload above re-reads the main unit, so systemd honours the new
+  # TimeoutStopSec at the next stop. But start-time-only directives (User=,
+  # ExecStart=, the sandboxing paths) apply only when the service (re)starts —
+  # and reconcile deliberately does NOT restart the node here (in the upgrade
+  # path it was just started; in the idempotent `already at $tag` path a restart
+  # would be a surprise). Say so plainly rather than let a stale live process
+  # imply the migration is already fully in effect.
+  if [ "$main_unit_changed" = 1 ]; then
+    ok "main service unit changed — restart '${AGENTOS_SERVICE}' to apply start-time directives"
   fi
   return 0
 }
