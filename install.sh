@@ -1343,6 +1343,18 @@ install_autoupdate_timer() { # install_autoupdate_timer <profiles-dir>
     printf 'Environment=AGENTOS_AUTOUPDATE_POLICY=%s\n' "$policy"
     printf 'Environment=AGENTOS_SIGNAL_INBOX=%s\n'  "${INSTALL_DIR}/signals"
     printf 'Environment=AGENTOS_SIGNAL_OUTBOX=%s\n' "${HOST_PREFIX}/var/lib/${SERVICE_NAME}/outbox"
+    # The activity-gate thresholds the poller must share with the in-core
+    # detector (scripts/agentos-autoupdate.sh). Both halves default identically,
+    # so these are carried only when the operator set them for this run; a
+    # non-integer value is dropped so the poller keeps the shared default rather
+    # than being armed with a word.
+    for _gk in AGENTOS_UPDATE_MAX_DEFERRAL AGENTOS_UPDATE_RESTART_INTERVAL; do
+      _gv="$(printf '%s' "${!_gk-}")"
+      case "$_gv" in
+        ''|*[!0-9]*) : ;;
+        *) printf 'Environment=%s=%s\n' "$_gk" "$_gv" ;;
+      esac
+    done
   } | $SUDO tee "${units}/${au}.service" >/dev/null
   # The timer names the unit it fires, so it is rendered too, never copied.
   $SUDO sed -e "s|^Unit=agentos-autoupdate.service$|Unit=${au}.service|" \

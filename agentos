@@ -429,6 +429,20 @@ $3"
   resolve_signal_paths systemd     # either key pair; both hold the HOST paths
   svc_env="$(printf 'Environment=AGENTOS_AUTOUPDATE_POLICY=%s\nEnvironment=AGENTOS_SIGNAL_INBOX=%s\nEnvironment=AGENTOS_SIGNAL_OUTBOX=%s' \
     "$policy" "$SIGNAL_INBOX" "$SIGNAL_OUTBOX")"
+  # The activity-gate thresholds the poller shares with the in-core detector
+  # (scripts/agentos-autoupdate.sh). Both halves DEFAULT identically, so these are
+  # carried only when an operator overrode them in .env — otherwise the poller
+  # keeps the shared default and the two paths still agree. A non-integer value is
+  # dropped rather than passed through, so a fat-fingered .env cannot arm root
+  # with a word the poller would then sanitise to a different number than the core.
+  local _gk _gv
+  for _gk in AGENTOS_UPDATE_MAX_DEFERRAL AGENTOS_UPDATE_RESTART_INTERVAL; do
+    _gv="$(dotenv_val "$_gk")"
+    case "$_gv" in
+      ''|*[!0-9]*) : ;;
+      *) svc_env="$(printf '%s\nEnvironment=%s=%s' "$svc_env" "$_gk" "$_gv")" ;;
+    esac
+  done
   render_unit "$pdir/agentos-autoupdate.service" "$units_dir/${au}.service" "$svc_env"
 
   # ─── the MAIN service unit ──────────────────────────────────────────────
