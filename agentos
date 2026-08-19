@@ -456,6 +456,34 @@ $3"
   # 21-stop-timeout.conf) survives the migration untouched.
   local main_unit="$units_dir/${AGENTOS_SERVICE}.service"
   if [ -f "$main_unit" ] && [ -f "$pdir/agentos.service" ]; then
+    # The template the node is being migrated ONTO appends stdout+stderr to
+    # <root>/logs/node.log. install.sh creates that directory; no upgrade path
+    # did, so a node installed before the log file existed got the new unit
+    # written over a root with no logs/ — and systemd cannot open an append
+    # target whose directory is missing. It does not degrade: the unit fails
+    # 209/STDOUT before ExecStart, Restart=always retries, and the node sits in
+    # a restart loop until a human creates one directory. That is exactly what
+    # took the Symoditi node down on 2026-08-19 (restart counter 54, ~6 min of
+    # downtime), and it would have hit every pre-log-file install on ITS next
+    # upgrade. Create the directory BEFORE writing the unit, never after: the
+    # window between the two is precisely the failure.
+    if plain_dir_ok "$AGENTOS_HOME/logs" "log directory"; then
+      if [ ! -d "$AGENTOS_HOME/logs" ]; then
+        if mkdir -p "$AGENTOS_HOME/logs" 2>/dev/null; then
+          chmod 0750 "$AGENTOS_HOME/logs" 2>/dev/null || true
+          chown "$AGENTOS_ACCOUNT:$AGENTOS_ACCOUNT" "$AGENTOS_HOME/logs" 2>/dev/null \
+            || warn "created $AGENTOS_HOME/logs but could not chown it to $AGENTOS_ACCOUNT — the node may not be able to write its log"
+          ok "created the node's log directory ($AGENTOS_HOME/logs), which the release unit template writes into"
+        else
+          warn "could not create $AGENTOS_HOME/logs — leaving the old main service unit in place rather than pointing a new one at a missing log directory"
+          pdir_logs_missing=1
+        fi
+      fi
+    else
+      pdir_logs_missing=1
+    fi
+  fi
+  if [ -f "$main_unit" ] && [ -f "$pdir/agentos.service" ] && [ "${pdir_logs_missing:-0}" != 1 ]; then
     # The install-root placeholder everywhere, then User=/Group= on their own
     # anchored lines. NOT a global s|agentos|<user>|: the account name is a
     # substring of every install path, so only anchored ^User= / ^Group= are
