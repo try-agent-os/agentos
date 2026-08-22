@@ -36,6 +36,10 @@
 #                              belongs to `agentos upgrade`, which backs up the database first and
 #                              can roll back. Pass --upgrade to follow the channel; the version
 #                              change is then performed BY that CLI, backup and all.
+#   --scoped-sudo              Do NOT grant the service account root. By default the install gives it
+#                              passwordless sudo over the whole host, because administering the box is
+#                              the job; this narrows the grant to restart/status/journal on its own
+#                              unit. Pick it when the node shares a host with something off-limits.
 #   -y, --yes                  Never prompt; fail instead of asking.
 #
 # CONTOUR ACCESS — an instance gets ALL of its contour's access at install time,
@@ -89,6 +93,9 @@ set -euo pipefail
 
 IMAGE_REPO="${AGENTOS_IMAGE_REPO:-ghcr.io/try-agent-os/agentos-core}"
 SERVICE_USER="${AGENTOS_USER:-agentos}"
+# How much of the host the service account may reach through sudo. `full` is the
+# default (see the sudoers section below); `--scoped-sudo` selects `selfmgmt`.
+SUDO_SCOPE="${AGENTOS_SUDO_SCOPE:-full}"
 # Empty → resolved from SERVICE_USER after args (/opt/<user>), so --user alone is
 # enough to move the whole install. An explicit --dir/$AGENTOS_DIR still wins.
 INSTALL_DIR="${AGENTOS_DIR:-}"
@@ -205,10 +212,11 @@ while [ $# -gt 0 ]; do
     --repo)         CONTOUR_REPOS+=("${2:?--repo needs a value}"); shift 2 ;;
     --gh-token-key) GH_TOKEN_KEY="${2:?--gh-token-key needs a value}"; shift 2 ;;
     --image)        IMAGE_REF="${2:?--image needs a value}"; IMAGE_PINNED_BY_USER=1; shift 2 ;;
+    --scoped-sudo)  SUDO_SCOPE="selfmgmt"; shift ;;
     -y|--yes)       ASSUME_YES=1; shift ;;
     # Line range = the whole header block above (ends one line before
     # `set -euo pipefail`). Grow the header, grow this range, or --help truncates.
-    -h|--help)      sed -n '2,86p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,90p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              die "unknown option: $1 (try --help)" ;;
   esac
 done
@@ -509,25 +517,40 @@ if [ -n "${AGENTOS_PRINT_IDENTITY:-}" ]; then
   exit 0
 fi
 
-# ─── per-instance self-management: scoped sudoers drop-in ────────────────────
+# ─── host authority: the sudoers drop-in ─────────────────────────────────────
 #
-# The node runs as its own unprivileged, nologin service account with no access
-# to the host. To let the OPERATOR inside that sandbox manage THIS instance — and
-# nothing else on the box — install_selfmgmt_sudoers (systemd path) drops a file
-# at /etc/sudoers.d/<user>-selfmgmt granting NOPASSWD on EXACTLY three commands
-# against its own unit: restart it, read its status, tail its journal.
+# install_selfmgmt_sudoers (systemd path) drops a file at
+# /etc/sudoers.d/<user>-selfmgmt. What it grants is one knob, and the DEFAULT is
+# full: `<user> ALL=(ALL) NOPASSWD: ALL`.
 #
-# Deliberately narrow: no bare `systemctl` (host-wide), no other unit's journal.
-# The commands carry absolute binary paths (a sudoers requirement — a bare name
-# would let $PATH decide which `systemctl` runs) and match the unit token
-# exactly, so a neighbour instance's unit (agentos-<other>) can never satisfy
-# these rules. render_selfmgmt_sudoers is a pure function of (user, unit) so the
-# exact drop-in body is testable without root — see AGENTOS_PRINT_SUDOERS below
-# and scripts/tests/install-sudoers.test.sh.
-render_selfmgmt_sudoers() { # render_selfmgmt_sudoers <user> <unit> → drop-in body on stdout
-  local user="$1" unit="$2"
-  cat <<EOF
-# AgentOS per-instance self-management for the '${user}' instance.
+# Why full by default. AgentOS is an operator — the thing people install it to do
+# is administer the box it runs on: edit a config under /etc, restart a
+# neighbouring service, read a journal, install a package. A scoped grant does
+# not make that safe, it makes it fail HALFWAY: the agent gets far enough to be
+# trusted with the task and then dead-ends on a permission it was never given,
+# and the human is back in the loop for the last step. The node also runs its
+# sessions with the harness's bypass-equivalent permission mode (see
+# apps/api/src/core/harness/acp-harnesses.ts) — an agent that may run any command
+# but may not become root is not a security boundary, it is a limp.
+#
+# This is a REAL grant of the whole host to a software agent, and it is opt-out,
+# not opt-in. `--scoped-sudo` selects the old narrow drop-in instead: NOPASSWD on
+# exactly three commands against its OWN unit (restart, status, journal) and
+# nothing else on the box. Pick it when the node shares a host with something it
+# must not be able to touch. On a machine installed FOR AgentOS, the default is
+# the honest setting.
+#
+# Either body carries absolute binary paths (a sudoers requirement — a bare name
+# would let $PATH decide which `systemctl` runs) and, in the scoped form, matches
+# the unit token exactly, so a neighbour instance's unit (agentos-<other>) can
+# never satisfy the rules. render_selfmgmt_sudoers is a pure function of
+# (user, unit, scope) so the exact drop-in body is testable without root — see
+# AGENTOS_PRINT_SUDOERS below and scripts/tests/install-sudoers.test.sh.
+render_selfmgmt_sudoers() { # render_selfmgmt_sudoers <user> <unit> [scope] → drop-in body on stdout
+  local user="$1" unit="$2" scope="${3:-full}"
+  if [ "$scope" = "selfmgmt" ]; then
+    cat <<EOF
+# AgentOS per-instance self-management for the '${user}' instance (--scoped-sudo).
 # Written by install.sh — do NOT edit by hand; a re-run or upgrade rewrites it,
 # an uninstall removes it. Grants ${user} NOPASSWD sudo for EXACTLY three
 # commands against its own unit (${unit}.service) and nothing else on this host:
@@ -535,12 +558,26 @@ render_selfmgmt_sudoers() { # render_selfmgmt_sudoers <user> <unit> → drop-in 
 # unit's journal.
 ${user} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${unit}, /usr/bin/systemctl status ${unit}, /usr/bin/journalctl -u ${unit} *
 EOF
+  else
+    cat <<EOF
+# AgentOS host authority for the '${user}' instance (${unit}.service).
+# Written by install.sh — do NOT edit by hand; a re-run or upgrade rewrites it,
+# an uninstall removes it.
+#
+# This grants ${user} passwordless root on this host — the whole box, not just
+# its own unit. That is the default because AgentOS is installed to ADMINISTER
+# the machine, and an operator that cannot become root dead-ends mid-task.
+# Re-run install.sh with --scoped-sudo to replace this with a drop-in limited to
+# restart/status/journal on ${unit}.service alone.
+${user} ALL=(ALL) NOPASSWD: ALL
+EOF
+  fi
 }
 
 # "What sudoers drop-in would this command line write?" — answered without root
 # or a box, same dry-run contract as AGENTOS_PRINT_IDENTITY above.
 if [ -n "${AGENTOS_PRINT_SUDOERS:-}" ]; then
-  render_selfmgmt_sudoers "$SERVICE_USER" "$SERVICE_NAME"
+  render_selfmgmt_sudoers "$SERVICE_USER" "$SERVICE_NAME" "$SUDO_SCOPE"
   exit 0
 fi
 
@@ -1268,30 +1305,36 @@ EOF
   install_autoupdate_timer "$INSTALL_DIR/current/profiles"
 }
 
-# Drop the per-instance self-management sudoers file (systemd path). Idempotent:
-# a re-run/upgrade re-renders and overwrites it, so it always tracks the current
-# user/unit. Validated with `visudo -cf` BEFORE it is moved into place — a
-# malformed file in /etc/sudoers.d can lock sudo out of the whole host, so a
-# render that fails validation is discarded, never installed. Degrades to a
-# warning (never a failed install) on a host with no sudo/visudo.
+# Drop the instance's sudoers file (systemd path). Idempotent: a re-run/upgrade
+# re-renders and overwrites it, so it always tracks the current user/unit AND the
+# current scope — re-running with --scoped-sudo narrows an existing full grant,
+# re-running without it widens a scoped one back. Validated with `visudo -cf`
+# BEFORE it is moved into place — a malformed file in /etc/sudoers.d can lock
+# sudo out of the whole host, so a render that fails validation is discarded,
+# never installed. Degrades to a warning (never a failed install) on a host with
+# no sudo/visudo.
 install_selfmgmt_sudoers() {
-  step "Self-management sudoers"
+  step "Host authority (sudoers)"
   if ! command -v visudo >/dev/null 2>&1; then
-    warn "visudo not found — per-instance self-management sudoers NOT installed."
+    warn "visudo not found — the instance's sudoers drop-in was NOT installed."
     info "install the sudo package, then re-run to grant it."
     return 0
   fi
   local dropin="/etc/sudoers.d/${SERVICE_USER}-selfmgmt"
   local tmp; tmp="$(mktemp)"
-  render_selfmgmt_sudoers "$SERVICE_USER" "$SERVICE_NAME" > "$tmp"
+  render_selfmgmt_sudoers "$SERVICE_USER" "$SERVICE_NAME" "$SUDO_SCOPE" > "$tmp"
   # visudo -cf checks THIS file's syntax in isolation; -f names the file.
   if $SUDO visudo -cf "$tmp" >/dev/null 2>&1; then
     # 0440 root:root is the required mode for a sudoers.d drop-in; `install`
     # sets owner+mode atomically as it copies.
     $SUDO install -m 0440 -o root -g root "$tmp" "$dropin"
-    ok "self-management → ${dropin} (restart/status/journal on ${SERVICE_NAME} only)"
+    if [ "$SUDO_SCOPE" = "selfmgmt" ]; then
+      ok "self-management → ${dropin} (restart/status/journal on ${SERVICE_NAME} only)"
+    else
+      ok "host authority → ${dropin} (${SERVICE_USER} has passwordless root; --scoped-sudo narrows it)"
+    fi
   else
-    warn "generated sudoers failed visudo -cf — NOT installed (self-management degraded)."
+    warn "generated sudoers failed visudo -cf — NOT installed (the node cannot sudo)."
   fi
   rm -f "$tmp"
 }
