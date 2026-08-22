@@ -1066,6 +1066,10 @@ systemd_backup_sqlite() { # systemd_backup_sqlite <label> — <label> is the cod
   # already captures it by tarring the whole /data volume, so bare metal must
   # snapshot it too or a rollback would strand the node with mismatched runs.
   [ -d "$AGENTOS_HOME/data/.aop" ] && cp -a "$AGENTOS_HOME/data/.aop" "$dest/"
+  # Context registry metadata lives in messages.db; every per-context ledger and
+  # local-only repository lives under contexts/. Snapshot the tree as a unit so
+  # A/B workspaces, including unpushed local history, restore consistently.
+  [ -d "$AGENTOS_HOME/data/contexts" ] && cp -a "$AGENTOS_HOME/data/contexts" "$dest/"
   echo "$label" > "$dest/version"
   ok "backup: $(basename "$dest")"
   systemd_prune_backups
@@ -1102,7 +1106,7 @@ systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores 
   # snapshot lacks in place, mixing old and new state. This mirrors docker mode,
   # which `rm -rf /data/*` before untarring the snapshot. Restoring a snapshot
   # taken before .aop/ existed therefore correctly leaves no .aop/ behind.
-  rm -rf "$AGENTOS_HOME/data/.aop"
+  rm -rf "$AGENTOS_HOME/data/.aop" "$AGENTOS_HOME/data/contexts"
   cp -a "$src"/. "$AGENTOS_HOME/data/"
   # The snapshots are root-owned (this CLI runs as root), and `cp -a` of
   # "<dir>/." carries the snapshot dir's OWN ownership onto data/ itself — the

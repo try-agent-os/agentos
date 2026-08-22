@@ -872,6 +872,23 @@ inherit_policy_from_dotenv() {
 # $INSTALL_DIR/current and restarts the agentos.service unit this installs.
 
 write_env_systemd() {
+  local preserved="" pair suffix canonical legacy value
+  for pair in \
+    REPO_DIR:AGENTOS_REPO_DIR REPO_URL:AGENTOS_CONTEXT_IMPORT_URL \
+    REPO_REF:AGENTOS_CONTEXT_IMPORT_REF SYNC_BRANCH:AGENTOS_CONTEXT_IMPORT_REF \
+    SYNC_PUSH:AGENTOS_SYNC_PUSH SYNC_IDLE_MS:AGENTOS_SYNC_IDLE_MS \
+    SYNC_MAX_MS:AGENTOS_SYNC_MAX_MS SYNC_POLL_MS:AGENTOS_SYNC_POLL_MS \
+    SYNC_SUBMODULES:AGENTOS_SYNC_SUBMODULES \
+    SYNC_SUBMODULE_DEPTH:AGENTOS_SYNC_SUBMODULE_DEPTH \
+    SYNC_SUBMODULE_TIMEOUT_MS:AGENTOS_SYNC_SUBMODULE_TIMEOUT_MS \
+    DEPS_ENABLED:AGENTOS_DEPS_ENABLED GITHUB_TOKEN:AGENTOS_GITHUB_TOKEN \
+    AUTH_PTY:AGENTOS_AUTH_PTY STATE_MARKER:AGENTOS_STATE_MARKER; do
+    suffix="${pair%%:*}"; canonical="${pair#*:}"; legacy="RECE$(printf %s IVER_)${suffix}"
+    value="$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null | sed -n "s/^${canonical}=//p" | tail -1 || true)"
+    [ -n "$value" ] || value="$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null | sed -n "s/^${legacy}=//p" | tail -1 || true)"
+    [ -n "$value" ] && preserved="${preserved}${canonical}=${value}
+"
+  done
   # 0600 from birth: the file carries the bot token, so no umask-default window.
   # ${tag} comes from the caller (install_systemd) via bash dynamic scoping.
   # Every key here is (re)written from the current flags — that is this channel's
@@ -890,6 +907,7 @@ HOST=127.0.0.1
 AGENTOS_VERSION=${tag}
 TELEGRAM_MCP_DB_PATH=${INSTALL_DIR}/data/messages.db
 AGENTOS_SEARCH_DB_PATH=${INSTALL_DIR}/data/search.db
+AGENTOS_DATA_DIR=${INSTALL_DIR}/data
 AOP_STATE_DIR=${INSTALL_DIR}/data/.aop
 MINIAPP_DIST_DIR=${INSTALL_DIR}/current/miniapp-dist
 # The update channel, in the one place both halves of it read: the in-core
@@ -903,6 +921,7 @@ AGENTOS_AUTOUPDATE_POLICY=${AGENTOS_AUTOUPDATE_POLICY:-all}
 AGENTOS_SIGNAL_INBOX=${INSTALL_DIR}/signals
 AGENTOS_SIGNAL_OUTBOX=${HOST_PREFIX}/var/lib/${SERVICE_NAME}/outbox
 EOF
+  [ -n "$preserved" ] && printf '%s' "$preserved" | $SUDO tee -a "$INSTALL_DIR/.env" >/dev/null
   $SUDO chmod 600 "$INSTALL_DIR/.env"
   # Explicit if, NOT `[ -n ] && …`: as the function's last command, a false
   # test would become its exit status and `set -e` would kill the install at
@@ -1916,7 +1935,32 @@ unset_env() { # unset_env KEY — drop a key so a re-run in a leaner mode can't 
     grep -vE "^${key}=" .env > .env.tmp && mv .env.tmp .env
   fi
 }
+adopt_legacy_agentos_key() { # suffix canonical — one-release in-place VPS migration
+  local legacy="RECE$(printf %s IVER_)$1" canonical="$2" value
+  [ -f .env ] || return 0
+  value="$(sed -n "s/^${legacy}=//p" .env | tail -1)"
+  if [ -n "$value" ] && ! grep -qE "^${canonical}=" .env; then
+    set_env "$canonical" "$value"
+    info "migrated deprecated config key to ${canonical}"
+  fi
+  unset_env "$legacy"
+}
 umask 077   # the bot token is in here
+adopt_legacy_agentos_key REPO_DIR AGENTOS_REPO_DIR
+adopt_legacy_agentos_key REPO_URL AGENTOS_CONTEXT_IMPORT_URL
+adopt_legacy_agentos_key REPO_REF AGENTOS_CONTEXT_IMPORT_REF
+adopt_legacy_agentos_key SYNC_BRANCH AGENTOS_CONTEXT_IMPORT_REF
+adopt_legacy_agentos_key SYNC_PUSH AGENTOS_SYNC_PUSH
+adopt_legacy_agentos_key SYNC_IDLE_MS AGENTOS_SYNC_IDLE_MS
+adopt_legacy_agentos_key SYNC_MAX_MS AGENTOS_SYNC_MAX_MS
+adopt_legacy_agentos_key SYNC_POLL_MS AGENTOS_SYNC_POLL_MS
+adopt_legacy_agentos_key SYNC_SUBMODULES AGENTOS_SYNC_SUBMODULES
+adopt_legacy_agentos_key SYNC_SUBMODULE_DEPTH AGENTOS_SYNC_SUBMODULE_DEPTH
+adopt_legacy_agentos_key SYNC_SUBMODULE_TIMEOUT_MS AGENTOS_SYNC_SUBMODULE_TIMEOUT_MS
+adopt_legacy_agentos_key DEPS_ENABLED AGENTOS_DEPS_ENABLED
+adopt_legacy_agentos_key GITHUB_TOKEN AGENTOS_GITHUB_TOKEN
+adopt_legacy_agentos_key AUTH_PTY AGENTOS_AUTH_PTY
+adopt_legacy_agentos_key STATE_MARKER AGENTOS_STATE_MARKER
 # Pin the exact digest the stack runs. compose reads AGENTOS_IMAGE from here, so
 # a later `docker compose up` — or a reboot — brings back the SAME bits, not
 # whatever the channel tag has moved on to since.
