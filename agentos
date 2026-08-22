@@ -135,7 +135,7 @@ docker_set_image() {
 #
 # .env is the node's configuration AND a file the UNPRIVILEGED core owns and can
 # rewrite: install.sh chowns the whole install root to the service account, the
-# core's unit grants it ReadWritePaths= over that root, and agent sessions run as
+# core runs with no systemd sandbox at all, and agent sessions run as
 # that account with a shell. This CLI reads that file as ROOT — inside an upgrade
 # it mkdir/chmod 0750/chowns the two directories it names, and it copies two of
 # its values into the root poller's unit (which has no EnvironmentFile= precisely
@@ -202,8 +202,8 @@ valid_policy() { case "${1:-}" in off|security|patch|minor|all) return 0 ;; *) r
 # having to enumerate them.
 # A validated PATH is still not a safe TARGET, which is what this second guard
 # is for. $AGENTOS_HOME belongs to the unprivileged core (install.sh chowns the
-# tree to the service account on every re-run, and agentos.service grants it
-# ReadWritePaths there), so it can replace a name under that root with a symlink
+# tree to the service account on every re-run, and the core runs unconfined), so
+# it can replace a name under that root with a symlink
 # — and root's mkdir/chmod/chown all FOLLOW symlinks. Aimed at
 # /etc/systemd/system, the chown hands the service account every unit root runs.
 # signal_path_ok above cannot catch it: the DEFAULT path is the vector, and the

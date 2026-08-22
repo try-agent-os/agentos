@@ -151,8 +151,9 @@ die()   { echo -e "\n${RED}✗ $*${NC}\n" >&2; exit 1; }
 #
 # Every directory this script hands to the service account lives under
 # $INSTALL_DIR, and $INSTALL_DIR belongs to that account — install_systemd
-# chowns the whole tree to it on every re-run, and agentos.service grants the
-# core ReadWritePaths over it. So for any such name the core may have got there
+# chowns the whole tree to it on every re-run, and the core runs unconfined
+# (agentos.service ships no systemd sandbox), so it can write anywhere its POSIX
+# permissions reach. So for any such name the core may have got there
 # first and left a symlink, and root's `mkdir -p`/`chmod`/`chown` all FOLLOW
 # symlinks: aimed at /etc/systemd/system, the chown hands the service account
 # every unit root runs.
@@ -880,8 +881,8 @@ EOF
 # ownership removes that without a single check in either program.
 #
 #   inbox  — $INSTALL_DIR/signals, owned by the service account so the core can
-#            write. Inside the install root because agentos.service's
-#            ReadWritePaths already covers it.
+#            write. Inside the install root because that is the tree the
+#            service account owns.
 #   outbox — /var/lib/<unit>/outbox, root-owned, group = the service account so
 #            the core can READ result.json without being able to create
 #            anything there. Deliberately OUTSIDE the install root: install.sh
@@ -922,8 +923,8 @@ create_signal_dirs() {
   # `chmod` it guards. Anything but the one mkdir fails. That test was blind to
   # this file until it was made to trace it, and blind to guards altogether
   # before that, so the claim stood while the code drifted. $INSTALL_DIR belongs to the
-  # service account (the chown -R below runs on every re-run) and agentos.service
-  # grants it ReadWritePaths there, so the core can swap `signals` for a symlink
+  # service account (the chown -R below runs on every re-run) and the core runs
+  # unconfined, so it can swap `signals` for a symlink
   # and have the chown/chmod land on its target; /etc/systemd/system would hand it
   # every unit root runs. Refuse rather than `chown -h`-retarget: retargeting as a
   # SUBSTITUTE for refusing would leave the attacker's link in place and the node
@@ -1102,14 +1103,15 @@ install_systemd() {
   esac
 
   step "Service user + layout"
-  # $HOME must live inside the writable install root (ProtectSystem=strict in
-  # the unit): ~/.claude and ~/.ssh break under a custom --dir otherwise.
+  # $HOME IS the install root (useradd -d): ~/.claude (CLI state) and ~/.ssh (the
+  # deploy key core-entrypoint.sh writes) then follow a custom --dir instead of
+  # landing in a home the install knows nothing about.
   id "$SERVICE_USER" >/dev/null 2>&1 || \
     $SUDO useradd -r -m -d "$INSTALL_DIR" -s /usr/sbin/nologin "$SERVICE_USER"
   # logs/: the node's own log file lives here (the unit appends stdout+stderr to
   # logs/node.log — see agentos.service), so the operator can self-diagnose from
-  # inside the instance sandbox without journalctl or root. Owned by the service
-  # account (chown -R below), under ReadWritePaths, world-readable once systemd
+  # inside the instance without journalctl or root. Owned by the service
+  # account (chown -R below), world-readable once systemd
   # creates the file.
   $SUDO mkdir -p "$INSTALL_DIR"/{versions,data,backups,logs}
   create_signal_dirs
@@ -1164,8 +1166,8 @@ install_systemd() {
   # literal default install root — that IS its placeholder convention (see the
   # comment at the top of that file). A plain cp only works for the default
   # --dir; retargeting every occurrence (EnvironmentFile, ExecStart*,
-  # WorkingDirectory, and the ProtectSystem= hardening paths alike) is what
-  # makes a custom --dir actually boot instead of pointing a hardened unit at
+  # WorkingDirectory, StandardOutput/StandardError alike) is what
+  # makes a custom --dir actually boot instead of pointing the unit at
   # a root that does not exist.
   # $SUDO on the READ too, not just the tee: $INSTALL_DIR is the agentos
   # service account's $HOME (useradd -r -m), which can be 0700 — under sudo
