@@ -306,6 +306,33 @@ SIGNAL_INBOX=""; SIGNAL_OUTBOX=""
 #
 # Only what changed is rewritten, so an upgrade that finds the unit set already
 # current does not reload systemd or restart anything at all.
+# Re-assert the ACLs of any declared external secret readers (see install.sh's
+# --secret-reader). The declaration lives in a root-owned file OUTSIDE the
+# install root; an upgrade re-materialises the version tree and can reset perms,
+# so every `agentos upgrade` re-applies these grants — the durable half of the
+# guarantee that a host-side reader (a freshness monitor, a backup job) keeps
+# reading $AGENTOS_HOME/secrets across node updates without a manual setfacl.
+reconcile_secret_reader_acls() {
+  local f="${AGENTOS_SECRET_READERS_FILE:-/var/lib/${AGENTOS_SERVICE}/secret-readers}"
+  local readers secrets_dir="$AGENTOS_HOME/secrets" u
+  [ -r "$f" ] || return 0
+  readers="$(sed 's/[[:space:]]//g; /^$/d' "$f" 2>/dev/null || true)"
+  [ -n "$readers" ] || return 0
+  command -v setfacl >/dev/null 2>&1 || { warn "setfacl not found — cannot re-apply secret-reader ACLs (install the 'acl' package)"; return 0; }
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    case "$u" in *[!a-z0-9_-]*|[!a-z_]*) warn "secret-reader '${u}': invalid account name — skipping"; continue ;; esac
+    if [ "$u" = "$AGENTOS_ACCOUNT" ]; then continue; fi
+    id "$u" >/dev/null 2>&1 || { warn "secret-reader '${u}': no such account — skipping"; continue; }
+    setfacl -m "u:${u}:--x" "$AGENTOS_HOME" || { warn "secret-reader '${u}': traverse grant on ${AGENTOS_HOME} failed"; continue; }
+    if [ -d "$secrets_dir" ]; then
+      setfacl -R -m "u:${u}:rX" "$secrets_dir" || warn "secret-reader '${u}': read grant on ${secrets_dir} failed"
+      setfacl -R -d -m "u:${u}:rX" "$secrets_dir" 2>/dev/null || true
+    fi
+    ok "secret reader ${u}: rX on ${secrets_dir} (+ traverse on ${AGENTOS_HOME})"
+  done <<< "$readers"
+}
+
 reconcile_units() { # reconcile_units <profiles-dir>
   local pdir="$1" au="${AGENTOS_SERVICE}-autoupdate" changed=0 main_unit_changed=0
   # Overridable so the suite can assert the rendered output without root.
@@ -1203,6 +1230,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     # It also runs the policy.conf migration, which an up-to-date node needs as
     # much as any other. Idempotent: unchanged units mean no daemon-reload.
     reconcile_units "$AGENTOS_HOME/current/profiles" || warn "unit reconciliation hit a snag"
+    reconcile_secret_reader_acls || warn "secret-reader ACL reconciliation hit a snag"
     return 0
   fi
   tarball="$(jq -r .tarball <<<"$manifest")"
@@ -1270,6 +1298,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     # branch below can still put $prev back. Best-effort — a snag here never
     # undoes an upgrade that is already healthy.
     reconcile_units "$AGENTOS_HOME/current/profiles" || warn "unit reconciliation hit a snag"
+    reconcile_secret_reader_acls || warn "secret-reader ACL reconciliation hit a snag"
     prune_versions
   else
     if uses_managed_postgres; then

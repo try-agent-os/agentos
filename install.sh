@@ -53,6 +53,13 @@
 #                              context-repo and every working repo (e.g. platform).
 #   --gh-token-key <KEY>       Which key in the merged .env holds the GitHub token used for `gh auth
 #                              setup-git` and the clones above. Default: GH_TOKEN, then GITHUB_TOKEN.
+#   --secret-reader <user>     A host account that must keep READ access to this instance's
+#                              operator-placed secrets ($INSTALL_DIR/secrets) across updates — e.g. a
+#                              host-side monitor or backup job. Its ACL (traverse on the install root,
+#                              rX on secrets/ + a default ACL so new drops inherit) is re-applied on
+#                              install AND every re-run, and the grant is remembered in
+#                              /var/lib/<service>/secret-readers (root-owned) so the auto-updater keeps
+#                              it without the flag. Repeatable. systemd-mode only. Requires `acl`.
 #
 # TWO NODES ON ONE HOST: same install, twice, with a different --user/--port and
 # its own .env — that is the whole story. Nothing is shared between instances
@@ -120,6 +127,10 @@ if [ -n "${AGENTOS_CONTOUR_REPOS:-}" ]; then # space/comma list also accepted vi
   IFS=', ' read -r -a CONTOUR_REPOS <<< "${AGENTOS_CONTOUR_REPOS}"
 fi
 GH_TOKEN_KEY="${AGENTOS_GH_TOKEN_KEY:-}"    # which .env key holds the gh token (else GH_TOKEN/GITHUB_TOKEN)
+SECRET_READERS=()                           # --secret-reader, repeatable: host accounts kept rx on $INSTALL_DIR/secrets across updates
+if [ -n "${AGENTOS_SECRET_READERS:-}" ]; then # space/comma list also accepted via env
+  IFS=', ' read -r -a SECRET_READERS <<< "${AGENTOS_SECRET_READERS}"
+fi
 COMPOSE_FILE="docker-compose.node.yml"
 INSTALL_MODE=""                  # docker | systemd; empty → resolved after args (default: systemd)
 # Prefix for the absolute HOST paths the auto-update channel writes OUTSIDE the
@@ -211,12 +222,13 @@ while [ $# -gt 0 ]; do
     --secrets)      SECRETS_FILE="${2:?--secrets needs a value}"; shift 2 ;;
     --repo)         CONTOUR_REPOS+=("${2:?--repo needs a value}"); shift 2 ;;
     --gh-token-key) GH_TOKEN_KEY="${2:?--gh-token-key needs a value}"; shift 2 ;;
+    --secret-reader) SECRET_READERS+=("${2:?--secret-reader needs a value}"); shift 2 ;;
     --image)        IMAGE_REF="${2:?--image needs a value}"; IMAGE_PINNED_BY_USER=1; shift 2 ;;
     --scoped-sudo)  SUDO_SCOPE="selfmgmt"; shift ;;
     -y|--yes)       ASSUME_YES=1; shift ;;
     # Line range = the whole header block above (ends one line before
     # `set -euo pipefail`). Grow the header, grow this range, or --help truncates.
-    -h|--help)      sed -n '2,90p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,97p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              die "unknown option: $1 (try --help)" ;;
   esac
 done
@@ -336,6 +348,72 @@ merge_contour_secrets() {
     && $SUDO chown -h "${SERVICE_USER}:${SERVICE_USER}" "$envfile" 2>/dev/null || true
   n="$(printf '%s\n' "$declared" | grep -c . || true)"
   ok "merged ${n} contour secret key(s) into .env: $(printf '%s ' $declared)"
+}
+
+# ─── extra secret readers — durable rx access to operator-placed secrets ─────
+#
+# The install root is the service account's $HOME at mode 0700: by default no
+# other account can even traverse it, which is exactly right for a node's own
+# secrets. But some contours have a LEGITIMATE external reader — a host-side
+# monitor, a backup job — that must read a credential the operator drops under
+# $INSTALL_DIR/secrets. A one-off `setfacl` grant does not survive: this install
+# chowns/refreshes the tree on every re-run and the auto-updater re-materialises
+# the version tree, so an ACL laid by hand silently lapses on the next update
+# (a freshness monitor went blind for a day this way, 2026-08-24 — the mask on
+# the secrets dir came back `---`, neutralising the reader's entry). The durable
+# form is to make the grant DECLARED and reconciled every run, like secrets/repos.
+#
+# Each declared reader is remembered in /var/lib/<service>/secret-readers
+# (root-owned, OUTSIDE the install root the core can rewrite — a process that
+# could edit it could hand any host account read of this node's secrets) so a
+# later re-run OR the CLI upgrade path re-applies it with no flag. `scripts/agentos`
+# reads the same file on every `agentos upgrade`. Reconciliation grants, per
+# reader: traverse (--x) on $INSTALL_DIR (descend, not list), and rX + a matching
+# default ACL on $INSTALL_DIR/secrets so a freshly-dropped credential is readable
+# without re-running. setfacl recomputes the ACL mask to include each named entry,
+# so this ALSO repairs a mask:--- a prior chmod on the dir had zeroed.
+secret_readers_list_file() { printf '%s/var/lib/%s/secret-readers' "${HOST_PREFIX}" "${SERVICE_NAME}"; }
+
+persist_secret_readers() {
+  [ "${#SECRET_READERS[@]}" -gt 0 ] || return 0
+  local f dir existing merged
+  f="$(secret_readers_list_file)"; dir="$(dirname "$f")"
+  $SUDO mkdir -p "$dir"
+  existing="$(read_maybe_sudo "$f" 2>/dev/null || true)"
+  merged="$(printf '%s\n' "$existing" "${SECRET_READERS[@]}" \
+    | sed 's/[[:space:]]//g; /^$/d' | sort -u)"
+  printf '%s\n' "$merged" | $SUDO tee "$f" >/dev/null
+  $SUDO chmod 0644 "$f"
+  $SUDO chown root:root "$f" 2>/dev/null || true
+}
+
+reconcile_secret_reader_acls() {
+  local f readers secrets_dir u
+  f="$(secret_readers_list_file)"
+  readers="$(read_maybe_sudo "$f" 2>/dev/null || true)"
+  readers="$(printf '%s\n' "$readers" | sed 's/[[:space:]]//g; /^$/d')"
+  [ -n "$readers" ] || return 0
+  if ! command -v setfacl >/dev/null 2>&1; then
+    warn "setfacl not found — cannot reconcile secret-reader ACLs (install the 'acl' package)"
+    return 0
+  fi
+  secrets_dir="$INSTALL_DIR/secrets"
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    case "$u" in *[!a-z0-9_-]*|[!a-z_]*) warn "secret-reader '${u}': not a valid unix account name — skipping"; continue ;; esac
+    if [ "$u" = "$SERVICE_USER" ]; then continue; fi
+    if ! id "$u" >/dev/null 2>&1; then warn "secret-reader '${u}': no such account on this host — skipping"; continue; fi
+    $SUDO setfacl -m "u:${u}:--x" "$INSTALL_DIR" \
+      || { warn "secret-reader '${u}': could not grant traverse on ${INSTALL_DIR}"; continue; }
+    if $SUDO test -d "$secrets_dir"; then
+      $SUDO setfacl -R -m "u:${u}:rX" "$secrets_dir" \
+        || warn "secret-reader '${u}': could not grant read on ${secrets_dir}"
+      $SUDO setfacl -R -d -m "u:${u}:rX" "$secrets_dir" 2>/dev/null || true
+      ok "secret reader ${u}: rX on ${secrets_dir} (+ traverse on ${INSTALL_DIR})"
+    else
+      ok "secret reader ${u}: traverse on ${INSTALL_DIR} (create ${secrets_dir} for shared secrets)"
+    fi
+  done <<< "$readers"
 }
 
 # Resolve the GitHub token from the merged .env, by the operator's chosen key if
@@ -715,6 +793,31 @@ if [ -n "${AGENTOS_PRINT_CONTOUR:-}" ]; then
   done
   echo "repos=${_rnames}"
   echo "gh_token_key=${GH_TOKEN_KEY}"
+  exit 0
+fi
+
+# "Which external secret-reader ACLs would this leave on the tree?" — answered
+# against a real (temp, --dir) install root, no root or systemd needed. Persists
+# the --secret-reader declaration then RUNS reconcile_secret_reader_acls so the
+# test asserts the real ACL result (mask repaired, reader granted rX + a default
+# ACL). HOST_PREFIX isolates the /var/lib/<service> list file to the temp tree.
+# Driven by scripts/tests/install-secret-readers.test.sh.
+if [ -n "${AGENTOS_PRINT_SECRET_READERS:-}" ]; then
+  SUDO="${SUDO:-}"                       # not yet resolved this early; the ops tolerate empty
+  HOST_PREFIX="$AGENTOS_PRINT_SECRET_READERS"   # the hook's value IS the /var/lib prefix (as AGENTOS_PRINT_SIGNAL_DIRS)
+  $SUDO mkdir -p "$INSTALL_DIR"
+  persist_secret_readers
+  reconcile_secret_reader_acls >/dev/null 2>&1 || true
+  echo "list_file=$(secret_readers_list_file)"
+  echo "readers=$(read_maybe_sudo "$(secret_readers_list_file)" 2>/dev/null | paste -sd, - || true)"
+  if command -v getfacl >/dev/null 2>&1; then
+    echo "--- installdir_acl ---"
+    getfacl -pE "$INSTALL_DIR" 2>/dev/null
+    if [ -d "$INSTALL_DIR/secrets" ]; then
+      echo "--- secrets_acl ---"
+      getfacl -pE "$INSTALL_DIR/secrets" 2>/dev/null
+    fi
+  fi
   exit 0
 fi
 
@@ -1117,7 +1220,9 @@ install_systemd() {
   wait_for_first_boot
   apt_wait_for_lock
   $SUDO apt-get -o DPkg::Lock::Timeout=300 update -qq
-  $SUDO apt-get -o DPkg::Lock::Timeout=300 install -y -qq ffmpeg git tmux curl zstd jq ca-certificates
+  # `acl` (setfacl/getfacl): reconcile_secret_reader_acls re-asserts the rx ACL
+  # of any declared external secret reader on every run — see --secret-reader.
+  $SUDO apt-get -o DPkg::Lock::Timeout=300 install -y -qq ffmpeg git tmux curl zstd jq ca-certificates acl
 
   step "Release"
   local manifest tag tarball sha node_ver url
@@ -1239,6 +1344,11 @@ install_systemd() {
             "$INSTALL_DIR/current/profiles/agentos.service" \
     | $SUDO tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null
   $SUDO chown -R "${SERVICE_USER}:${SERVICE_USER}" "$INSTALL_DIR"
+  # AFTER the tree chown: record any newly-declared external secret readers and
+  # (re)apply their ACLs, so a reader survives this re-run and every later update
+  # without a manual setfacl. No-op when none are declared.
+  persist_secret_readers
+  reconcile_secret_reader_acls
   $SUDO systemctl daemon-reload
   $SUDO systemctl enable --now "$SERVICE_NAME"
 
