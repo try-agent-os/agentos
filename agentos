@@ -1496,6 +1496,30 @@ cmd_preset() {
   esac
 }
 
+cmd_import_history() { # agentos import-history --from <path> --chat <id> [--dry-run ...]
+  # One-shot data load: import a prior transport's chat history (a telegram-mcp
+  # messages.db, or a jsonl export) into this node's messages schema. Runs the
+  # SAME CLI the source repo ships, against the node's own primary + FTS sidecar.
+  # ⚠ SQLite is single-writer — run with the node stopped (or target Postgres).
+  case "$(detect_mode)" in
+    docker)
+      ( cd "$AGENTOS_HOME" && exec docker compose -f "$COMPOSE_FILE" exec -T node \
+          node dist/ops/import-history-cli.js "$@" ) ;;
+    systemd)
+      local base="$AGENTOS_HOME/current" cli=""
+      for c in \
+        "$base/dist/ops/import-history-cli.js" \
+        "$base/apps/api/dist/ops/import-history-cli.js" \
+        "$base/node_modules/@agent-os/api/dist/ops/import-history-cli.js"; do
+        [ -f "$c" ] && { cli="$c"; break; }
+      done
+      [ -n "$cli" ] || die "import-history CLI not found under $base (is the node installed?)"
+      exec node "$cli" "$@" ;;
+    none)
+      die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
 cmd_rollback() {
   case "$(detect_mode)" in
     systemd) systemd_rollback ;;
@@ -1525,6 +1549,8 @@ agentos — operate an AgentOS Core node
   plugin add|ls|rm|enable|disable|secret|update|slot ...  manage runtime plugins
   plugin new|validate|list ...  author, validate and scaffold plugin dirs
   preset ls | show <id> | add <id> [key=value ...]  browse + install routine presets
+  import-history --from <path> --chat <id> [--dry-run]  import prior-transport
+                              chat history into this node (messages.db | jsonl)
   status | logs [n] | version
 EOF
 }
@@ -1536,6 +1562,7 @@ case "${1:-}" in
   rollback)   cmd_rollback ;;
   plugin)     shift; cmd_plugin "$@" ;;
   preset)     shift; cmd_preset "$@" ;;
+  import-history) shift; cmd_import_history "$@" ;;
   status)   cmd_status ;;
   logs)     shift || true; cmd_logs "${1:-200}" ;;
   version)  cmd_version ;;
