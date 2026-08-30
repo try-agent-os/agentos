@@ -551,20 +551,44 @@ $3"
   # already current that run has nothing to change. Gated on `changed`, the
   # clearing would never fire in the one scenario it exists for. It is a no-op
   # on a healthy unit, so running it every time is free.
+  #
+  # `${au}.timer` belongs in this list too, not just `.path`/`.service`: when the
+  # oneshot they both fire hits its StartLimitBurst, systemd fails the JOB that
+  # activates it — and that failure propagates to whichever trigger unit issued
+  # the job, timer included, not only the .path. Leaving it out of reset-failed
+  # was itself a live bug (2026-08-30, task 86cbbrmbz): a hub upgrade to
+  # v2.73.0 left both agentos-hub-autoupdate.timer AND .path `inactive (dead)`,
+  # `Trigger: n/a`, with no error anywhere — a release then shipped at 20:09 and
+  # the node sat on the old version past 21:00 because nothing was left to fire
+  # the next check.
   if [ -f "$units_dir/${au}.service" ]; then
-    systemctl reset-failed "${au}.path" "${au}.service" >/dev/null 2>&1 || true
+    systemctl reset-failed "${au}.timer" "${au}.path" "${au}.service" >/dev/null 2>&1 || true
   fi
 
+  # BEFORE the re-arm below, not after: when `changed` is 1 the files on disk
+  # just moved out from under systemd's cached unit definitions, and enabling
+  # or starting a unit before a reload arms it against the STALE in-memory
+  # copy. daemon-reload stays gated on `changed` — nothing to pick up otherwise.
   if [ "$changed" = 1 ]; then
     systemctl daemon-reload || warn "daemon-reload failed; units will apply on next boot"
-    # Never ask systemd to arm a unit this node has no file for: a release that
-    # predates the .path leaves nothing to enable, and the error would be the
-    # only thing an operator saw from an otherwise clean upgrade.
-    if [ -f "$units_dir/${au}.path" ]; then
-      systemctl enable --now "${au}.path" >/dev/null 2>&1 || true
-    fi
-    systemctl enable --now "${au}.timer" >/dev/null 2>&1 || true
     ok "reconciled auto-update units"
+  fi
+
+  # Re-arming is why the reset above exists at all, and it has the SAME
+  # changed-gate bug reset-failed used to have: `reset-failed` only clears the
+  # failure counter, it never restarts anything, so a `.path`/`.timer` a poke
+  # storm knocked dead stays dead forever once gated behind `changed` — the
+  # very upgrade whose burst caused the trip usually leaves the unit set
+  # byte-identical (the trip is a runtime event, not a template edit), so
+  # `changed` is 0 on exactly the run that most needs this. `enable --now` on
+  # an already-active unit is a no-op, so running it unconditionally on every
+  # reconcile is free and self-heals the fast path within the same invocation
+  # that broke it, without waiting on a human or a second release.
+  if [ -f "$units_dir/${au}.path" ]; then
+    systemctl enable --now "${au}.path" >/dev/null 2>&1 || true
+  fi
+  if [ -f "$units_dir/${au}.timer" ]; then
+    systemctl enable --now "${au}.timer" >/dev/null 2>&1 || true
   fi
 
   # The daemon-reload above re-reads the main unit, so systemd honours the new
