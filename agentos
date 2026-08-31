@@ -3,7 +3,8 @@
 # Modes: docker (compose profile) | systemd (bare-metal, no Docker).
 #
 #   agentos install [installer flags]   fresh install (delegates to install.sh)
-#   agentos upgrade [--to <tag>]        upgrade to the stable channel (or a pinned tag)
+#   agentos upgrade [--to <tag>] [--force]  upgrade to the stable channel (or a pinned
+#                                       tag); waits for a quiet moment unless --force
 #   agentos rollback                    undo the last upgrade (code + database)
 #   agentos backup                      take a manual backup without upgrading
 #   agentos status | logs [n] | version
@@ -285,6 +286,46 @@ resolve_signal_paths() { # resolve_signal_paths <docker|systemd>
   return 0
 }
 SIGNAL_INBOX=""; SIGNAL_OUTBOX=""
+
+# ─── the quiet-moment guard, shared with the unattended updater ──────────────
+#
+# ClickUp 86cbc3grw (continuation of 86cbc1pae). A long stop is a DRAIN, not a
+# hang: on SIGTERM the core waits out agent turns already in flight. It only gets
+# long when a restart is fired INTO a live turn. scripts/agentos-autoupdate.sh has
+# refused to do that for a while (verdict=deferred reason=activity); the hands-on
+# paths — this CLI's `upgrade`, and `agentos plugin` — did it blind. Same question,
+# one implementation: scripts/lib/node-activity.sh, sourced by all three.
+#
+# Two escapes, and only two, matching the updater's: an explicit `--force`, and the
+# wait CEILING (AGENTOS_RESTART_GUARD_TIMEOUT, default 900s) after which the restart
+# proceeds anyway. The core writes the busy signal, so it must be able to DELAY an
+# operator and never to block one.
+_CLI_HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [ -r "$_CLI_HERE/lib/node-activity.sh" ]; then
+  # shellcheck source=lib/node-activity.sh
+  . "$_CLI_HERE/lib/node-activity.sh"
+  AGENTOS_ACTIVITY_GUARD=1
+else
+  AGENTOS_ACTIVITY_GUARD=0
+fi
+
+# await_quiet_moment <what> — block until no owner turn is in flight, then return.
+# NEVER fails the caller: worst case it prints why it could not wait and returns 0,
+# because a guard that can cancel an upgrade is a guard that can strand a node.
+await_quiet_moment() { # await_quiet_moment <label>
+  local label="${1:-restart}"
+  [ "${FORCE_RESTART:-0}" = 1 ] && { info "restart-guard: verdict=proceed reason=forced (--force) — not waiting for a quiet moment"; return 0; }
+  if [ "$AGENTOS_ACTIVITY_GUARD" != 1 ]; then
+    warn "restart-guard: verdict=proceed reason=guard-lib-missing — cannot see owner activity from $_CLI_HERE; ${label} proceeds blind"
+    return 0
+  fi
+  # The host-side inbox is where the core writes signals/activity; resolve it the
+  # same way the upgrade paths resolve every other signal path, never raw.
+  [ -n "${SIGNAL_INBOX:-}" ] || resolve_signal_paths "$(detect_mode)"
+  node_activity_use_marker "$SIGNAL_INBOX/activity"
+  node_wait_for_quiet "${AGENTOS_RESTART_GUARD_TIMEOUT:-900}" || true
+  return 0
+}
 
 # ─── both modes: reconcile the systemd unit set with the release ────────────
 #
@@ -652,12 +693,17 @@ docker_refresh_profiles() { # docker_refresh_profiles <new-image> [prev-image]
   docker rm "$c" >/dev/null 2>&1 || true
 
   # 1. Self-updating operator tooling — always tracks the image, atomic rename.
-  for f in agentos agentos-autoupdate.sh; do
+  # lib/node-activity.sh is a RELATIVE path, not a bare name: the guard the two
+  # scripts above source resolves as "<their own dir>/lib/node-activity.sh", so it
+  # must land under $AGENTOS_HOME/lib/ — hence the mkdir. Leave it out and a node
+  # refreshes a CLI that then cannot see owner activity at all.
+  for f in agentos agentos-autoupdate.sh lib/node-activity.sh; do
     [ -f "$stage/$f" ] || continue
     if [ -f "$AGENTOS_HOME/$f" ] && cmp -s "$stage/$f" "$AGENTOS_HOME/$f"; then
       continue   # already current — no needless churn
     fi
     chmod +x "$stage/$f" 2>/dev/null || true
+    mkdir -p "$(dirname "$AGENTOS_HOME/$f")"
     mv -f "$stage/$f" "$AGENTOS_HOME/$f"   # same-fs rename: atomic, safe self-overwrite
     ok "refreshed $f from the new image"
   done
@@ -1424,9 +1470,17 @@ cmd_upgrade() {
     case "$1" in
       --to)    to="${2:?--to needs a value}"; shift 2 ;;
       --image) image_ref="${2:?--image needs a value}"; shift 2 ;;
+      # Skip the quiet-moment wait. The unattended updater passes it too: by the
+      # time it invokes this CLI it has ALREADY run the same gate (and may have
+      # come through the security / MAX_DEFERRAL escape), so re-gating here would
+      # let a busy core defer root past the very ceiling that bounds it.
+      --force) FORCE_RESTART=1; shift ;;
       *)       die "unknown upgrade option: $1 (try --help)" ;;
     esac
   done
+  # An upgrade ends in a restart of the node whichever mode we are in, so the
+  # guard belongs here — once — rather than in each mode's restart call.
+  await_quiet_moment "upgrade"
   case "$(detect_mode)" in
     systemd)
       [ -n "$image_ref" ] && die "--image is docker-mode only; bare-metal ships a tarball channel (use --to <tag>)."
@@ -1455,7 +1509,11 @@ cmd_autoupdate() {
   # AGENTOS_DIR/SERVICE/USER in its environment — so it upgrades the right node
   # whatever the instance is called, and the default slot keeps working too.
   # Still overridable: the test suite substitutes a recorder via this same var.
-  export AGENTOS_AUTOUPDATE_APPLY_CMD="${AGENTOS_AUTOUPDATE_APPLY_CMD:-$self upgrade}"
+  # `--force`: the poller runs the activity gate itself before it decides to apply
+  # (and bypasses it for a security release or a target that has waited out
+  # MAX_DEFERRAL). Without this flag cmd_upgrade would gate a SECOND time and a
+  # core writing "busy" forever could hold root off past its own ceiling.
+  export AGENTOS_AUTOUPDATE_APPLY_CMD="${AGENTOS_AUTOUPDATE_APPLY_CMD:-$self upgrade --force}"
   exec "$poller" "$@"
 }
 
@@ -1564,8 +1622,11 @@ usage() {
   cat <<'EOF'
 agentos — operate an AgentOS Core node
   install [installer flags]   fresh install (delegates to install.sh)
-  upgrade [--to <tag>|--image <ref>]  upgrade to the stable channel, a pinned
-                              tag, or an explicit (digest-pinned) image ref
+  upgrade [--to <tag>|--image <ref>] [--force]
+                              upgrade to the stable channel, a pinned tag, or an
+                              explicit (digest-pinned) image ref. Waits for a
+                              quiet moment first (the node drains agent turns on
+                              stop); --force restarts into a live turn anyway
   autoupdate [--check]        poll the update channel and apply per policy
                               (--check: report the verdict, change nothing)
   rollback                    undo the last upgrade (code + database)
