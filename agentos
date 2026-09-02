@@ -1498,7 +1498,25 @@ cmd_autoupdate() {
   local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
   local here; here="$(cd "$(dirname "$self")" && pwd)"
   local poller="$here/agentos-autoupdate.sh"
-  [ -x "$poller" ] || die "autoupdater not found at $poller"
+  # A broken install must fail LOUDLY and ONCE. Two things went wrong together on
+  # 2026-09-02 and each hid the other: v2.78.0's tarball shipped this poller
+  # 0644, so the -x test failed on every contour; and the unit whitelists exit 1
+  # (SuccessExitStatus=0 1, so a rolled-back health gate does not wedge the
+  # timer), which rendered the failure as "Finished ... Deactivated
+  # successfully". Four nodes stopped updating and every indicator stayed green.
+  #
+  # The poke is consumed HERE rather than only inside the poller (which never got
+  # to run): the paired .path unit re-triggers for as long as the file exists, so
+  # a poller that cannot start turns one poke into a start-limit-hit and leaves
+  # the .path unit itself failed — that is how the fast path died on two nodes.
+  # Exit 78 (EX_CONFIG), not 1: the unit does not whitelist it, so systemd marks
+  # the unit failed and the timer guard reports a cause instead of silence.
+  if [ ! -x "$poller" ]; then
+    rm -f "${AGENTOS_SIGNAL_INBOX:-$AGENTOS_HOME/signals}/poke" \
+          "${AGENTOS_SIGNAL_INBOX:-$AGENTOS_HOME/signals}/poke-force" 2>/dev/null || true
+    echo "agentos: autoupdater not usable at $poller (missing or not executable) — this node will NOT self-update" >&2
+    exit 78
+  fi
   # The poller's apply step runs `$AGENTOS_AUTOUPDATE_APPLY_CMD --to <tag>`. Its
   # built-in default is the BARE `agentos`, which exists on PATH only for the
   # DEFAULT slot — a named (--user) instance's CLI is `agentos-<name>` and plain
