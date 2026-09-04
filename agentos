@@ -1596,6 +1596,34 @@ cmd_preset() {
   esac
 }
 
+# Routines surface — the runtime lifecycle overlay (task 86cban9hh).
+#   agentos routines ls | activate <routine> --from <ts> [--until <ts>] [--runs n]
+#                       | reset-budget <routine>
+# Arms a routine's activation window / run budget WITHOUT editing Git and without
+# a Telegram round-trip: the HTTP admin routes that do the same sit behind
+# Mini-App initData authorization, so an operator on the box has no way in.
+# Delegates to the compiled Node CLI shipped with the core
+# (core/routines/cli.js), exactly like `agentos preset`.
+cmd_routines() {
+  case "$(detect_mode)" in
+    docker)
+      ( cd "$AGENTOS_HOME" && exec docker compose -f "$COMPOSE_FILE" exec -T node \
+          node dist/core/routines/cli.js "$@" ) ;;
+    systemd)
+      local base="$AGENTOS_HOME/current" cli=""
+      for c in \
+        "$base/dist/core/routines/cli.js" \
+        "$base/apps/api/dist/core/routines/cli.js" \
+        "$base/node_modules/@agent-os/api/dist/core/routines/cli.js"; do
+        [ -f "$c" ] && { cli="$c"; break; }
+      done
+      [ -n "$cli" ] || die "routines CLI not found under $base (is the node installed?)"
+      exec node "$cli" "$@" ;;
+    none)
+      die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
 cmd_import_history() { # agentos import-history --from <path> --chat <id> [--dry-run ...]
   # One-shot data load: import a prior transport's chat history (a telegram-mcp
   # messages.db, or a jsonl export) into this node's messages schema. Runs the
@@ -1652,6 +1680,9 @@ agentos — operate an AgentOS Core node
   plugin add|ls|rm|enable|disable|secret|update|slot ...  manage runtime plugins
   plugin new|validate|list ...  author, validate and scaffold plugin dirs
   preset ls | show <id> | add <id> [key=value ...]  browse + install routine presets
+  routines ls | activate <routine> --from <ts> [--until <ts>] [--runs n]
+           | reset-budget <routine>   arm/re-arm a routine's activation window
+                              and run budget at runtime (no Git edit)
   import-history --from <path> --chat <id> [--dry-run]  import prior-transport
                               chat history into this node (messages.db | jsonl)
   status | logs [n] | version
@@ -1665,6 +1696,7 @@ case "${1:-}" in
   rollback)   cmd_rollback ;;
   plugin)     shift; cmd_plugin "$@" ;;
   preset)     shift; cmd_preset "$@" ;;
+  routines)   shift; cmd_routines "$@" ;;
   import-history) shift; cmd_import_history "$@" ;;
   status)   cmd_status ;;
   logs)     shift || true; cmd_logs "${1:-200}" ;;
