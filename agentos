@@ -1624,6 +1624,59 @@ cmd_routines() {
   esac
 }
 
+# MCP surface — this node, served to an EXTERNAL agent (task 12418agf324).
+#   agentos mcp [--profile read|write] [--label <name>] [--print-surface]
+# The second sub-mode of this one command, next to the operator subcommands
+# above: `codex mcp`'s shape, where the same binary raises an MCP server instead
+# of driving a session. It does NOT start a node — the node keeps running and
+# owns its database; this is a stdio bridge onto its loopback tool surface, so a
+# foreign agent mounts it with {"command":"agentos","args":["mcp"]}.
+#
+# ⚠ STDOUT IS THE PROTOCOL here. Nothing in this arm may echo to stdout — no
+# warn(), no progress line — or the JSON-RPC framing is corrupt and the client
+# reports a broken server with no clue why. die() writes to stderr and is fine.
+#
+# The credential is AGENTOS_NODE_KEY, and it is taken from the ENVIRONMENT, never
+# from argv (which is world-readable in /proc). We lift it — and the endpoint
+# file — out of the node's .env when the caller has not already exported them,
+# because the whole point is that a foreign agent's config is one word long.
+cmd_mcp() {
+  case "$(detect_mode)" in
+    docker)
+      # `exec -T` keeps stdin/stdout as a plain pipe pair, which is exactly what
+      # an MCP stdio client needs; a TTY would corrupt the framing.
+      #
+      # The label must be forwarded EXPLICITLY: `docker compose exec` does not
+      # inherit the caller's environment into the container, so without `-e` the
+      # client's chosen name is dropped and every docker-mode agent shows up in
+      # the contour journal under the same default — the one field the audit
+      # trail has for answering "who". The node key and endpoint are already in
+      # the container's own environment, so only this one needs carrying.
+      ( cd "$AGENTOS_HOME" && exec docker compose -f "$COMPOSE_FILE" exec -T \
+          ${AGENTOS_MCP_CLIENT_LABEL:+-e "AGENTOS_MCP_CLIENT_LABEL=$AGENTOS_MCP_CLIENT_LABEL"} \
+          node node dist/core/mcp/cli.js "$@" ) ;;
+    systemd)
+      local base="$AGENTOS_HOME/current" cli=""
+      for c in \
+        "$base/dist/core/mcp/cli.js" \
+        "$base/apps/api/dist/core/mcp/cli.js" \
+        "$base/node_modules/@agent-os/api/dist/core/mcp/cli.js"; do
+        [ -f "$c" ] && { cli="$c"; break; }
+      done
+      [ -n "$cli" ] || die "mcp CLI not found under $base (is the node installed?)"
+      [ -n "${AGENTOS_NODE_KEY:-}" ] || AGENTOS_NODE_KEY="$(dotenv_val AGENTOS_NODE_KEY)"
+      [ -n "${AGENTOS_PEER_ENDPOINT_FILE:-}" ] || \
+        AGENTOS_PEER_ENDPOINT_FILE="$(dotenv_val AGENTOS_PEER_ENDPOINT_FILE)"
+      [ -n "$AGENTOS_NODE_KEY" ] || die "AGENTOS_NODE_KEY is not set and not readable from $AGENTOS_HOME/.env"
+      export AGENTOS_NODE_KEY AGENTOS_PEER_ENDPOINT_FILE
+      export AGENTOS_DIR="${AGENTOS_DIR:-$AGENTOS_HOME}"
+      [ -n "${AGENTOS_MCP_CLIENT_LABEL:-}" ] && export AGENTOS_MCP_CLIENT_LABEL
+      exec node "$cli" "$@" ;;
+    none)
+      die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
 cmd_import_history() { # agentos import-history --from <path> --chat <id> [--dry-run ...]
   # One-shot data load: import a prior transport's chat history (a telegram-mcp
   # messages.db, or a jsonl export) into this node's messages schema. Runs the
@@ -1685,6 +1738,11 @@ agentos — operate an AgentOS Core node
                               and run budget at runtime (no Git edit)
   import-history --from <path> --chat <id> [--dry-run]  import prior-transport
                               chat history into this node (messages.db | jsonl)
+  mcp [--profile read|write] [--label <name>] [--print-surface]
+                              serve THIS node to an external agent as an MCP
+                              server over stdio (mount it elsewhere as
+                              {"command":"agentos","args":["mcp"]}). Read-only
+                              unless the node arms AGENTOS_MCP_EXTERNAL_PROFILE
   status | logs [n] | version
 EOF
 }
@@ -1698,6 +1756,7 @@ case "${1:-}" in
   preset)     shift; cmd_preset "$@" ;;
   routines)   shift; cmd_routines "$@" ;;
   import-history) shift; cmd_import_history "$@" ;;
+  mcp)        shift; cmd_mcp "$@" ;;
   status)   cmd_status ;;
   logs)     shift || true; cmd_logs "${1:-200}" ;;
   version)  cmd_version ;;
