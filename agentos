@@ -146,7 +146,16 @@ docker_set_image() {
 # necessity (this CLI ships inside the image, install.sh arrives by curl) and
 # must be kept in step by hand, exactly like create_signal_dirs/ensure_signal_dirs.
 dotenv_val() { # dotenv_val <key> — the last assignment of <key> in .env, or empty
-  sed -n "s/^$1=//p" "$AGENTOS_HOME/.env" 2>/dev/null | tail -1 || true
+  # Reads, never SOURCES: .env is data, and sourcing data executes it. Accepts
+  # the three shapes a hand-edited .env actually contains — `KEY=value`,
+  # `KEY="value"` and `KEY='value'`, each optionally `export `-prefixed — and
+  # strips the quotes, because a shell sourcing the same line would. Without
+  # that, `AGENTOS_PEER_ENDPOINT_FILE="/run/…"` reached a caller with its quotes
+  # still attached and the path did not exist (ClickUp 12418agf323). The LAST
+  # assignment wins, which is again what sourcing would do. Empty when absent.
+  sed -nE "s/^[[:space:]]*(export[[:space:]]+)?$1=//p" "$AGENTOS_HOME/.env" 2>/dev/null \
+    | tail -1 \
+    | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" || true
 }
 
 # One key into .env, atomically, without disturbing the file's identity.
@@ -1624,6 +1633,70 @@ cmd_routines() {
   esac
 }
 
+# Export one .env value into this process ONLY when the caller has not already
+# set it. An explicit value in the environment therefore wins, so a second
+# contour can be addressed by exporting its key without editing any file.
+# Presence is tested with `${name:+set}`, never `${name:-}`: the latter would
+# print the variable's VALUE, and one of these three is the node's key.
+ctl_env_default() { # ctl_env_default KEY
+  local key="$1" found
+  [ -n "${!key:+set}" ] && return 0
+  found="$(dotenv_val "$key")"
+  [ -n "$found" ] && export "$key=$found"
+  return 0
+}
+
+# Node-control surface — `agentos ctl` (task 12418agf323).
+#   agentos ctl status | doctor | routine … | runs … | task … | settings … |
+#           harness … | secret set … | restart | logs [n]
+# The sub-mode that operates a RUNNING node from an ordinary shell, with no
+# agent session and no LLM spend. Everything except `logs` goes through the
+# core's loopback tool surface (never the database: SQLite is single-writer, and
+# a second writer beside a live core is a second source of truth about one node),
+# so the work is done by the compiled Node CLI — same three-path probe as
+# `agentos preset` and `agentos routines`.
+#
+# `logs` is the deliberate exception and stays HERE: the node's stdout belongs to
+# the supervisor, not to the node, so asking the core for its own log fails in
+# exactly the case that matters — a core too sick to answer. It is the same
+# reader `agentos logs` already is.
+cmd_ctl() {
+  if [ "${1:-}" = "logs" ]; then
+    shift
+    # `ctl logs tail 200` and `ctl logs 200` mean the same thing; the word is
+    # accepted because the task names the verb that way, and an operator who
+    # types it should get their log, not a usage error.
+    [ "${1:-}" = "tail" ] && shift
+    cmd_logs "${1:-200}"
+    return
+  fi
+  case "$(detect_mode)" in
+    docker)
+      # The container already carries the node's environment, so nothing is
+      # exported here. -T keeps stdin a pipe, which `ctl secret set` needs.
+      ( cd "$AGENTOS_HOME" && exec docker compose -f "$COMPOSE_FILE" exec -T node \
+          node dist/core/ctl/cli.js "$@" ) ;;
+    systemd)
+      # The CLI reads the node key and the endpoint from the ENVIRONMENT, and an
+      # ssh shell has neither: they live in the node's own .env, readable by the
+      # contour user alone. Lift exactly the three variables it needs.
+      ctl_env_default AGENTOS_NODE_KEY
+      ctl_env_default AGENTOS_PEER_ENDPOINT_FILE
+      ctl_env_default MCP_PORT
+      local base="$AGENTOS_HOME/current" cli=""
+      for c in \
+        "$base/dist/core/ctl/cli.js" \
+        "$base/apps/api/dist/core/ctl/cli.js" \
+        "$base/node_modules/@agent-os/api/dist/core/ctl/cli.js"; do
+        [ -f "$c" ] && { cli="$c"; break; }
+      done
+      [ -n "$cli" ] || die "ctl CLI not found under $base (is the node installed?)"
+      exec node "$cli" "$@" ;;
+    none)
+      die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
 # MCP surface — this node, served to an EXTERNAL agent (task 12418agf324).
 #   agentos mcp [--profile read|write] [--label <name>] [--print-surface]
 # The second sub-mode of this one command, next to the operator subcommands
@@ -1738,6 +1811,14 @@ agentos — operate an AgentOS Core node
                               and run budget at runtime (no Git edit)
   import-history --from <path> --chat <id> [--dry-run]  import prior-transport
                               chat history into this node (messages.db | jsonl)
+  ctl status | doctor | routine … | runs … | task … | settings … | harness … |
+      secret set … | restart | logs [n]
+                              operate the RUNNING node from this shell: no agent
+                              session, no LLM spend, --json on every command.
+                              `agentos ctl --help` lists them all. Note the pair:
+                              `agentos status` is the SERVICE view (is the unit
+                              up), `agentos ctl status` is the NODE view
+                              (version, uptime, harness, live runs).
   mcp [--profile read|write] [--label <name>] [--print-surface]
                               serve THIS node to an external agent as an MCP
                               server over stdio (mount it elsewhere as
@@ -1756,6 +1837,7 @@ case "${1:-}" in
   preset)     shift; cmd_preset "$@" ;;
   routines)   shift; cmd_routines "$@" ;;
   import-history) shift; cmd_import_history "$@" ;;
+  ctl)        shift; cmd_ctl "$@" ;;
   mcp)        shift; cmd_mcp "$@" ;;
   status)   cmd_status ;;
   logs)     shift || true; cmd_logs "${1:-200}" ;;
