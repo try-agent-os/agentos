@@ -1568,6 +1568,40 @@ install_autoupdate_timer() { # install_autoupdate_timer <profiles-dir>
       warn "could not arm ${au}.path — updates will still arrive on the timer"
     fi
   fi
+
+  # ── the owner's forced-upgrade pair (ClickUp 12418agfcp1) ─────────────────
+  #
+  # `/upgrade <version>` in chat writes ${INSTALL_DIR}/signals/upgrade-target;
+  # this .path unit turns that into a ROOT run of `agentos manual-upgrade`,
+  # which walks the release chain one health-gated hop per major boundary.
+  #
+  # It is a second unit rather than another trigger on the poller above because
+  # the run has to OUTLIVE the node it restarts (the core cannot upgrade itself
+  # — the first hop kills its own cgroup) and needs a chain's time budget; the
+  # unit file itself carries the full reasoning. It carries no Environment=
+  # block: unlike the poller it has no policy and no signal paths to be handed,
+  # because the CLI resolves both from .env as validated data.
+  #
+  # Optional exactly like the .path unit above: a re-run of the installer
+  # against a profiles/ tree that predates these templates must not die under
+  # `set -euo pipefail` on a missing file.
+  local mu="${SERVICE_NAME}-manual-upgrade"
+  if [ -f "$pdir/agentos-manual-upgrade.service" ] && [ -f "$pdir/agentos-manual-upgrade.path" ]; then
+    $SUDO sed -e "s|/opt/agentos|${INSTALL_DIR}|g" \
+              -e "s|^ExecStart=/usr/local/bin/agentos |ExecStart=/usr/local/bin/${SERVICE_NAME} |" \
+              "$pdir/agentos-manual-upgrade.service" \
+      | $SUDO tee "${units}/${mu}.service" >/dev/null
+    $SUDO sed -e "s|/opt/agentos|${INSTALL_DIR}|g" \
+              -e "s|^Unit=agentos-manual-upgrade.service$|Unit=${mu}.service|" \
+              "$pdir/agentos-manual-upgrade.path" \
+      | $SUDO tee "${units}/${mu}.path" >/dev/null
+    $SUDO systemctl daemon-reload
+    if $SUDO systemctl enable --now "${mu}.path" >/dev/null 2>&1; then
+      ok "forced upgrades armed (${mu}.path → ${mu}.service)"
+    else
+      warn "could not arm ${mu}.path — /upgrade in chat will have nothing listening; upgrade by hand with: ${SERVICE_NAME} upgrade --to <tag>"
+    fi
+  fi
 }
 
 # The node's auto-apply appetite used to live in a systemd drop-in that only the

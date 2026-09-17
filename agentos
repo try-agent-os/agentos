@@ -3,8 +3,11 @@
 # Modes: docker (compose profile) | systemd (bare-metal, no Docker).
 #
 #   agentos install [installer flags]   fresh install (delegates to install.sh)
-#   agentos upgrade [--to <tag>] [--force]  upgrade to the stable channel (or a pinned
-#                                       tag); waits for a quiet moment unless --force
+#   agentos upgrade [--to <tag>] [--force] [--no-chain]
+#                                       upgrade to the stable channel (or a pinned
+#                                       tag); waits for a quiet moment unless --force.
+#                                       Crossing a major walks the intermediate
+#                                       majors one hop at a time unless --no-chain
 #   agentos rollback                    undo the last upgrade (code + database)
 #   agentos backup                      take a manual backup without upgrading
 #   agentos status | logs [n] | version
@@ -318,6 +321,22 @@ else
   AGENTOS_ACTIVITY_GUARD=0
 fi
 
+# The cross-major upgrade PLANNER, sourced the same relative way and for the
+# same reason (docker/Dockerfile.node → profiles/lib/). It decides the order of
+# hops and nothing else; this file executes them.
+#
+# Absence is not fatal and not silent: a node whose profiles/ predates the lib
+# can still upgrade WITHIN its major — it simply must not be allowed to jump a
+# major boundary blind, because that is the jump forward-only migrations cannot
+# survive. cmd_upgrade refuses that one case by name.
+if [ -r "$_CLI_HERE/lib/upgrade-chain.sh" ]; then
+  # shellcheck source=lib/upgrade-chain.sh
+  . "$_CLI_HERE/lib/upgrade-chain.sh"
+  AGENTOS_CHAIN_PLANNER=1
+else
+  AGENTOS_CHAIN_PLANNER=0
+fi
+
 # await_quiet_moment <what> — block until no owner turn is in flight, then return.
 # NEVER fails the caller: worst case it prints why it could not wait and returns 0,
 # because a guard that can cancel an upgrade is a guard that can strand a node.
@@ -385,6 +404,13 @@ reconcile_secret_reader_acls() {
 
 reconcile_units() { # reconcile_units <profiles-dir>
   local pdir="$1" au="${AGENTOS_SERVICE}-autoupdate" changed=0 main_unit_changed=0
+  # The owner's forced-upgrade pair (ClickUp 12418agfcp1) — a second, separately
+  # rate-limited trigger with a chain's time budget. Reconciled here for the
+  # same reason the .path unit was: existing nodes get their units through this
+  # path and never re-run the installer, so a release that merely SHIPS the
+  # units would leave every already-installed node with a `/upgrade` command
+  # whose request file nothing watches.
+  local mu="${AGENTOS_SERVICE}-manual-upgrade"
   # Overridable so the suite can assert the rendered output without root.
   local units_dir="${AGENTOS_UNITS_DIR:-/etc/systemd/system}"
   command -v systemctl >/dev/null 2>&1 || return 0
@@ -405,7 +431,8 @@ reconcile_units() { # reconcile_units <profiles-dir>
     local rendered
     rendered="$(sed -e "s|/opt/agentos|${AGENTOS_HOME}|g" \
                     -e "s|^ExecStart=/usr/local/bin/agentos |ExecStart=/usr/local/bin/${AGENTOS_SERVICE} |" \
-                    -e "s|^Unit=agentos-autoupdate.service$|Unit=${au}.service|" "$1")"
+                    -e "s|^Unit=agentos-autoupdate.service$|Unit=${au}.service|" \
+                    -e "s|^Unit=agentos-manual-upgrade.service$|Unit=${mu}.service|" "$1")"
     # An `if`, never `[ -n … ] && rendered=…`: as a bare statement a false test
     # is the command's exit status, and `set -e` would kill the upgrade here.
     if [ -n "${3:-}" ]; then
@@ -433,6 +460,15 @@ $3"
 
   render_unit "$pdir/agentos-autoupdate.timer"   "$units_dir/${au}.timer"
   render_unit "$pdir/agentos-autoupdate.path"    "$units_dir/${au}.path"
+
+  # The forced-upgrade pair. No appended Environment= block: unlike the poller
+  # it carries no policy and no signal paths — the CLI it runs resolves both
+  # from .env itself, as DATA it validates, which is the same boundary stated at
+  # length in agentos-autoupdate.service. Both are optional in the same way
+  # every template here is: a node upgrading FROM a release that predates them
+  # simply has no source file, and render_unit returns without inventing one.
+  render_unit "$pdir/agentos-manual-upgrade.service" "$units_dir/${mu}.service"
+  render_unit "$pdir/agentos-manual-upgrade.path"    "$units_dir/${mu}.path"
 
   # The oneshot is rendered further down, after the drop-in migration: it now
   # carries the policy, and the migration is what settles the policy.
@@ -614,6 +650,12 @@ $3"
   if [ -f "$units_dir/${au}.service" ]; then
     systemctl reset-failed "${au}.timer" "${au}.path" "${au}.service" >/dev/null 2>&1 || true
   fi
+  # Same clearing, same reason, for the forced-upgrade pair: its own
+  # StartLimitBurst=3 can trip on a run of malformed requests, and a .path unit
+  # left failed means the NEXT `/upgrade` writes a file nobody reads.
+  if [ -f "$units_dir/${mu}.service" ]; then
+    systemctl reset-failed "${mu}.path" "${mu}.service" >/dev/null 2>&1 || true
+  fi
 
   # BEFORE the re-arm below, not after: when `changed` is 1 the files on disk
   # just moved out from under systemd's cached unit definitions, and enabling
@@ -639,6 +681,9 @@ $3"
   fi
   if [ -f "$units_dir/${au}.timer" ]; then
     systemctl enable --now "${au}.timer" >/dev/null 2>&1 || true
+  fi
+  if [ -f "$units_dir/${mu}.path" ]; then
+    systemctl enable --now "${mu}.path" >/dev/null 2>&1 || true
   fi
 
   # The daemon-reload above re-reads the main unit, so systemd honours the new
@@ -706,7 +751,7 @@ docker_refresh_profiles() { # docker_refresh_profiles <new-image> [prev-image]
   # scripts above source resolves as "<their own dir>/lib/node-activity.sh", so it
   # must land under $AGENTOS_HOME/lib/ — hence the mkdir. Leave it out and a node
   # refreshes a CLI that then cannot see owner activity at all.
-  for f in agentos agentos-autoupdate.sh lib/node-activity.sh; do
+  for f in agentos agentos-autoupdate.sh lib/node-activity.sh lib/upgrade-chain.sh; do
     [ -f "$stage/$f" ] || continue
     if [ -f "$AGENTOS_HOME/$f" ] && cmp -s "$stage/$f" "$AGENTOS_HOME/$f"; then
       continue   # already current — no needless churn
@@ -1473,8 +1518,105 @@ cmd_logs() {
   esac
 }
 
+# The ONE shape this CLI accepts as "a version this node runs": three numbers,
+# optionally followed by a prerelease and/or build suffix, with or without the
+# leading `v`. Echoed back without the `v`; non-zero and silent for anything
+# else. Deliberately self-contained rather than delegating to
+# upgrade_chain_release_core: a node whose tooling predates
+# lib/upgrade-chain.sh (AGENTOS_CHAIN_PLANNER=0) still has to read its version.
+node_version_form() { # node_version_form <string> → bare version, or non-zero
+  local v="${1-}"
+  v="${v#v}"
+  [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$ ]] || return 1
+  printf '%s' "$v"
+}
+
+# The running release version with no leading `v`, or empty when this node
+# cannot state one. Deliberately the SAME four sources (and the same order) as
+# scripts/agentos-autoupdate.sh's current_version(): the poller and this CLI
+# must never disagree about where a node is standing, or the poller gates one
+# version while the CLI plans a chain from another.
+#
+# Four sources, ONE form, and the form is checked on every one of them. A place
+# a version may be written is not a promise that what is written IS one, and
+# this CLI's callers cannot tell the difference: `plan_upgrade` has a written,
+# tested answer for "this node cannot state its version" (a single hop, with the
+# reason said out loud) and nothing but a `die` for "a version that does not
+# parse" — `upgrade_chain_plan` refuses it and no hop runs at all. Two real
+# nodes reached that `die`: a tree under versions/ named `v4.1.0-rc.1`, and a
+# docker install pinned by digest, where `${ref##*:}` is 64 hex characters and
+# the old `[0-9]*` glob let through every digest that happens to start with a
+# digit. A source that does not carry a version is SKIPPED, not fatal — the next
+# one may still state it.
+installed_version() { # → bare semver (possibly with a prerelease suffix), or empty
+  local v tgt ref tag
+  v="$(node_version_form "$(dotenv_val AGENTOS_VERSION)" || true)"
+  [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  if [ -L "$AGENTOS_HOME/current" ]; then
+    tgt="$(basename "$(readlink "$AGENTOS_HOME/current")" 2>/dev/null || true)"
+    v="$(node_version_form "$tgt" || true)"
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  fi
+  if [ -f "$AGENTOS_HOME/.version" ]; then
+    tgt="$(tr -d '[:space:]' < "$AGENTOS_HOME/.version" 2>/dev/null || true)"
+    v="$(node_version_form "$tgt" || true)"
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  fi
+  ref="$(dotenv_val AGENTOS_IMAGE)"; tag="${ref##*:}"
+  node_version_form "$tag" || true
+  return 0
+}
+
+# Every stable tag the dist channel has published, newest first — the OPTIONAL
+# input to the planner. Optional because the planner falls back to the
+# structural `<major>.0.0` gateway without it; this only matters where a major
+# line's first release was withdrawn, which no amount of version arithmetic can
+# know. Best-effort by design: a rate-limited or offline API must degrade to the
+# structural plan, never fail an upgrade an operator is standing in front of.
+# AGENTOS_RELEASE_TAGS overrides it whole, which is how the suite drives this
+# without a network.
+channel_release_tags() { # → v-tags, one per line (possibly none)
+  if [ -n "${AGENTOS_RELEASE_TAGS:-}" ]; then
+    # shellcheck disable=SC2086  # word-splitting IS the parse: space- or
+    # newline-separated tags both arrive as one tag per line.
+    printf '%s\n' ${AGENTOS_RELEASE_TAGS}
+    return 0
+  fi
+  command -v jq >/dev/null 2>&1 || return 0
+  curl -fsSL --max-time 30 -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/${DIST_REPO}/releases?per_page=100" 2>/dev/null \
+    | jq -r '.[]? | select(.draft | not) | select(.prerelease | not) | .tag_name' 2>/dev/null \
+    || true
+}
+
+# ONE hop, in whichever mode this node runs. Everything above it — the quiet
+# moment, the plan, the loop — is mode-agnostic; this is the only place that
+# still has to know.
+#
+# AGENTOS_UPGRADE_HOP_CMD substitutes the engine, the same seam (and the same
+# spelling) as AGENTOS_AUTOUPDATE_APPLY_CMD and AGENTOS_RESTART_CMD: the suite
+# points it at a recorder so "which hops ran, in what order, and did the chain
+# stop when one failed" can be asserted without unpacking a tarball or
+# restarting anything. Never set in production — a chain is only as trustworthy
+# as the order it is applied in, and that order has to be testable.
+upgrade_hop() { # upgrade_hop <tag> <image-ref>
+  if [ -n "${AGENTOS_UPGRADE_HOP_CMD:-}" ]; then
+    # BOTH args, not just the tag: which hop carries the digest pin is itself a
+    # property under test (it belongs to the target release alone).
+    $AGENTOS_UPGRADE_HOP_CMD "$1" "$2"
+    return
+  fi
+  case "$(detect_mode)" in
+    systemd)
+      [ -n "$2" ] && die "--image is docker-mode only; bare-metal ships a tarball channel (use --to <tag>)."
+      systemd_upgrade "$1" ;;
+    docker)  docker_upgrade "$1" "$2" ;;
+    none)    die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
 cmd_upgrade() {
-  local to="" image_ref=""
+  local to="" image_ref="" chain=1 cur plan hop hop_arg hop_img total n=0 from_latest=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --to)    to="${2:?--to needs a value}"; shift 2 ;;
@@ -1484,19 +1626,351 @@ cmd_upgrade() {
       # come through the security / MAX_DEFERRAL escape), so re-gating here would
       # let a busy core defer root past the very ceiling that bounds it.
       --force) FORCE_RESTART=1; shift ;;
+      # The escape hatch out of the chain: apply the target in ONE hop, whatever
+      # majors lie between. It exists because a plan is a guess about published
+      # history and an operator on the box may know better — not because a
+      # direct cross-major jump is safe. It is the operator's to take, never a
+      # default, and never reachable from the core (cmd_manual_upgrade does not
+      # pass it).
+      --no-chain) chain=0; shift ;;
       *)       die "unknown upgrade option: $1 (try --help)" ;;
     esac
   done
-  # An upgrade ends in a restart of the node whichever mode we are in, so the
-  # guard belongs here — once — rather than in each mode's restart call.
+
+  # UNCHANGED position, and it has to stay here: an upgrade ends in a restart of
+  # the node whichever mode we are in, so the guard runs ONCE up front — before
+  # any planning, any network and any mode branch. Everything below can bail
+  # out; the verdict must have been spoken by then either way.
   await_quiet_moment "upgrade"
-  case "$(detect_mode)" in
-    systemd)
-      [ -n "$image_ref" ] && die "--image is docker-mode only; bare-metal ships a tarball channel (use --to <tag>)."
-      systemd_upgrade "$to" ;;
-    docker)  docker_upgrade "$to" "$image_ref" ;;
-    none)    die "no install found under $AGENTOS_HOME" ;;
+  # Before the first network call, for the same reason: a host with no install
+  # has nothing to plan and nothing to fetch, and must not spend a curl timeout
+  # finding that out.
+  [ "$(detect_mode)" = none ] && die "no install found under $AGENTOS_HOME"
+
+  # `--no-chain` is the operator opting out by hand.
+  if [ "$chain" = 0 ]; then
+    upgrade_hop "$to" "$image_ref"
+    return
+  fi
+  # An image ref with NO tag beside it pins an artifact that cannot be placed on
+  # the version line at all — there is nothing to plan from, so it is installed
+  # as given. With a tag (what the unattended docker path now sends) the plan
+  # runs and the pin is carried to the LAST hop, where it is the release being
+  # installed; the intermediate majors resolve their own digest-pinned refs from
+  # their own manifests, so immutability holds for every hop.
+  if [ -n "$image_ref" ] && [ -z "$to" ]; then
+    upgrade_hop "" "$image_ref"
+    return
+  fi
+
+  # Resolve "latest" to a concrete tag BEFORE planning. A bare `agentos upgrade`
+  # on a node two majors behind is exactly the cross-major case, and it cannot
+  # be seen while the target is still the word "latest".
+  if [ -z "$to" ]; then
+    from_latest=1
+    if command -v jq >/dev/null 2>&1; then
+      to="$(fetch_manifest | jq -r '.version // empty' 2>/dev/null || true)"
+    fi
+    if [ -z "$to" ]; then
+      # No jq, or an unreadable manifest: the single-hop path resolves the
+      # channel itself (and reports the fetch failure loudly if that is what it
+      # was), so fall through to it rather than refuse the upgrade here.
+      warn "could not read the channel's latest version — applying it as a single hop, with no cross-major plan"
+      upgrade_hop "" ""
+      return
+    fi
+  fi
+  case "$to" in v*) ;; *) to="v$to" ;; esac
+
+  cur="$(installed_version)"
+  # A plan this node will not make is not the end of the road: `--no-chain` is
+  # the single jump this CLI has always taken, and an operator standing on the
+  # box may know something the planner does not (a deliberate downgrade to a
+  # restored database, a release history the channel no longer lists). Naming
+  # it here is what keeps the planner a guard rather than a new wall — the
+  # refusal itself is already on stderr, from whoever produced it.
+  if ! plan="$(plan_upgrade "$cur" "$to")"; then
+    die "not applying ${to}: see the reason above. To take it as a single jump anyway: agentos upgrade --to ${to} --no-chain"
+  fi
+  total="$(printf '%s\n' "$plan" | grep -c . || true)"
+
+  if [ "$total" -gt 1 ]; then
+    step "Cross-major upgrade: v${cur} → ${to} in ${total} hops"
+    info "v${cur}$(printf '%s' "$plan" | sed 's/^/ -> /' | tr -d '\n')"
+    info "each hop drains the node, health-gates the new release and rolls ITSELF back on failure;"
+    info "a hop that fails stops the chain there — the node stays on the last release that came up healthy"
+  fi
+
+  while IFS= read -r hop; do
+    [ -n "$hop" ] || continue
+    n=$((n + 1))
+    if [ "$total" -gt 1 ]; then
+      step "Hop ${n}/${total}: $hop"
+      # From the SECOND hop on, and only then: the wait at the top of this
+      # function covered the first restart, and the node that comes back from
+      # hop N can be mid-turn by the time hop N+1 is due — a single wait would
+      # have guarded only the first of three restarts. `--force` still skips all
+      # of them, which is what the unattended and the owner-forced callers pass.
+      [ "$n" -gt 1 ] && await_quiet_moment "upgrade to $hop"
+    fi
+    # The LAST hop of a chain that was resolved from "latest" is handed over as
+    # "latest" again, not as the tag we resolved it to. Two reasons, and the
+    # first is not hypothetical: the engine's latest path reads the channel's
+    # `latest/download/stable.json`, while a pinned tag reads that TAG's own
+    # asset — a different object, which some published releases do not have, so
+    # re-pinning would turn a working `agentos upgrade` into "no stable.json for
+    # vX.Y.Z". The second is that it keeps the bare command doing exactly what
+    # it always did when there is nothing to chain. Intermediate hops have no
+    # choice: only a tag can name them.
+    hop_arg="$hop"; hop_img=""
+    if [ "$n" = "$total" ]; then
+      # The pin belongs to the TARGET release and to no other: an intermediate
+      # major has to resolve its own image from its own manifest, or every hop
+      # would install the same bits and the chain would be three restarts of one
+      # release.
+      hop_img="$image_ref"
+      [ "$from_latest" = 1 ] && hop_arg=""
+    fi
+    # PLAINLY, never `if ! upgrade_hop`. Testing a command suppresses errexit
+    # for its whole dynamic extent — INCLUDING inside the engine — and the
+    # engine is built on errexit: `set -e` is what turns a failed `tar` or a
+    # failed `curl` into an abort before the symlink is flipped. Wrapping this
+    # call in a condition disarmed all of it, and a simulated extraction failure
+    # then reported "upgraded" (scripts/tests/agentos-cli.test.sh REGRESSION 2).
+    # So the chain stops the only way that keeps the engine intact: the engine
+    # `die`s, the process exits, and the EXIT trap below says where it stopped.
+    UPGRADE_CHAIN_N="$n"; UPGRADE_CHAIN_TOTAL="$total"; UPGRADE_CHAIN_HOP="$hop"
+    upgrade_hop "$hop_arg" "$hop_img"
+  done <<EOF
+$plan
+EOF
+  # Reached the target: nothing left for the trap to report.
+  UPGRADE_CHAIN_TOTAL=0
+}
+
+# Where an upgrade stopped, said once, from wherever it stopped.
+#
+# Every failure path in the engine is `die` — an `exit`, not a return — because
+# the engine is built on errexit and must abort before it flips a symlink. That
+# makes an EXIT trap the only place two facts can still be stated: which hop of
+# a chain did not complete, and (when the owner asked for this from chat) an
+# outcome in the outbox, so the reply is not silence. A handler rather than a
+# check after the call is also what covers the deaths that are not returns at
+# all: the unit's TimeoutStartSec, an OOM, an operator's Ctrl-C.
+UPGRADE_CHAIN_N=0; UPGRADE_CHAIN_TOTAL=0; UPGRADE_CHAIN_HOP=""
+MANUAL_UPGRADE_FROM=""; MANUAL_UPGRADE_TO=""
+upgrade_abort_report() {
+  local rc=$?
+  [ "$rc" = 0 ] && return 0
+  if [ "${UPGRADE_CHAIN_TOTAL:-0}" -gt 1 ]; then
+    warn "hop ${UPGRADE_CHAIN_N}/${UPGRADE_CHAIN_TOTAL} (${UPGRADE_CHAIN_HOP}) did not complete — the chain stops here. The node is on the last release that came up healthy; nothing after ${UPGRADE_CHAIN_HOP} was attempted."
+  fi
+  if [ -n "${MANUAL_UPGRADE_TO:-}" ]; then
+    write_upgrade_result rolled-back "$MANUAL_UPGRADE_FROM" "$MANUAL_UPGRADE_TO" \
+      "a hop did not complete; see journalctl -u ${AGENTOS_SERVICE}"
+  fi
+  return 0
+}
+
+# The chain, or a single hop, or a refusal — printed one `vX.Y.Z` per line.
+# Wraps the pure planner (scripts/lib/upgrade-chain.sh) with the three answers
+# that need THIS node's facts rather than version algebra:
+#
+#   • current version unknown  → one hop. The gates already treat an unknown
+#     current version as `unknown-current-version` and refuse to auto-apply; an
+#     operator who typed the target anyway gets what they asked for, once, with
+#     the reason said out loud. This is the ONLY unreadable-current answer, which
+#     is why `installed_version` returns empty rather than something unparseable:
+#     a current version that reaches the planner and does not parse there ends
+#     the command in a `die`, with no hop at all.
+#   • planner not shipped      → one hop WITHIN the major, refusal across it.
+#     Crossing blind is the one thing forward-only migrations cannot take back.
+#   • planner says no          → its own message, already on stderr.
+plan_upgrade() { # plan_upgrade <current-bare-version> <target-tag> → hops on stdout
+  local cur="${1-}" to="${2-}" cur_major to_major
+  if [ -z "$cur" ]; then
+    # >&2 is load-bearing: warn() prints to STDOUT, and this function's stdout
+    # IS the plan — an unredirected warning would be parsed as a hop.
+    warn "this node cannot state which version it is running (none of .env AGENTOS_VERSION, the current symlink, .version or the pinned image tag carries something shaped like a release) — applying ${to} directly, with no cross-major plan" >&2
+    printf '%s\n' "$to"
+    return 0
+  fi
+  # Already on the target. NOT an error, and emphatically not a no-op: the
+  # engine's `already at $tag` branch reconciles the unit set and runs the
+  # policy migration, which is the command an operator has after editing .env —
+  # and a node already on the newest release is exactly the node that would
+  # otherwise have no way to re-arm its poller short of re-running install.sh.
+  # The planner refuses this as "not an upgrade", which would take that branch
+  # away from every node that has it.
+  if [ "${to#v}" = "$cur" ]; then
+    printf '%s\n' "$to"
+    return 0
+  fi
+  cur_major="${cur%%.*}"; to_major="${to#v}"; to_major="${to_major%%.*}"
+  if [ "$AGENTOS_CHAIN_PLANNER" = 1 ]; then
+    if [ "$cur_major" = "$to_major" ]; then
+      # No boundary to cross, so there is no gateway to pick and nothing the
+      # channel's tag list could change — and every routine apply comes through
+      # here, including the unattended updater's. Fetching the releases API for
+      # a plan that is already known to be one hop would put a GitHub
+      # round-trip in front of every release this fleet ever installs.
+      upgrade_chain_plan "$cur" "$to" </dev/null
+    else
+      # Crossing: the list is what tells a withdrawn `M.0.0` from a real one,
+      # and it is worth a round-trip exactly here. Best-effort — channel_release_tags
+      # returns nothing rather than failing, and the planner falls back to the
+      # structural gateway.
+      upgrade_chain_plan "$cur" "$to" < <(channel_release_tags)
+    fi
+    return
+  fi
+  if [ "$cur_major" != "$to_major" ]; then
+    die "this node's tooling predates the upgrade planner (no $_CLI_HERE/lib/upgrade-chain.sh), so it cannot walk v${cur} → ${to} one major at a time — and a direct cross-major jump runs migrations the target never shipped. Upgrade WITHIN this major first (agentos upgrade --to v${cur_major}.<latest>), which reinstalls the tooling, then run this again."
+  fi
+  printf '%s\n' "$to"
+}
+
+# ─── the owner's FORCED upgrade, arriving from the core ──────────────────────
+#
+# `/upgrade <version>` in chat writes ONE file into the signal inbox
+# (<inbox>/upgrade-target, holding a bare `vX.Y.Z`); the paired .path unit fires
+# ${AGENTOS_SERVICE}-manual-upgrade.service; that unit runs THIS. The shape is
+# the poke path's, deliberately — same inbox, same "root re-decides for itself"
+# rule — with two differences that are the whole reason it is a second unit
+# rather than another trigger on the oneshot:
+#
+#   1. IT SURVIVES THE NODE IT IS UPGRADING. A chain restarts the node once per
+#      hop. Anything running inside the node's own cgroup — an agent session, a
+#      tool call, the core itself — is killed by the first hop and the chain
+#      dies half-applied. A root systemd unit is a separate cgroup with its own
+#      lifetime, so the hops keep coming after the core that asked for them is
+#      gone. This is exactly how the one successful cross-major walk on this
+#      fleet was actually performed (aos, 2026-09-16: a hand-written
+#      aos-manual-upgrade.service).
+#   2. IT HAS A CHAIN'S BUDGET. The autoupdate oneshot's TimeoutStartSec=2700
+#      is sized for ONE apply; three hops need three of those, and a oneshot
+#      SIGTERM'd mid-`systemctl stop` leaves the node down with nobody to start
+#      it. The manual unit carries its own, larger ceiling.
+#
+# WHAT THE CORE MAY AND MAY NOT SAY
+#   A poke is EMPTY on purpose: `agentos upgrade --image <ref>` runs as root, so
+#   a ref chosen by the (unprivileged, prompt-injectable) core would be a root
+#   escalation. This file is the ONE exception, and it stays inside that rule by
+#   being a VERSION, never an artifact:
+#     • it must match vX.Y.Z exactly — no image ref, no path, no flag, no
+#       whitespace, and at most 32 characters — the request is read with a
+#       65-byte ceiling, one byte past the longest thing that could be
+#       valid, so an oversized file is REJECTED rather than silently
+#       truncated into a prefix that happens to parse;
+#     • root resolves it against the SAME dist channel it always resolves, and
+#       the tarball's sha256 still has to match that channel's manifest;
+#     • it must be strictly NEWER than what this node runs — so the worst a
+#       compromised core can do is install an official release the unattended
+#       updater was already allowed to install, earlier than it would have.
+#   Downgrades are refused here rather than left to the engine: a downgrade is
+#   how you get a node whose database is ahead of its code, and the boot guard
+#   would then refuse to start it.
+#
+# The forced part is real: this path does NOT re-run the client gates. `breaking`
+# and the node's policy are what hold a cross-major release back from the
+# UNATTENDED path, and lifting them deliberately is the owner's decision, already
+# taken in chat (the command shows both versions and demands confirmation for a
+# major). What is NOT lifted is the physics — every hop still drains, still
+# health-gates, still rolls itself back.
+UPGRADE_REQUEST=upgrade-target
+
+# Temp + rename so the core never reads a half-written file; best-effort so a
+# missing outbox never fails an upgrade that otherwise worked. Mirrors
+# write_outbox/write_result in scripts/agentos-autoupdate.sh, and the shape is
+# UpgradeResult in apps/api/src/core/updates/signal-channel.ts — the core has
+# exactly one reader for both producers.
+write_upgrade_result() { # write_upgrade_result <outcome> <from> <to> <reason>
+  command -v jq >/dev/null 2>&1 || return 0
+  local json
+  json="$(jq -nc --arg id "$(date -u +%s)-$3" --arg o "$1" --arg f "$2" --arg t "$3" --arg r "$4" \
+    '{id: $id, outcome: $o,
+      from:   (if $f == "" then null else $f end),
+      to:     (if $t == "" then null else $t end),
+      reason: (if $r == "" then null else $r end)}' 2>/dev/null || true)"
+  [ -n "$json" ] || return 0
+  mkdir -p "$SIGNAL_OUTBOX" 2>/dev/null || true
+  printf '%s\n' "$json" > "$SIGNAL_OUTBOX/result.json.tmp" 2>/dev/null \
+    && mv -f "$SIGNAL_OUTBOX/result.json.tmp" "$SIGNAL_OUTBOX/result.json" 2>/dev/null || true
+  return 0
+}
+
+cmd_manual_upgrade() {
+  local mode; mode="$(detect_mode)"
+  [ "$mode" = none ] && die "no install found under $AGENTOS_HOME"
+  resolve_signal_paths "$mode"
+  local req="$SIGNAL_INBOX/$UPGRADE_REQUEST" raw cur
+  if [ ! -f "$req" ]; then
+    info "no upgrade request at $req — nothing to do"
+    return 0
+  fi
+  # Bounded read, then DELETE FIRST — before any validation can fail. The .path
+  # unit re-triggers for as long as the file exists, so a request that dies on
+  # its own malformed contents would otherwise become a start-limit-hit that
+  # leaves the .path unit itself failed (this is how the poke fast path died on
+  # two nodes; see cmd_autoupdate).
+  # 65 bytes, not 64: reading one MORE than the longest thing that can be valid
+  # is what turns an oversized file into a rejection instead of a silently
+  # truncated prefix that happens to parse.
+  raw="$(head -c 65 "$req" 2>/dev/null | tr -d '[:space:]' || true)"
+  rm -f "$req" 2>/dev/null || true
+
+  cur="$(installed_version)"
+  # Strict, and strict in the ONE shape the core is allowed to name. Everything
+  # else — an image ref, a flag, a path, a prerelease, a fourth component — is
+  # refused by PATTERN rather than sanitized: a value root will act on is not
+  # something to repair on the writer's behalf. Three checks, because one glob
+  # cannot do it: `v[0-9]*.[0-9]*.[0-9]*` also matches `v1.2.3.4` (a `*` eats
+  # dots) and `v1.2.3-rc.1`.
+  reject_request() { # reject_request <why>
+    write_upgrade_result failed-no-rollback "$cur" "" "malformed upgrade request"
+    die "refusing upgrade request '${raw}': $1"
+  }
+  [ "${#raw}" -le 32 ] || reject_request "longer than any release tag"
+  case "$raw" in
+    v[0-9]*.[0-9]*.[0-9]*) ;;
+    *) reject_request "not a vX.Y.Z release tag" ;;
   esac
+  case "${raw#v}" in
+    *[!0-9.]*) reject_request "not a vX.Y.Z release tag (only digits and dots after the v)" ;;
+    *.*.*.*)   reject_request "not a vX.Y.Z release tag (too many components)" ;;
+    *.*.*)     ;;
+    *)         reject_request "not a vX.Y.Z release tag (too few components)" ;;
+  esac
+
+  if [ -z "$cur" ]; then
+    write_upgrade_result failed-no-rollback "" "${raw#v}" "unknown current version"
+    die "refusing upgrade request ${raw}: this node cannot state which version it runs, so 'newer than current' cannot be checked. Upgrade by hand: agentos upgrade --to ${raw}"
+  fi
+  if [ "$AGENTOS_CHAIN_PLANNER" = 1 ] && [ "$(upgrade_chain_cmp "${raw#v}" "$cur" 2>/dev/null || echo -1)" != 1 ]; then
+    write_upgrade_result failed-no-rollback "$cur" "${raw#v}" "not an upgrade"
+    die "refusing upgrade request ${raw}: this node runs v${cur}, and this path never moves a node backwards (a database ahead of its code does not boot)."
+  fi
+
+  step "Forced upgrade requested by the owner: v${cur} → ${raw}"
+  # The outcome is reported from an EXIT trap, not from around the call. The
+  # engine ends a failed hop with `die` — an `exit` — so there is no `else`
+  # branch to write from, and wrapping the call in a condition to get one would
+  # disarm the errexit the engine is built on (see the chain loop). The two
+  # signal traps are there for the same reason one level up: this unit carries a
+  # multi-hour TimeoutStartSec, and systemd ends an expired oneshot with
+  # SIGTERM — which without a handler kills bash before any EXIT trap runs, and
+  # the owner would be left waiting on a report that can never come.
+  MANUAL_UPGRADE_FROM="$cur"; MANUAL_UPGRADE_TO="${raw#v}"
+  trap upgrade_abort_report EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  # --force, and only --force: the quiet-moment wait is skipped because the
+  # owner asked for this one directly and is watching the reply. Never
+  # --no-chain — the chain is the point.
+  cmd_upgrade --to "$raw" --force
+  MANUAL_UPGRADE_TO=""          # reached: the trap has nothing left to report
+  trap - EXIT TERM INT
+  write_upgrade_result ok "$cur" "${raw#v}" ""
 }
 
 # Unattended manifest-driven updater — the policy layer that decides WHETHER to
@@ -1868,13 +2342,23 @@ usage() {
   cat <<'EOF'
 agentos — operate an AgentOS Core node
   install [installer flags]   fresh install (delegates to install.sh)
-  upgrade [--to <tag>|--image <ref>] [--force]
+  upgrade [--to <tag>|--image <ref>] [--force] [--no-chain]
                               upgrade to the stable channel, a pinned tag, or an
                               explicit (digest-pinned) image ref. Waits for a
                               quiet moment first (the node drains agent turns on
-                              stop); --force restarts into a live turn anyway
+                              stop); --force restarts into a live turn anyway.
+                              A target on a newer MAJOR is applied as a chain —
+                              one health-gated hop per major boundary, because
+                              migrations are forward-only; --no-chain takes the
+                              single jump instead (operator's call, not a default)
   autoupdate [--check]        poll the update channel and apply per policy
                               (--check: report the verdict, change nothing)
+  manual-upgrade              apply the forced upgrade the core requested in
+                              <signals>/upgrade-target (what `/upgrade` in chat
+                              writes). Run by the manual-upgrade systemd unit,
+                              not by hand — it is the unit's own cgroup that
+                              lets a multi-hop chain outlive the node it
+                              restarts
   rollback                    undo the last upgrade (code + database)
   backup                      take a manual backup without upgrading
   plugin add|ls|rm|enable|disable|secret|update|slot ...  manage runtime plugins
@@ -1915,6 +2399,7 @@ case "${1:-}" in
   install)    shift; exec bash <(curl -fsSL "https://raw.githubusercontent.com/${DIST_REPO}/main/install.sh") "$@" ;;
   upgrade)    shift; cmd_upgrade "$@" ;;
   autoupdate) shift; cmd_autoupdate "$@" ;;
+  manual-upgrade) shift; cmd_manual_upgrade "$@" ;;
   rollback)   cmd_rollback ;;
   plugin)     shift; cmd_plugin "$@" ;;
   preset)     shift; cmd_preset "$@" ;;
