@@ -1633,6 +1633,45 @@ cmd_routines() {
   esac
 }
 
+# Shared-state surface — the counters two routines hold in common
+# (ClickUp 12418agezg7).
+#   agentos state ls | get <scope.key> | set <scope.key> <value>
+#                    | incr <scope.key> [--by N] | cas <scope.key> <value> --expect <old>
+#                    | history [<scope.key>]
+# `incr` and `cas` are ATOMIC: the node decides the winner in one conditional
+# UPDATE, which is the whole reason this is not a file in the context repo.
+# A routine `command:` step calls the same CLI, and the engine hands that step
+# the routine's declared write list in the environment — so a step can only
+# write what its file declares. From a shell here the caller is the owner and
+# may seed any key; every write is recorded in the state history either way.
+# Delegates to the compiled Node CLI (core/routines/state-cli.js), exactly like
+# `agentos routines`.
+#
+# Docker mode passes the AGENTOS_STATE_* variables through with `-e`: inside a
+# routine step they ARE the contract, and dropping them at the container edge
+# would silently promote a step to owner authority.
+cmd_state() {
+  case "$(detect_mode)" in
+    docker)
+      ( cd "$AGENTOS_HOME" && exec docker compose -f "$COMPOSE_FILE" exec -T \
+          -e AGENTOS_STATE_DB -e AGENTOS_STATE_WRITES -e AGENTOS_STATE_ACTOR \
+          -e AGENTOS_ROUTINE_RUN_ID -e AGENTOS_INSTALLATION_ID \
+          node node dist/core/routines/state-cli.js "$@" ) ;;
+    systemd)
+      local base="$AGENTOS_HOME/current" cli=""
+      for c in \
+        "$base/dist/core/routines/state-cli.js" \
+        "$base/apps/api/dist/core/routines/state-cli.js" \
+        "$base/node_modules/@agent-os/api/dist/core/routines/state-cli.js"; do
+        [ -f "$c" ] && { cli="$c"; break; }
+      done
+      [ -n "$cli" ] || die "state CLI not found under $base (is the node installed?)"
+      exec node "$cli" "$@" ;;
+    none)
+      die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
 # Export one .env value into this process ONLY when the caller has not already
 # set it. An explicit value in the environment therefore wins, so a second
 # contour can be addressed by exporting its key without editing any file.
@@ -1691,6 +1730,41 @@ cmd_ctl() {
         [ -f "$c" ] && { cli="$c"; break; }
       done
       [ -n "$cli" ] || die "ctl CLI not found under $base (is the node installed?)"
+      exec node "$cli" "$@" ;;
+    none)
+      die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
+# Durable sessions — `agentos sessions` (task U3, alias `agentos session`).
+#   agentos sessions create|ls|status|attach|steer|stop|resume|budget …
+# The job API for durable agent sessions: the SAME `/api/v1/sessions` contract an
+# HTTP caller speaks, so a script, an operator and the node's own MCP tools all
+# name one set of sessions with one set of receipts. Never the database — a
+# durable control command must reach the RUNNING node, because the node is what
+# holds the execution the command is about.
+#
+# Same three-path probe and the same credential lift as `ctl`: the key and the
+# endpoint live in the node's own .env, readable by the contour user alone, and
+# the CLI refuses to take a key from argv (/proc is world-readable).
+cmd_sessions() {
+  case "$(detect_mode)" in
+    docker)
+      # -T keeps stdin a pipe; `attach` streams until the operator detaches.
+      ( cd "$AGENTOS_HOME" && exec docker compose -f "$COMPOSE_FILE" exec -T node \
+          node dist/core/sessions/cli.js "$@" ) ;;
+    systemd)
+      ctl_env_default AGENTOS_NODE_KEY
+      ctl_env_default AGENTOS_PEER_ENDPOINT_FILE
+      ctl_env_default MCP_PORT
+      local base="$AGENTOS_HOME/current" cli=""
+      for c in \
+        "$base/dist/core/sessions/cli.js" \
+        "$base/apps/api/dist/core/sessions/cli.js" \
+        "$base/node_modules/@agent-os/api/dist/core/sessions/cli.js"; do
+        [ -f "$c" ] && { cli="$c"; break; }
+      done
+      [ -n "$cli" ] || die "sessions CLI not found under $base (is the node installed?)"
       exec node "$cli" "$@" ;;
     none)
       die "no install found under $AGENTOS_HOME" ;;
@@ -1806,6 +1880,11 @@ agentos — operate an AgentOS Core node
   plugin add|ls|rm|enable|disable|secret|update|slot ...  manage runtime plugins
   plugin new|validate|list ...  author, validate and scaffold plugin dirs
   preset ls | show <id> | add <id> [key=value ...]  browse + install routine presets
+  state ls | get <scope.key> | set <scope.key> <v> | incr <scope.key> [--by N]
+        | cas <scope.key> <v> --expect <old> | history [<scope.key>]
+                              shared state between routines and runs; incr and
+                              cas are atomic. Inside a routine step the engine
+                              bounds writes to that routine's state.writes.
   routines ls | activate <routine> --from <ts> [--until <ts>] [--runs n]
            | reset-budget <routine>   arm/re-arm a routine's activation window
                               and run budget at runtime (no Git edit)
@@ -1819,6 +1898,10 @@ agentos — operate an AgentOS Core node
                               `agentos status` is the SERVICE view (is the unit
                               up), `agentos ctl status` is the NODE view
                               (version, uptime, harness, live runs).
+  sessions <verb> …           durable agent sessions over this node's job API
+                              (create|ls|status|attach|steer|stop|resume|budget;
+                              `session` is the singular alias). Receipts, event
+                              cursors and exit codes: `agentos sessions --help`
   mcp [--profile read|write] [--label <name>] [--print-surface]
                               serve THIS node to an external agent as an MCP
                               server over stdio (mount it elsewhere as
@@ -1836,8 +1919,10 @@ case "${1:-}" in
   plugin)     shift; cmd_plugin "$@" ;;
   preset)     shift; cmd_preset "$@" ;;
   routines)   shift; cmd_routines "$@" ;;
+  state)      shift; cmd_state "$@" ;;
   import-history) shift; cmd_import_history "$@" ;;
   ctl)        shift; cmd_ctl "$@" ;;
+  sessions|session) shift; cmd_sessions "$@" ;;
   mcp)        shift; cmd_mcp "$@" ;;
   status)   cmd_status ;;
   logs)     shift || true; cmd_logs "${1:-200}" ;;
