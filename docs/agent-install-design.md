@@ -45,7 +45,7 @@ becomes a support ticket a week later.
 
 | Phase | The agent | Gate |
 |---|---|---|
-| 0 Preflight | arch, distro, privileges, existing install, disk/RAM; dry-runs the intended command line through the installer's own no-op probes (`AGENTOS_PRINT_MODE`, `AGENTOS_PRINT_IDENTITY`, `AGENTOS_PRINT_VERSION_DECISION`) | profile decided; `install`, not `keep` |
+| 0 Preflight | arch, distro, privileges, existing install, disk/RAM; dry-runs the intended command line through the installer's own no-op probes (`AGENTOS_PRINT_MODE`, `AGENTOS_PRINT_IDENTITY`) and reads `<install-dir>/current` off the box | profile decided; no node already installed |
 | 1 Interview | group A: what the install cannot proceed without · group B: where the brain lives · group C: who the owner is | every group-A answer present |
 | 2 Secrets file | one 0600 env file: `GH_TOKEN`, optional `CLAUDE_CODE_OAUTH_TOKEN`, `AGENTOS_REPO_DIR` | file exists, mode 0600 |
 | 3 Brain | repo from the template, `memory/owner.md` and `CLAUDE.md` filled from group C, pushed | commit on the remote |
@@ -161,9 +161,13 @@ Everything else is a retry-once-then-report. The installer has no rollback and
 no cleanup trap on purpose: whatever completed stays completed, `.env` and data
 survive, and re-running is the supported repair — so the prompt's default
 recovery is *run the installer again*, not *repair the box by hand*. The one
-documented exception is a checksum failure, which leaves an empty version
-directory that a naive re-run would adopt; the prompt says exactly which two
-paths to delete first.
+documented exception is an **extraction** failure: the version directory is
+created after the checksum passes and before the tarball is unpacked, so a
+`tar` that dies leaves `<install-dir>/versions/<tag>` present but empty, and the
+installer skips the whole download-and-unpack block when that directory exists —
+a naive re-run then points `current` at nothing. The prompt says which two paths
+to delete first, and says plainly that a checksum failure is *not* that case:
+there the directory was never created and the box is untouched.
 
 ### D6. What onboarding must extract
 
@@ -188,7 +192,7 @@ What the agent asks instead, and where each answer lands:
 
 All of it is repository state, not node settings, and that is the point: the
 repository is the brain, it travels, and it survives the node being rebuilt. The
-node's settings surface (`agentos ctl settings`) carries five operational keys
+node's settings surface (`agentos ctl settings`) carries six operational keys
 and is the wrong home for any of this.
 
 ### D7. How this sits next to the bot-led wizard
@@ -235,3 +239,18 @@ Stated rather than hidden; none of them blocks the channel.
   `install.sh`; it does not prove that an agent following it reaches a healthy
   node. The first real run against a clean box is the acceptance, and it needs a
   human.
+- **The gate reports drift, it cannot prevent it.** `install.sh` and `agentos`
+  arrive in this repository as release artifacts, copied here by the node repo's
+  release job. A flag renamed upstream therefore lands on `main` here at release
+  time, and `check-agent-prompt.py` reddens *this* repository afterwards rather
+  than blocking the rename. That is still the right place for it — this is where
+  the two files sit side by side — but the guarantee is "you will know within one
+  release", not "it cannot happen".
+- **The gate checks flags, not environment variables.** Every double-dashed
+  option in the prompt is matched against the installer's parser; a claim about
+  `AGENTOS_PRINT_*`, `AGENTOS_TEST_*` or `AGENTOS_REPO_DIR` is not checked at
+  all. The one factual error found in review of this very PR lived exactly
+  there: the prompt used `AGENTOS_PRINT_VERSION_DECISION` — a pure function of
+  two `AGENTOS_TEST_*` variables — as if it inspected the box, so its
+  "is a node already installed?" guard always answered "no". Extending the gate
+  to the environment-variable surface is the obvious next increment.

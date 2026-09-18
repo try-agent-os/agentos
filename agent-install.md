@@ -115,20 +115,54 @@ Read it like this:
 - **Less than ~1 GB RAM or a nearly full disk** → say it now. It will fail later
   and less clearly.
 
-Then dry-run your intended command line. These three probes print a decision and
-exit without touching the machine:
+Then dry-run your intended command line. These two probes read your flags, print
+a decision and exit without touching the machine:
 
 ```bash
-AGENTOS_PRINT_MODE=1 bash /tmp/agentos-install.sh <your flags>              # docker | systemd
-AGENTOS_PRINT_IDENTITY=1 bash /tmp/agentos-install.sh <your flags>          # user|dir|unit|port
-AGENTOS_PRINT_VERSION_DECISION=1 bash /tmp/agentos-install.sh <your flags>  # install | keep | upgrade
+AGENTOS_PRINT_MODE=1 bash /tmp/agentos-install.sh <your flags>      # docker | systemd
+AGENTOS_PRINT_IDENTITY=1 bash /tmp/agentos-install.sh <your flags>  # user|dir|unit|port
 ```
 
-If `AGENTOS_PRINT_MODE` says `docker` when you expected `systemd`, you passed a
-container-only flag (`--tunnel-token`, `--quick`, `--image`, or a `--channel`
-other than `stable`) — they switch profiles silently. If
-`AGENTOS_PRINT_VERSION_DECISION` says anything but `install`, there is already a
-node here. Stop and go back to rule 5.
+Drop `--secrets` from the flags you probe with. Argument validation runs before
+these probes print anything, and a `--secrets` file that does not exist yet
+(you write it in Phase 2) ends the probe with `✗ --secrets: no such file`. The
+flags that decide profile and identity are the other ones anyway.
+
+If `AGENTOS_PRINT_MODE` says `docker` when you expected `systemd`, either you
+passed a container-only flag (`--tunnel-token`, `--quick`, `--image`, or a
+`--channel` other than `stable`) — they switch profiles silently — or this box
+already carries a Docker install, which pins the profile on its own and says so
+(`existing Docker install in <install-dir>`). `AGENTOS_PRINT_IDENTITY` gives you
+the install directory the rest of this file calls `<install-dir>`; take it from
+here rather than assuming `/opt/agentos`.
+
+**Whether a node is already installed is a question about the box, not about
+your flags.** Ask the box, using the directory the identity probe just printed:
+
+```bash
+sudo readlink <install-dir>/current   # prints the installed version tag, or nothing
+```
+
+Anything printed means there is already a node here: rule 5 applies, you are
+refreshing and not creating, and the version stays where it is.
+
+There is a third probe, `AGENTOS_PRINT_VERSION_DECISION`, and it is easy to
+misread. It evaluates the keep-or-move rule as a pure function of
+(channel tag, installed tag, `--upgrade`) — fed by `AGENTOS_TEST_CHANNEL_TAG`
+and `AGENTOS_TEST_INSTALLED_TAG`, not by looking at this machine. Run it with
+neither set and it prints `install` on a box that already runs a node. Use it
+only to confirm what the rule does with tags you have already read yourself:
+
+```bash
+AGENTOS_TEST_INSTALLED_TAG="$(sudo readlink <install-dir>/current | xargs -r basename)" \
+AGENTOS_TEST_CHANNEL_TAG="<the tag the channel offers>" \
+AGENTOS_PRINT_VERSION_DECISION=1 bash /tmp/agentos-install.sh <your flags>
+# install <tag> | keep <installed> | upgrade <installed> <tag>
+```
+
+The authoritative answer on a real run is the installer's own banner in Phase 4
+(`installed <old>; channel has <new> — keeping <old>`), which it prints from the
+same function after resolving both tags for itself.
 
 ## Phase 1 — Ask the owner
 
@@ -236,6 +270,26 @@ Fill it in from Phase 1C, in the two files the template keeps for exactly this:
   answers into it: name, preferred name, timezone, role, how they want updates
   delivered, what they are working on now, the people who matter. Short and
   true beats long and padded.
+
+  **Fill the YAML frontmatter, not only the prose below it.** The template opens
+  with a fence of empty strings, and the node reads exactly three keys out of
+  it — `name`, `preferred_name`, `timezone` — to decide whether this owner has
+  been onboarded. Prose in the body, however good, does not count:
+
+  ```
+  ---
+  name: "Vasily Krylov"
+  role: "founder"
+  timezone: "Europe/Amsterdam"
+  preferred_name: "Vasily"
+  ---
+  ```
+
+  Keep the fence as the very first thing in the file (a stray blank line above
+  it and the file parses as having no frontmatter at all), and leave no required
+  value empty or whitespace. Everything else you learned in Phase 1C goes in the
+  body sections, where it is for the agent to read rather than for a predicate
+  to check.
 - **`CLAUDE.md`** — the charter. Set the working language, name the two or three
   jobs from Phase 1C, and write the standing consent as a rule the agent can
   actually apply ("act on reversible things and report; ask before anything
@@ -246,8 +300,8 @@ file in this repository.
 
 That filled `memory/owner.md` is load-bearing beyond being useful: the node's
 own chat onboarding treats a filled owner profile as proof that onboarding
-already happened and stands down instead of re-asking. Leave the template's
-placeholders in place and the owner gets greeted by a wizard for work you
+already happened and stands down instead of re-asking. Leave those three
+frontmatter values empty and the owner gets greeted by a wizard for work you
 already did.
 
 ## Phase 4 — Install
@@ -272,7 +326,8 @@ when you do — it is a systemd-mode flag and the container profile only warns.
 
 It takes a few minutes: apt packages, the release tarball and its checksum, a
 vendored Node runtime, the Claude Code CLI, the unit, then a health gate that
-polls `http://127.0.0.1:<port>/healthz` for up to 90 seconds.
+polls `http://127.0.0.1:<port>/healthz` — 45 attempts two seconds apart, so up
+to roughly two minutes before it gives up.
 
 **Assert the finish, do not eyeball it.** Four things must hold, and the first
 two are gone if you do not capture them: the installer's **exit status is 0**,
@@ -311,8 +366,9 @@ agentos ctl status --json    # version, uptime, harness, live runs
 ```
 
 If they have no credential at all and no way to make one right now, say plainly
-what that means: the node runs, routines tick, and every agent reply fails with
-"Not logged in" until `/login` happens.
+what that means: the node runs, routines tick, and every agent reply comes back
+as the Claude CLI's `Not logged in` banner with the node's own hint to run
+`/login` — until `/login` happens.
 
 Then verify the brain actually got adopted — it is the step with the quietest
 failure:
@@ -389,8 +445,9 @@ command's own status and message. Read the message — it usually names the fix.
 | `run as root, or install sudo.` / `sudo failed` | No privileges. Nothing was touched. | Get root, or say you cannot. |
 | `the bare-metal node needs x86_64…` / `needs an apt-based distro…` | Wrong host for this profile. Nothing was touched. | Re-run with `--docker`, and tell the owner what that changes. |
 | `cannot resolve the stable channel`, a curl failure on the tarball or the Node runtime | Network or GitHub. Packages may be installed; nothing else is. | Retry once. Still failing: report it as an outage, do not hand-download anything. |
-| `tarball checksum mismatch` | **Stop.** A release tarball that does not match its SHA256 is not a thing to work around. | Delete `<install-dir>/versions/<tag>` and the tarball left in `/tmp` before any retry — the version directory was already created, and a naive re-run skips the download and points `current` at an empty tree. Then retry once. If it repeats, report it and stop; never disable the check. |
-| `node did not become healthy` (the last 50 journal lines were printed above it) | The unit is installed and enabled; the node did not answer `/healthz` in ~90 s. | Read that dump first. Then `journalctl -u agentos -n 200 --no-pager` and `tail -200 /opt/agentos/logs/node.log` — note that `/usr/local/bin/agentos` is not created until after the health gate, so the CLI is not there yet. A wrong value in `.env` and a port already taken are the common causes. Fix the cause and re-run the installer; it is cheap the second time. |
+| `tarball checksum mismatch` | **Stop.** A release tarball that does not match its SHA256 is not a thing to work around. | Nothing was unpacked: the version directory is created only after the check passes, so the box is untouched apart from a partial download in `/tmp` that the next attempt overwrites. Retry once in case the download was truncated. If it repeats, report it and stop; never disable the check. |
+| A `tar`/`unzstd` failure right after the checksum passed | The download was good, the extraction was not. **This one does leave a trap**: `<install-dir>/versions/<tag>` now exists but is empty or partial, and the installer skips the whole download-and-unpack block when that directory is present — so a naive re-run points `current` at an empty tree and the node never starts. | Delete `<install-dir>/versions/<tag>` (and the tarball in `/tmp`) before retrying. Then re-run the installer. |
+| `node did not become healthy` (the last 50 journal lines were printed above it) | The unit is installed and enabled; the node did not answer `/healthz` in 45 attempts (~1.5-2 min). | Read that dump first. Then `journalctl -u agentos -n 200 --no-pager` and `tail -200 /opt/agentos/logs/node.log` — note that `/usr/local/bin/agentos` is not created until after the health gate, so the CLI is not there yet (and on a named instance it is `/usr/local/bin/agentos-<user>`, a wrapper, not a symlink). A wrong value in `.env` and a port already taken are the common causes. Fix the cause and re-run the installer; it is cheap the second time. |
 | `docker install failed`, `docker daemon is not reachable` | Docker, not AgentOS. | Follow the message, or drop `--docker` if the box can take the bare-metal profile. |
 | `install did not finish cleanly… your .env and data are kept` (container profile) | Same class as the health timeout. | Read the container's last log lines, fix, re-run. |
 | `! git clone <name> failed`, `! gh auth setup-git failed` | **Warnings, not failures.** The install succeeded; the brain did not arrive. | Check the token scope (`repo`, `read:org`) and the URL, then re-run the installer — `--repo` is re-run safe and fetches when the checkout is already there. |

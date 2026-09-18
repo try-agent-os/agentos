@@ -89,9 +89,21 @@ def installer_flags() -> set[str]:
 
 
 def fetch_urls(text: str) -> set[str]:
-    """URLs on a line that downloads something. A link in prose is not a fetch."""
-    found: set[str] = set()
+    """URLs on a line that downloads something. A link in prose is not a fetch.
+
+    Shell continuations are folded first. The prompt's own install command is
+    already `curl -fsSL \\` + the URL on the next line, so a scan that looked at
+    raw lines would miss exactly the style the next edit is most likely to use:
+    the word `curl` and the URL it fetches routinely live on different lines.
+    """
+    folded: list[str] = []
     for line in text.splitlines():
+        if folded and folded[-1].endswith("\\"):
+            folded[-1] = folded[-1][:-1] + " " + line.strip()
+        else:
+            folded.append(line)
+    found: set[str] = set()
+    for line in folded:
         if "curl" not in line and "wget" not in line:
             continue
         found.update(URL_RE.findall(line))
