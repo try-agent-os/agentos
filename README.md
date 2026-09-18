@@ -50,6 +50,22 @@ running`, the bot is already polling Telegram.
 Then DM your bot `/login` (admin-only, private chat) to connect Claude — no SSH
 needed for that step.
 
+### Already have a coding agent? Let it do the whole thing
+
+If you use Claude Code, Codex CLI or any agent with a terminal on that box, hand
+it [`agent-install.md`](agent-install.md) — paste the file, or give it the raw
+URL:
+
+```
+https://raw.githubusercontent.com/try-agent-os/agentos/main/agent-install.md
+```
+
+It is a prepared prompt: the agent runs the same `install.sh` as above, asks you
+the handful of things only you know — who you are, your timezone, what you want
+it doing first — and writes the answers into your agent's repo, so the node
+knows you from its first message instead of interviewing you afterwards. The
+design behind it is in [`docs/agent-install-design.md`](docs/agent-install-design.md).
+
 ### No box yet? One click to create one
 
 [![Deploy to DigitalOcean](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/droplets/new?image=ubuntu-24-04-x64&size=s-2vcpu-4gb&region=fra1&refcode=6f9a0892dd0a)
