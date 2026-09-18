@@ -18,8 +18,9 @@ expects them.
 
 - **A Telegram-native agent** — message it like a person; it answers, does the
   work, and reports back in the chat.
-- **Background work** — hand off something long-running; it keeps going while
-  you carry on in the chat, and comes back with the result when it is done.
+- **Background work** — hand off something long-running: it keeps going while
+  you carry on in the chat, outlives a node restart, and reports back when it
+  is done.
 - **Routines** — scheduled jobs on cron: morning digests, monitors, recurring
   chores.
 - **Mini App** — routines, activity and sessions from your phone, right inside
