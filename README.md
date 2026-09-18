@@ -1,10 +1,10 @@
 # AgentOS
 
-Your own agent, 24/7 — a Telegram bot + task tracker + scheduled routines +
-Mini App, running as a single process over a git repo.
+Your own agent, 24/7 — a Telegram bot + scheduled routines + Mini App, running
+as a single process over a git repo.
 
 **Own your files, own your repo.** Everything your agent knows and does lives
-as plain files in a git repository on your machine: tasks, routines, notes,
+as plain files in a git repository on your machine: routines, skills, notes,
 working context. Read it with any editor, version it with git, back it up like
 any repo, move it to another box whenever you want. No vendor database, nothing
 to export — wipe the node and your data is still yours.
@@ -18,12 +18,12 @@ expects them.
 
 - **A Telegram-native agent** — message it like a person; it answers, does the
   work, and reports back in the chat.
-- **Tasks** — hand off long-running work; it runs in the background and comes
-  back with results.
+- **Background work** — hand off something long-running; it keeps going while
+  you carry on in the chat, and comes back with the result when it is done.
 - **Routines** — scheduled jobs on cron: morning digests, monitors, recurring
   chores.
-- **Mini App** — manage tasks and routines from your phone, right inside
-  Telegram.
+- **Mini App** — routines, activity and sessions from your phone, right inside
+  Telegram: flip a routine on, run it now, or watch a run as it goes.
 - **One process on your box** — a single systemd service (or a single Docker
   container, if you prefer). Your server, your keys, your data.
 
