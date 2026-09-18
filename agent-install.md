@@ -274,14 +274,19 @@ It takes a few minutes: apt packages, the release tarball and its checksum, a
 vendored Node runtime, the Claude Code CLI, the unit, then a health gate that
 polls `http://127.0.0.1:<port>/healthz` for up to 90 seconds.
 
-**Assert the finish, do not eyeball it.** All four:
+**Assert the finish, do not eyeball it.** Four things must hold, and the first
+two are gone if you do not capture them: the installer's **exit status is 0**,
+and its stdout contained the literal `AgentOS Node is running.` — ANSI colour
+wraps that line, so match the substring, not the whole line. Then, independently
+of what it printed:
 
 ```bash
-echo "exit=$?"                                   # 0
-# stdout contained the literal: AgentOS Node is running.
 systemctl is-active agentos                      # active
-curl -fsS http://127.0.0.1:8787/healthz          # 200
+curl -fsS http://127.0.0.1:8787/healthz          # exits 0
 ```
+
+Substitute the unit name and port if you passed `--user` or `--port`: a named
+instance is `agentos-<user>`.
 
 Also read what the banner says about your own flags. If it printed
 `installed <old>; channel has <new> — keeping <old>`, you were refreshing an
@@ -296,7 +301,10 @@ Two steps only the human can do. Do not fake progress here; ask, then verify.
    got an answer. A silent bot after a successful install is almost always a
    wrong token or another process polling the same bot.
 2. **Connect the thinking** — unless you placed a token in Phase 2. In the DM:
-   `/login` (admin only, private chat). Check it landed:
+   `/login` (admin only, private chat). The proof it took is a real answer to a
+   real message, not the absence of an error: ask them to send the bot something
+   that needs thinking and confirm what came back. The node's own view of itself
+   is one command away, and costs no model tokens:
 
 ```bash
 agentos ctl status --json    # version, uptime, harness, live runs
