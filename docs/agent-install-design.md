@@ -199,9 +199,15 @@ the node's own gates take care of it:
 
 - a filled `memory/owner.md` in the active context makes the wizard reply "done"
   and stop, instead of opening (`apps/api/src/core/onboarding/wizard.ts`,
-  `isProfileFilled`);
-- a non-local context binding makes it skip permanently
-  (`detectEstablishedNode`).
+  `isProfileFilled`). **This is the gate this channel relies on**, and Phase 3
+  of the prompt exists partly to arm it;
+- a context binding that is not the node's own local one makes the wizard skip
+  permanently (`detectEstablishedNode`, `core/onboarding/local-context.ts`).
+  That second gate does **not** fire on a fresh install through this channel:
+  `AGENTOS_REPO_DIR` adoption registers the brain under the local-context owner
+  (`core/db/bootstrap-contexts.ts`), so the node counts as established only once
+  the owner connects GitHub. Which is why the first gate has to be armed and is
+  not a belt-and-braces nicety.
 
 So a node installed through this channel greets its owner as an already-known
 person, wizard or no wizard. When the wizard is deleted, nothing here changes.
