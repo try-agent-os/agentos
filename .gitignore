@@ -1,0 +1,14 @@
+# Byte-compiled Python. .github/check-english.py and its self-test are run
+# straight from the checkout, and CPython writes a __pycache__ next to the
+# source the moment anything imports or compiles it. One of those .pyc files
+# was committed by a broad `git add` on 2026-09-20: a binary blob, pinned to
+# one interpreter version, stale the moment the script next changes, and
+# re-staged on every local run. Nothing in this repository is built, so
+# nothing byte-compiled belongs in it.
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor and OS droppings that a broad `git add` sweeps in the same way.
+.DS_Store
+*.swp

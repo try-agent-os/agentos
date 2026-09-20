@@ -1,0 +1,21 @@
+# Paths whose ADDED lines may contain Cyrillic, one glob per line.
+#
+# This file is the narrow, path-scoped bypass of .github/check-english.py. It
+# exists for the day a document genuinely has to QUOTE Cyrillic -- a
+# localization note, a verbatim bug report about an encoding -- and for nothing
+# else. It is deliberately empty: by default this repository has no bypass.
+#
+# What it cannot do, on purpose:
+#   * it never waives a branch name, a commit subject or a commit body. Those
+#     are metadata; no quote has to live there.
+#   * an entry broad enough to cover the whole repository is rejected by the
+#     gate. An allowlist matching everything is the gate switched off, and
+#     switching it off should cost a conversation, not a wildcard.
+#
+# The other bypass is per-pull-request and leaves a reason behind: put a line
+#   allow-cyrillic: <why this change has to quote Cyrillic>
+# in the PR body. Prefer that one -- it expires with the pull request, while a
+# line added here stays until somebody deletes it.
+#
+# Add an entry as `<path glob>  # <why>`, for example:
+#   docs/localization-notes.md  # quotes the Russian strings it is about
