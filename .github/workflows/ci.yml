@@ -33,3 +33,11 @@ jobs:
           yaml.safe_load(data)
           print('cloud-init.yaml ok')
           PY
+
+      - name: Agent-install prompt cannot drift from install.sh
+        # agent-install.md is the second install channel: a prompt that makes a
+        # coding agent CALL install.sh. It is only safe while it stays a shell
+        # around the installer — one flag it invents, one URL it fetches on its
+        # own, one pinned version, and it becomes a second source of truth about
+        # how AgentOS is installed. The script checks exactly that.
+        run: python3 .github/check-agent-prompt.py
