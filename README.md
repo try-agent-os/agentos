@@ -1,34 +1,14 @@
 # AgentOS
 
 Your own agent, 24/7 — a Telegram bot + scheduled routines + Mini App, running
-as a single process over a git repo.
-
-**Own your files, own your repo.** Everything your agent knows and does lives
-as plain files in a git repository on your machine: routines, skills, notes,
-working context. Read it with any editor, version it with git, back it up like
-any repo, move it to another box whenever you want. No vendor database, nothing
-to export — wipe the node and your data is still yours.
-
-Start the agent's repo from the default template:
-**[try-agent-os/claude-code-template](https://github.com/try-agent-os/claude-code-template)**
-— charter, skills, memory, and manifests, pre-structured the way the node
-expects them.
-
-## What you get
-
-- **A Telegram-native agent** — message it like a person; it answers, does the
-  work, and reports back in the chat.
-- **Background work** — hand off something long-running: it keeps going while
-  you carry on in the chat, outlives a node restart, and reports back when it
-  is done.
-- **Routines** — scheduled jobs on cron: morning digests, monitors, recurring
-  chores.
-- **Mini App** — routines, activity and sessions from your phone, right inside
-  Telegram: flip a routine on, run it now, or watch a run as it goes.
-- **One process on your box** — a single systemd service (or a single Docker
-  container, if you prefer). Your server, your keys, your data.
+as a single process on your own box, over a git repo you own.
 
 ## Install
+
+**Pick your way in:** you have a Linux box — the command below, about a minute.
+You have a coding agent on it — [hand it the prompt](#already-have-a-coding-agent-let-it-do-the-whole-thing)
+and it does the whole thing for you. No box yet —
+[one click to create one](#no-box-yet-one-click-to-create-one).
 
 Two things to have ready: a bot token from
 [@BotFather](https://t.me/BotFather) (`/newbot`), and your numeric Telegram id
@@ -136,6 +116,33 @@ curl -fsSL https://raw.githubusercontent.com/try-agent-os/agentos/main/cloud-ini
 doctl compute droplet create agentos --image ubuntu-24-04-x64 --size s-2vcpu-4gb \
   --region fra1 --ssh-keys <your-ssh-key-id> --user-data-file cloud-init.yaml
 ```
+
+## What you get
+
+- **A Telegram-native agent** — message it like a person; it answers, does the
+  work, and reports back in the chat.
+- **Background work** — hand off something long-running: it keeps going while
+  you carry on in the chat, outlives a node restart, and reports back when it
+  is done.
+- **Routines** — scheduled jobs on cron: morning digests, monitors, recurring
+  chores.
+- **Mini App** — routines, activity and sessions from your phone, right inside
+  Telegram: flip a routine on, run it now, or watch a run as it goes.
+- **One process on your box** — a single systemd service (or a single Docker
+  container, if you prefer). Your server, your keys, your data.
+
+## Own your files, own your repo
+
+Everything your agent knows and does lives as plain files in a git repository
+on your machine: routines, skills, notes, working context. Read it with any
+editor, version it with git, back it up like any repo, move it to another box
+whenever you want. No vendor database, nothing to export — wipe the node and
+your data is still yours.
+
+Start the agent's repo from the default template:
+**[try-agent-os/claude-code-template](https://github.com/try-agent-os/claude-code-template)**
+— charter, skills, memory, and manifests, pre-structured the way the node
+expects them.
 
 ## Manage
 
