@@ -41,3 +41,33 @@ jobs:
         # own, one pinned version, and it becomes a second source of truth about
         # how AgentOS is installed. The script checks exactly that.
         run: python3 .github/check-agent-prompt.py
+
+  english:
+    # try-agent-os/agentos is public. Branch names, commit subjects and bodies,
+    # PR title and body, code, comments and docs are read by people who do not
+    # speak Russian, and they are read forever. That rule used to live only in
+    # the prompt of whoever wrote the change, and on 2026-09-20 it cost a
+    # rewrite of public main's history plus three PR bodies. This job is the
+    # mechanical version: not "should be English", but "cannot be merged
+    # otherwise". Separate from `lint` on purpose -- it guards the change, not
+    # the tree, and its findings should not be mixed with a shell syntax error.
+    name: English only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The gate reads every commit in the pull request and the diff
+          # against the base, so it needs the history behind both SHAs. With
+          # the default shallow fetch it would fail loudly rather than scan a
+          # truncated range -- which is correct, and useless as a gate.
+          fetch-depth: 0
+
+      - name: Self-test of the gate
+        # A gate nobody tests is a green check that means nothing. This run
+        # proves every surface still fails on Cyrillic before the real scan
+        # is believed: commit subject and body, branch, PR title and body,
+        # added lines, added paths, pushes to main, and both bypasses.
+        run: python3 .github/test-check-english.py
+
+      - name: No Cyrillic in branch, commits, PR text or added lines
+        run: python3 .github/check-english.py
