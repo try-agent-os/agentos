@@ -226,8 +226,30 @@ def scan_commits(findings: Findings, shas: list[str], label: str) -> None:
     findings.note(f"{label}: {len(shas)} commit(s) checked (subject and body)")
 
 
+HUNK_RE = re.compile(
+    r"^@@ -\d+(?:,(?P<removed>\d+))? \+(?P<start>\d+)(?:,(?P<added>\d+))? @@"
+)
+
+
 def added_lines(base: str, head: str) -> list[tuple[str, int, str]]:
-    """(path, line number in the new file, text) for every added line."""
+    """(path, line number in the new file, text) for every added line.
+
+    Parsed as a state machine over the unified diff rather than by testing the
+    first characters of each line, because those characters lie. An added line
+    whose own content begins with `++ ` is printed as `+++ <content>`, which no
+    prefix test can tell apart from the `+++ b/<path>` file header -- and
+    reading it as a header both dropped the line from the scan and took its
+    text as the current path, so a following Cyrillic line could be attributed
+    to an allowlisted file and walk through with it. Exactly the silent pass
+    this gate exists to make impossible.
+
+    What is reliable is structure: header lines only exist OUTSIDE a hunk body,
+    and the hunk header states how many removed and added lines its body holds
+    (with -U0 there are no context lines). Counting those down is what
+    separates content from metadata. A body that does not match its own header
+    means we are not reading the diff we think we are reading, and an input the
+    gate cannot read is a failure, never a pass.
+    """
     out = git(
         "diff",
         "--no-color",
@@ -237,23 +259,52 @@ def added_lines(base: str, head: str) -> list[tuple[str, int, str]]:
         base,
         head,
     )
-    hunk_re = re.compile(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@")
     results: list[tuple[str, int, str]] = []
     path: str | None = None
     lineno = 0
+    pending_removed = 0
+    pending_added = 0
+    saw_old_header = False
     for line in out.splitlines():
+        if pending_removed or pending_added:
+            # Inside a hunk body. Every line here is file content; the budget
+            # from the @@ header says which kind, the text never does.
+            if line.startswith("\\"):
+                # "\ No newline at end of file" annotates the line above.
+                continue
+            if line.startswith("+") and pending_added:
+                results.append((path or "<unknown>", lineno, line[1:]))
+                lineno += 1
+                pending_added -= 1
+                continue
+            if line.startswith("-") and pending_removed:
+                pending_removed -= 1
+                continue
+            raise GateError(
+                f"unreadable diff in {path or '<unknown file>'}: hunk body line "
+                f"{line[:80]!r} does not fit its @@ header. Refusing to guess which "
+                f"lines were added."
+            )
         if line.startswith("diff --git "):
-            path, lineno = None, 0
-        elif line.startswith("+++ "):
+            path, lineno, saw_old_header = None, 0, False
+        elif line.startswith("--- "):
+            saw_old_header = True
+        elif line.startswith("+++ ") and saw_old_header:
             target = line[4:].strip()
             path = None if target == "/dev/null" else re.sub(r"^b/", "", target)
-        elif line.startswith("@@"):
-            match = hunk_re.match(line)
-            if match:
-                lineno = int(match.group(1))
-        elif line.startswith("+") and not line.startswith("+++"):
-            results.append((path or "<unknown>", lineno, line[1:]))
-            lineno += 1
+            saw_old_header = False
+        elif line.startswith("@@ "):
+            match = HUNK_RE.match(line)
+            if not match:
+                raise GateError(f"unreadable hunk header {line[:80]!r}")
+            lineno = int(match.group("start"))
+            pending_removed = int(match.group("removed") or 1)
+            pending_added = int(match.group("added") or 1)
+    if pending_removed or pending_added:
+        raise GateError(
+            "unreadable diff: it ends inside a hunk that promised "
+            f"{pending_removed} more removed and {pending_added} more added line(s)"
+        )
     return results
 
 
@@ -379,10 +430,17 @@ def run_push(findings: Findings, root: Path, event: dict) -> None:
         parents = git("rev-list", "--parents", "-1", after).split()[1:]
         if parents:
             base = parents[0]
-        findings.note(
-            "push: the previous head is not available (new branch or force push); "
-            "checking the pushed head commit only"
-        )
+            findings.note(
+                "push: the previous head is not available (new branch, force push or "
+                "a truncated event); comparing the pushed head against its first "
+                "parent instead"
+            )
+        else:
+            findings.note(
+                "push: the previous head is not available and the pushed commit is a "
+                "root commit; its message is checked, and there is no base to diff "
+                "against"
+            )
 
     scan_commits(findings, commits_in(base, after), "commits in the push")
     if base:

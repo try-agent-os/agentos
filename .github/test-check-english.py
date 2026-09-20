@@ -5,7 +5,9 @@ A gate is only worth its job if every way of smuggling Russian in actually
 fails it, so each surface it claims to guard gets a run that MUST exit 1:
 Russian commit subject, Russian commit body on a commit that is not the head
 one, Russian PR title, Russian PR body, Russian branch name, Russian comment in
-an added line, Russian file name. Plus the runs that must stay green: a clean
+an added line, Russian file name -- including the added lines whose own text is
+shaped like diff metadata (`++ ...`), which a prefix-matching diff parser reads
+as a file header and silently drops. Plus the runs that must stay green: a clean
 English pull request, a diff that only REMOVES Cyrillic, and each bypass used
 as designed.
 
@@ -181,6 +183,61 @@ class GateTest(unittest.TestCase):
         self.box.write("install.sh", f"#!/bin/sh\n# {RU_SENTENCE}\necho hi\n")
         self.box.commit("feat: english subject")
         self.assertFails(self.box.pr(), "added line", "install.sh:2")
+
+    # -- added lines that impersonate diff metadata ------------------------
+    # A unified diff prints an added line by prefixing it with "+", so a line
+    # whose own content starts with "++ " arrives as "+++ <content>" -- the
+    # exact shape of the "+++ b/<path>" file header. Any parser that tells
+    # header from content by prefix alone drops the line, and worse, believes
+    # its text is the current path. These are the three shapes of that hole.
+
+    def test_an_added_line_shaped_like_a_file_header_is_still_scanned(self):
+        self.box.branch("feat/clean")
+        self.box.write("notes.md", f"++ {RU_SENTENCE}\n")
+        self.box.commit("docs: english subject")
+        self.assertFails(self.box.pr(), "added line", "notes.md:1")
+
+    def test_an_added_line_shaped_like_a_file_header_without_a_space_is_scanned(self):
+        self.box.branch("feat/clean")
+        self.box.write("notes.md", f"++{RU_SENTENCE}\n")
+        self.box.commit("docs: english subject")
+        self.assertFails(self.box.pr(), "added line", "notes.md:1")
+
+    def test_an_added_line_cannot_forge_an_allowlisted_path_for_its_neighbours(self):
+        """Path poisoning: the forged header used to waive the whole hunk."""
+        self.box.write(".github/cyrillic-allowlist.txt", "# why:\ndocs/l10n.md\n")
+        self.box.commit("chore: allow one documented path")
+        self.box.branch("feat/clean")
+        self.box.write("notes.md", f"++ b/docs/l10n.md\n{RU_SENTENCE}\n")
+        self.box.commit("docs: english subject")
+        self.assertFails(self.box.pr(), "added line", "notes.md:2")
+
+    def test_a_removed_line_shaped_like_a_file_header_does_not_derail_the_parser(self):
+        """The mirror shape: a removed "-- b/x" line prints as "--- b/x"."""
+        self.box.write("notes.md", "-- b/docs/l10n.md\nplain english\n")
+        self.box.commit("docs: seed a line shaped like a diff header")
+        self.box.branch("feat/clean")
+        self.box.write("notes.md", f"plain english\n# {RU_WORD}\n")
+        self.box.commit("docs: english subject")
+        self.assertFails(self.box.pr(), "added line", "notes.md")
+
+    def test_a_file_without_a_trailing_newline_is_still_parsed(self):
+        """The no-newline annotation is a body line the counter must skip."""
+        self.box.write("notes.md", "one\ntwo")
+        self.box.commit("docs: a file with no trailing newline")
+        self.box.branch("feat/clean")
+        self.box.write("notes.md", f"one\n{RU_WORD}")
+        self.box.commit("docs: english subject")
+        self.assertFails(self.box.pr(), "added line", "notes.md")
+
+    def test_the_reported_line_number_points_at_the_offending_line(self):
+        """Per-hunk counters must reset: a second hunk starts its own numbering."""
+        self.box.write("notes.md", "a\nb\nc\nd\ne\n")
+        self.box.commit("docs: seed a multi-line file")
+        self.box.branch("feat/clean")
+        self.box.write("notes.md", f"first\nb\nc\nd\n{RU_WORD}\n")
+        self.box.commit("docs: english subject")
+        self.assertFails(self.box.pr(), "notes.md:5")
 
     # -- the surfaces the four do not cover --------------------------------
     def test_russian_body_of_a_commit_that_is_not_the_head_fails(self):
