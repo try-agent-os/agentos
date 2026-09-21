@@ -1615,7 +1615,78 @@ upgrade_hop() { # upgrade_hop <tag> <image-ref>
   esac
 }
 
+# ─── self-invocation guard: never let `stop` behead the process asking for it ─
+#
+# `agentos upgrade`, run directly (not through the manual-upgrade unit above),
+# can itself be a process INSIDE $AGENTOS_SERVICE's own cgroup — an agent
+# session the core spawned, a tool call it is running, a shell an operator
+# attached to inside the sandbox. systemd_upgrade's first act is `systemctl
+# stop "$AGENTOS_SERVICE"`, and stopping a unit SIGKILLs its WHOLE cgroup —
+# including the very process running this function. The stop lands, the
+# cgroup dies mid-upgrade, and the paired `systemctl start` a few lines later
+# never runs: nobody is left alive to reach it. Not hypothetical — it took
+# agentos-aos down for however long it took someone watching to notice and
+# start it by hand (2026-09-17, ClickUp 12418agff6m):
+#   agentos-aos.service: Killing process NNN (bash) with signal SIGKILL
+#   agentos-aos.service: Killing process NNN (sudo) with signal SIGKILL
+#   agentos-aos.service: Killing process NNN (systemctl) with signal SIGKILL
+#
+# The fix borrows the SAME escape the owner's forced-upgrade path already
+# uses (cmd_manual_upgrade, above): run stop/start from OUTSIDE this cgroup,
+# in a transient unit systemd tracks separately, so it keeps going after
+# `stop` kills everything currently alive under $AGENTOS_SERVICE.
+#
+# AGENTOS_CGROUP_FILE is the test seam: the suite points it at a fixture so
+# this reads FAKE membership instead of the REAL /proc/self/cgroup of
+# whatever process happens to run the tests — which matters because that
+# process is sometimes itself inside a live agentos unit's cgroup (this very
+# CLI's own test suite runs on such a host; see scripts/tests/lib/hermetic-env.sh
+# for the sibling hazard with inherited env vars). Never set in production.
+running_inside_own_unit() { # → 0 (true) iff THIS shell's cgroup is $AGENTOS_SERVICE's own
+  local cg
+  cg="$(cat "${AGENTOS_CGROUP_FILE:-/proc/self/cgroup}" 2>/dev/null)" || return 1
+  case "$cg" in
+    *"/${AGENTOS_SERVICE}.service"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# AGENTOS_UPGRADE_DETACH_CMD is the same test seam as AGENTOS_RESTART_CMD /
+# AGENTOS_UPGRADE_HOP_CMD above: the suite substitutes a recorder so "did we
+# detach, with what unit, running what" is assertable without a real systemd.
+# Never set in production.
+detach_upgrade_and_exit() { # detach_upgrade_and_exit <original upgrade argv...> — never returns
+  local self unit
+  self="$(readlink -f "${BASH_SOURCE[0]}")"
+  unit="${AGENTOS_SERVICE}-cli-upgrade-$$-$(date -u +%s)"
+  warn "this shell is running INSIDE ${AGENTOS_SERVICE}.service's own cgroup — 'systemctl stop' is"
+  warn "about to kill it (and everything else in that cgroup) before the paired 'start' could run."
+  warn "handing the upgrade to a detached unit (${unit}.service) that outlives this process..."
+  if [ -n "${AGENTOS_UPGRADE_DETACH_CMD:-}" ]; then
+    # shellcheck disable=SC2086  # word-splitting is the seam: the suite passes
+    # a multi-word recorder command.
+    $AGENTOS_UPGRADE_DETACH_CMD "$unit" "$self" "$@"
+  else
+    command -v systemd-run >/dev/null 2>&1 \
+      || die "cannot detach: systemd-run not found, and running the upgrade from inside ${AGENTOS_SERVICE}.service's own cgroup would kill it mid-flight. Run this from outside the node's cgroup instead (e.g. from the host, not an agent session it spawned)."
+    systemd-run --unit="$unit" --collect --quiet \
+      --setenv=AGENTOS_DIR="$AGENTOS_HOME" \
+      --setenv=AGENTOS_SERVICE="$AGENTOS_SERVICE" \
+      --setenv=AGENTOS_USER="$AGENTOS_ACCOUNT" \
+      --setenv=AGENTOS_PORT="${AGENTOS_PORT:-8787}" \
+      -- "$self" upgrade "$@"
+  fi
+  ok "detached: journalctl -u ${unit}.service -f to watch it; agentos status once it settles."
+  exit 0
+}
+
 cmd_upgrade() {
+  # Checked before anything else — including arg parsing — because a positive
+  # match means THIS process hands off wholesale and never gets to run any of
+  # what follows; the detached unit re-parses the same argv from scratch.
+  if [ "$(detect_mode)" = systemd ] && running_inside_own_unit; then
+    detach_upgrade_and_exit "$@"
+  fi
   local to="" image_ref="" chain=1 cur plan hop hop_arg hop_img total n=0 from_latest=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -2347,6 +2418,10 @@ agentos — operate an AgentOS Core node
                               explicit (digest-pinned) image ref. Waits for a
                               quiet moment first (the node drains agent turns on
                               stop); --force restarts into a live turn anyway.
+                              Run from inside the node's OWN unit cgroup (an
+                              agent session it spawned), it detaches into a
+                              transient unit first, so `stop` cannot behead the
+                              process that asked for the upgrade.
                               A target on a newer MAJOR is applied as a chain —
                               one health-gated hop per major boundary, because
                               migrations are forward-only; --no-chain takes the
