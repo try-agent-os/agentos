@@ -439,24 +439,133 @@ run_as_service() { # run_as_service <cmd> [args...]
   fi
 }
 
-# Ensure the GitHub CLI is present — the acceptance is `gh pr view/checks`, which
-# needs the binary, not just a token. Try the distro first (Ubuntu 24.04 ships
-# it), then GitHub's own apt repo; degrade to a warning rather than failing the
-# install (git-over-https still works through the credential helper).
-ensure_gh() {
-  command -v gh >/dev/null 2>&1 && return 0
-  $SUDO apt-get -o DPkg::Lock::Timeout=120 install -y -qq gh >/dev/null 2>&1 \
-    && command -v gh >/dev/null 2>&1 && { ok "gh installed (apt)"; return 0; }
-  info "adding the GitHub CLI apt repo"
-  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg 2>/dev/null \
-    | $SUDO tee /usr/share/keyrings/githubcli-archive-keyring.gpg >/dev/null 2>&1 || true
-  $SUDO chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null || true
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-    | $SUDO tee /etc/apt/sources.list.d/github-cli.list >/dev/null 2>&1 || true
+# ─── the GitHub CLI ─────────────────────────────────────────────────────────
+#
+# The minimum gh this node is allowed to run with. Not a preference and not a
+# round number: every gh below 2.60 asks GitHub for a Projects (classic) field
+# when it edits a pull request, and GitHub answers that with an error, so
+# `gh pr edit` fails on EVERY pull request, in a message that names nothing the
+# caller did:
+#
+#   GraphQL: Projects (classic) is being deprecated in favor of the new Projects
+#   experience (repository.pullRequest.projectCards)
+#
+# Editing a PR body is routine work for the agent on this node (the canonical
+# `Task:` line, the verification report, the description after a rebase), so a
+# node that cannot do it is a broken node — and the failure reads like a missing
+# permission, which is the wrong thing to go fix.
+#
+# Ubuntu 24.04 ships exactly such a gh (2.45.0-1ubuntu0.3). That is why GitHub's
+# own apt repo (cli/cli) is the PRIMARY source below and the distro package is a
+# last resort: "try the distro first" used to succeed here, report `gh installed
+# (apt)`, and leave every new contour with a gh that cannot edit a PR.
+GH_MIN_VERSION="2.60.0"
+
+# `gh version 2.45.0 (2024-03-04)` → `2.45.0`. Empty when the text is not gh's.
+gh_version_of() { # gh_version_of <`gh --version` output>
+  printf '%s\n' "${1:-}" | sed -n 's/^gh version \([0-9][0-9.]*\).*/\1/p' | head -1
+}
+
+# Field-by-field numeric compare — `sort -V` is not everywhere, and a string
+# compare gets 2.101.0 vs 2.60.0 backwards (which is this host's real pair).
+gh_version_ge() { # gh_version_ge <a> <b> → 0 when a >= b
+  local a="${1:-}" b="${2:-}" i av bv
+  [ -n "$a" ] || return 1
+  for i in 1 2 3; do
+    av="$(printf '%s' "$a" | cut -d. -f"$i")"; av="${av:-0}"
+    bv="$(printf '%s' "$b" | cut -d. -f"$i")"; bv="${bv:-0}"
+    case "$av$bv" in *[!0-9]*) return 1 ;; esac
+    [ "$av" -gt "$bv" ] && return 0
+    [ "$av" -lt "$bv" ] && return 1
+  done
+  return 0
+}
+
+# What a run should do about gh, as a pure function of the version that is
+# already on the box. Kept separate from the install path so the rule is
+# testable without root, network or apt: see scripts/tests/install-gh.test.sh.
+#
+# The second defect this pins: an EXISTING gh is not a good gh. The old check
+# was `command -v gh && return 0`, so a box that already had 2.45 kept it
+# through every re-run and every node update — the one path an operator would
+# expect to heal it.
+gh_decision() { # gh_decision <installed-version> → ok <v> | upgrade <v> | install
+  local v="${1:-}"
+  [ -n "$v" ] || { printf 'install\n'; return 0; }
+  if gh_version_ge "$v" "$GH_MIN_VERSION"; then printf 'ok %s\n' "$v"; else printf 'upgrade %s\n' "$v"; fi
+}
+
+# Empty means "no usable gh": either the command is not there, or it is there
+# and cannot say what it is. Asking the BINARY rather than $PATH is deliberate —
+# the only thing that matters downstream is the version it reports.
+gh_installed_version() { # gh_installed_version → x.y.z, empty when gh is absent
+  gh_version_of "$(gh --version 2>/dev/null || true)"
+}
+
+# Declare GitHub's own apt source (cli/cli) — the source that actually carries a
+# current gh. Every step used to end in `|| true`, which made a failure here
+# invisible: the only symptom was gh missing, or gh silently staying old. Now
+# each half that can fail says so once, and the caller decides.
+add_gh_apt_repo() {
+  local keyring=/usr/share/keyrings/githubcli-archive-keyring.gpg
+  if ! curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg 2>/dev/null \
+       | $SUDO tee "$keyring" >/dev/null 2>&1; then
+    warn "could not fetch the GitHub CLI signing key from cli.github.com"
+    return 1
+  fi
+  $SUDO chmod go+r "$keyring" 2>/dev/null || true
+  if ! echo "deb [arch=$(dpkg --print-architecture) signed-by=$keyring] https://cli.github.com/packages stable main" \
+       | $SUDO tee /etc/apt/sources.list.d/github-cli.list >/dev/null 2>&1; then
+    warn "could not declare the GitHub CLI apt source"
+    return 1
+  fi
   $SUDO apt-get -o DPkg::Lock::Timeout=120 update -qq >/dev/null 2>&1 || true
-  $SUDO apt-get -o DPkg::Lock::Timeout=120 install -y -qq gh >/dev/null 2>&1 \
-    && command -v gh >/dev/null 2>&1 && { ok "gh installed (github apt repo)"; return 0; }
-  warn "could not install gh — 'gh pr view/checks' stays unavailable until it is; git over https still works"
+  return 0
+}
+
+# Ensure a WORKING GitHub CLI is present — the acceptance is `gh pr view/checks`
+# and `gh pr edit`, which needs the binary at >= $GH_MIN_VERSION, not just a
+# token. Primary source: GitHub's own apt repo. The distro package is tried only
+# when that repo could not be reached at all, and never silences the version
+# rule. Degrades to a warning rather than failing the install (git-over-https
+# still works through the credential helper) — but the warning now NAMES the
+# version that came out, so a contour born with an unusable gh says so.
+ensure_gh() {
+  local have decision
+  have="$(gh_installed_version)"
+  decision="$(gh_decision "$have")"
+  case "$decision" in
+    ok\ *)
+      return 0 ;;
+    upgrade\ *)
+      info "gh ${have} is below ${GH_MIN_VERSION} — 'gh pr edit' fails on every PR with it; upgrading from cli.github.com" ;;
+    *)
+      info "installing the GitHub CLI from cli.github.com" ;;
+  esac
+
+  if add_gh_apt_repo; then
+    $SUDO apt-get -o DPkg::Lock::Timeout=120 install -y -qq gh >/dev/null 2>&1 || true
+    have="$(gh_installed_version)"
+    if [ -n "$have" ] && gh_version_ge "$have" "$GH_MIN_VERSION"; then
+      ok "gh ${have} (cli.github.com)"
+      return 0
+    fi
+  fi
+
+  # Last resort, and only when there is NO gh at all: the distro package is
+  # known to be older than the minimum on Ubuntu 24.04, so it can never satisfy
+  # the rule — it is strictly better than nothing (`gh pr view/checks` work),
+  # and strictly worse than what the repo above would have given us.
+  if [ -z "$have" ]; then
+    $SUDO apt-get -o DPkg::Lock::Timeout=120 install -y -qq gh >/dev/null 2>&1 || true
+    have="$(gh_installed_version)"
+  fi
+
+  if [ -z "$have" ]; then
+    warn "could not install gh — 'gh pr view/checks' stays unavailable until it is; git over https still works"
+    return 0
+  fi
+  warn "gh ${have} is below ${GH_MIN_VERSION}: 'gh pr edit' will fail on every PR (Projects classic). Install a current gh from https://cli.github.com and re-run."
   return 0
 }
 
@@ -576,6 +685,30 @@ version_decision() { # version_decision <channel-tag> <installed-tag> <allow-upg
 
 if [ -n "${AGENTOS_PRINT_VERSION_DECISION:-}" ]; then
   version_decision "${AGENTOS_TEST_CHANNEL_TAG:-}" "${AGENTOS_TEST_INSTALLED_TAG:-}" "$ALLOW_UPGRADE"
+  exit 0
+fi
+
+# "What would this box do about gh?" — the rule alone, as a pure function of the
+# installed version, without root, apt or network. Same early-exit contract as
+# the print hooks around it; driven by scripts/tests/install-gh.test.sh.
+if [ -n "${AGENTOS_PRINT_GH_DECISION:-}" ]; then
+  gh_decision "$(gh_version_of "${AGENTOS_TEST_GH_VERSION:-}")"
+  exit 0
+fi
+
+# The same question asked of the REAL ensure_gh: it runs here against whatever
+# `gh`/`apt-get`/`curl`/`dpkg`/`tee` the caller put on $PATH, so the suite can
+# assert the ORDER of the sources (cli/cli first, distro last) and what each
+# outcome reports, which is where both defects lived. Prints ensure_gh's own
+# output, then the version it left behind.
+if [ -n "${AGENTOS_PRINT_GH_PLAN:-}" ]; then
+  SUDO="${SUDO:-}"                       # not resolved this early; every call tolerates empty
+  _gh_rc=0
+  ensure_gh || _gh_rc=$?                 # `|| rc=$?` and not a bare call: `set -e` would take
+                                         # a non-zero ensure_gh out before the report is printed,
+                                         # and "never aborts the install" is one of the assertions
+  echo "rc=${_gh_rc}"
+  echo "gh=$(gh_installed_version)"
   exit 0
 fi
 
