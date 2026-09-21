@@ -1076,6 +1076,7 @@ docker_restore_sqlite() { # docker_restore_sqlite <archive> — restores /data f
 
 docker_upgrade() { # docker_upgrade [tag] [image-ref]  — empty tag = latest stable
   local to="${1:-}" image_ref="${2:-}" manifest image digest prev snap
+  local from_label to_label stop_epoch snap_started snap_seconds
   if [ -n "$image_ref" ]; then
     # Explicit, already-resolved ref (the autoupdate poller passes a
     # digest-pinned repo@sha256:… so the pull is immutable). Skip the manifest.
@@ -1106,10 +1107,25 @@ docker_upgrade() { # docker_upgrade [tag] [image-ref]  — empty tag = latest st
     reconcile_units "$AGENTOS_HOME" || warn "unit reconciliation hit a snag"
     return 0
   fi
+  # Same bracket as the systemd path, for the same reason — docker mode stops
+  # the node inside docker_backup_sqlite, so this is again the last moment the
+  # core can speak. Docker addresses releases by DIGEST, which is not something
+  # to put in a chat line, so the notice names versions: the tag this upgrade
+  # was asked for (the poller always passes one) or the manifest's, against
+  # whatever version .env records, and the image ref only as a last resort.
+  from_label="$(dotenv_val AGENTOS_VERSION)"
+  [ -n "$from_label" ] || from_label="${prev##*:}"
+  to_label="$to"
+  [ -n "$to_label" ] || to_label="$(printf '%s' "${manifest:-}" | jq -r '.version // empty' 2>/dev/null || true)"
+  [ -n "$to_label" ] || to_label="${image##*[:@]}"
+  announce_going_down "${from_label#v}" "${to_label#v}"
   # Managed PG: record the pre-flip restore point + shout that there is no
   # automatic rollback here, BEFORE anything changes. No-op on SQLite nodes.
   managed_pg_restore_point "$prev" "$image"
+  stop_epoch="$(date +%s)"
+  snap_started="$stop_epoch"
   snap="$(docker_backup_sqlite | tail -1)"   # consistent copy: the node is stopped
+  snap_seconds=$(( $(date +%s) - snap_started ))
   [ -n "$snap" ] && echo "$snap" > "$BACKUP_DIR/.last-upgrade"   # pairs archive + pre-upgrade image (its .image sidecar), before the flip
   docker_set_image "$image"
   # BEFORE any `up`: the compose file this node runs may already carry the two
@@ -1130,6 +1146,7 @@ docker_upgrade() { # docker_upgrade [tag] [image-ref]  — empty tag = latest st
     ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" up -d )
     die "upgrade failed; previous version restored"
   fi
+  record_upgrade_downtime docker "${from_label#v}" "${to_label#v}" "$stop_epoch" "$snap_seconds"
   # The node is live and healthy on the new image; now pull the operator tooling
   # (the CLI itself, the auto-update poller, the compose file) forward too, so
   # `agentos upgrade` upgrades itself and not merely the container (issue #112).
@@ -1199,6 +1216,204 @@ docker_backup() { # manual, standalone backup — leaves the node running afterw
 # same systemd_backup_sqlite helper but never touches .last-upgrade, so a
 # routine backup can never change what `agentos rollback` restores. There is
 # no separate `.last` pointer — the snapshot dir IS the record.
+
+# ── the update's silence: announce it before, measure it after ──────────────
+#
+# THE DEFECT THIS EXISTS FOR (ClickUp 12418agfpq9, live hub, 2026-09-21). The
+# node vanished from chat for ten minutes and six seconds without a word. Last
+# message 08:12:26, unit stopped 08:23:52, unit back 08:33:58; the owner asked
+# twice in another contour why the hub was dead (08:25:33, 08:33:07) and only at
+# 08:35:05 did `updated 4.18.0 → 4.18.1` arrive — eleven minutes after the stop.
+# The update itself was healthy. The only thing wrong was that a planned,
+# predictable, already-decided operation said nothing until it was over.
+#
+# So the stop is now bracketed:
+#
+#   announce_going_down   runs BEFORE `systemctl stop`, while the core still
+#                         exists, and blocks until the core has actually put the
+#                         line in the owner's chat. The core is the only process
+#                         on this box that can talk to Telegram — root must not
+#                         hold the bot token or run an operator-supplied notify
+#                         command (invariant И1, see agentos-autoupdate.service)
+#                         — so the announcement is a handshake with the process
+#                         we are about to kill, not a message root sends.
+#
+#   record_upgrade_downtime runs once the node is healthy again. It writes the
+#                         measurement TWICE, for two different readers: into
+#                         backups/.last-upgrade-timing, which is where the NEXT
+#                         upgrade's estimate comes from, and into the signal
+#                         outbox, where the core that just booted reads it and
+#                         tells the owner if the silence outran its
+#                         announcement (core/updates/downtime-notice.ts).
+#
+# The estimate is a MEASUREMENT, not a constant — that is the owner's wording:
+# «N брать из длительности предыдущего снапшота, а не из константы». The
+# constants below exist only for the one upgrade that has no predecessor to
+# learn from, and the notice says so in that case.
+UPGRADE_TIMING_FILE="$BACKUP_DIR/.last-upgrade-timing"
+# Copy rate assumed for the FIRST upgrade only, when no downtime has ever been
+# measured on this node: 50 MiB/s, deliberately pessimistic for `cp -a` of a
+# multi-gigabyte data/ onto the same disk. Over-promising speed is the failure
+# mode that hurts — an owner told "about a minute" who then waits ten is exactly
+# where this task started.
+SNAPSHOT_KB_PER_SEC=51200
+# Bounds. The floor applies to EVERY source — the stop/start alone is not free,
+# and "about 0 s" is not a window anyone can plan around. The ceiling applies
+# only to the GUESS: a measured window of forty minutes is a fact and should be
+# announced as one, while a guess that size is far likelier to be a mis-sized
+# directory. The hard cap is the endpoint's own bound, so a corrupt number is
+# refused here rather than at the far end.
+UPGRADE_ETA_FLOOR=30
+UPGRADE_ETA_CEILING=1800
+UPGRADE_ETA_HARD_CAP=86400
+
+# Kilobytes the pre-upgrade snapshot has to copy. `du -sk`, not `du -sb`: -k is
+# POSIX and -b is GNU-only, and this file is read by a suite that also runs on
+# macOS. Empty when the directory is not there to size — docker mode keeps the
+# data in a named volume, not under $AGENTOS_HOME — and every caller treats
+# empty as "cannot size", never as zero.
+snapshot_input_kb() {
+  [ -d "$AGENTOS_HOME/data" ] || return 0
+  du -sk "$AGENTOS_HOME/data" 2>/dev/null | awk 'NR==1{print $1}' || true
+}
+
+UPGRADE_ETA_SECONDS=""
+UPGRADE_ETA_BASIS=""
+# Sets UPGRADE_ETA_SECONDS + UPGRADE_ETA_BASIS. Three sources, in order of how
+# much they actually know about THIS node:
+#   1. an operator override in .env (AGENTOS_UPGRADE_ETA_SECONDS) — a human who
+#      has measured their own box outranks both guesses below;
+#   2. the previous upgrade's measured downtime — the owner's requirement;
+#   3. the size of data/ over a pessimistic copy rate — still a fact about this
+#      node, and labelled `estimated` so the notice never claims to have
+#      measured anything.
+upgrade_eta() {
+  local prev kb override
+  UPGRADE_ETA_BASIS=estimated
+  override="$(dotenv_val AGENTOS_UPGRADE_ETA_SECONDS)"
+  case "$override" in ''|*[!0-9]*) override="" ;; esac
+  if [ -n "$override" ] && [ "$override" -gt 0 ]; then
+    UPGRADE_ETA_SECONDS="$override"
+  else
+    # A RECORDED window is a measurement even when it reads 0 — the previous
+    # upgrade was timed, and the answer was "under a second of resolution". The
+    # floor below turns that into an announceable number without turning it
+    # back into a guess.
+    prev="$(jq -r '.downtime_seconds // empty' "$UPGRADE_TIMING_FILE" 2>/dev/null || true)"
+    case "$prev" in ''|*[!0-9]*) prev="" ;; esac
+    if [ -n "$prev" ]; then
+      UPGRADE_ETA_SECONDS="$prev"
+      UPGRADE_ETA_BASIS=measured
+    else
+      kb="$(snapshot_input_kb)"
+      case "$kb" in ''|*[!0-9]*) kb="" ;; esac
+      if [ -n "$kb" ] && [ "$kb" -gt 0 ]; then
+        UPGRADE_ETA_SECONDS=$(( kb / SNAPSHOT_KB_PER_SEC ))
+      else
+        UPGRADE_ETA_SECONDS=0
+      fi
+      if [ "$UPGRADE_ETA_SECONDS" -gt "$UPGRADE_ETA_CEILING" ]; then
+        UPGRADE_ETA_SECONDS="$UPGRADE_ETA_CEILING"
+      fi
+    fi
+  fi
+  if [ "$UPGRADE_ETA_SECONDS" -lt "$UPGRADE_ETA_FLOOR" ]; then
+    UPGRADE_ETA_SECONDS="$UPGRADE_ETA_FLOOR"
+  fi
+  if [ "$UPGRADE_ETA_SECONDS" -gt "$UPGRADE_ETA_HARD_CAP" ]; then
+    UPGRADE_ETA_SECONDS="$UPGRADE_ETA_HARD_CAP"
+  fi
+  return 0
+}
+
+# What the owner was actually PROMISED, in seconds — empty when the line never
+# reached the chat. Read by record_upgrade_downtime: a window nobody was told
+# about cannot be overrun, and reporting one would scold the owner with a number
+# they never saw.
+UPGRADE_ANNOUNCED_SECONDS=""
+
+announce_going_down() { # announce_going_down <from> <to> — one chat line, BEFORE the stop
+  UPGRADE_ANNOUNCED_SECONDS=""
+  local from="$1" to="$2" port token body reply outcome
+  local -a auth=()
+  upgrade_eta
+  port="$(dotenv_val AGENTOS_PORT)"
+  [ -n "$port" ] || port="${AGENTOS_PORT:-8787}"
+  case "$port" in ''|*[!0-9]*) port=8787 ;; esac
+  token="$(dotenv_val INTERNAL_API_TOKEN)"
+  # An array, never `${token:+-H "…"}`: the unquoted form word-splits the header
+  # and curl receives `x-internal-token:` and the value as two arguments.
+  [ -n "$token" ] && auth=(-H "x-internal-token: $token")
+  body="$(jq -nc --arg from "$from" --arg to "$to" \
+            --argjson eta "$UPGRADE_ETA_SECONDS" --arg basis "$UPGRADE_ETA_BASIS" \
+            '{from:$from,to:$to,eta_seconds:$eta,basis:$basis}' 2>/dev/null)" || body=""
+  if [ -z "$body" ]; then
+    warn "could not compose the going-down notice; continuing with the upgrade"
+    return 0
+  fi
+  # Bounded: the announcement must never become a reason the upgrade does not
+  # happen. A core that cannot answer in time is a core that is already having a
+  # bad day, and the upgrade is usually the fix.
+  reply="$(curl -fsS --max-time "${AGENTOS_PRESTOP_TIMEOUT:-15}" \
+             -X POST -H 'content-type: application/json' \
+             "${auth[@]+"${auth[@]}"}" --data "$body" \
+             "http://127.0.0.1:${port}/internal/updates/pre-stop" 2>/dev/null)" || reply=""
+  if [ -z "$reply" ]; then
+    warn "could not tell the owner the node is going down (no answer from the core on 127.0.0.1:${port}); continuing with the upgrade"
+    return 0
+  fi
+  if [ "$(printf '%s' "$reply" | jq -r '.announced // false' 2>/dev/null || true)" = true ]; then
+    UPGRADE_ANNOUNCED_SECONDS="$UPGRADE_ETA_SECONDS"
+    info "told the owner: going down ${from} → ${to}, ~${UPGRADE_ETA_SECONDS}s (${UPGRADE_ETA_BASIS})"
+  else
+    outcome="$(printf '%s' "$reply" | jq -r '.outcome // "?"' 2>/dev/null || true)"
+    warn "the core took the going-down notice but did not deliver it to chat (outcome: ${outcome:-?})"
+  fi
+  return 0
+}
+
+record_upgrade_downtime() { # record_upgrade_downtime <docker|systemd> <from> <to> <stop-epoch> <snapshot-seconds>
+  local mode="$1" from="$2" to="$3" stop="$4" snap_s="$5" now downtime tmp
+  now="$(date +%s)"
+  downtime=$(( now - stop ))
+  [ "$downtime" -lt 0 ] && downtime=0
+  case "$snap_s" in ''|*[!0-9]*) snap_s=0 ;; esac
+  mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+  # (1) the measurement the NEXT upgrade estimates from. Temp+rename so a run
+  # killed mid-write cannot leave the next upgrade reading half a number.
+  tmp="${UPGRADE_TIMING_FILE}.tmp"
+  if jq -nc --argjson at "$now" --arg from "$from" --arg to "$to" \
+       --argjson snapshot_seconds "$snap_s" --argjson downtime_seconds "$downtime" \
+       '{at:$at,from:$from,to:$to,snapshot_seconds:$snapshot_seconds,downtime_seconds:$downtime_seconds}' \
+       > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$UPGRADE_TIMING_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  else
+    rm -f "$tmp" 2>/dev/null || true
+    warn "could not record this upgrade's downtime; the next one will estimate instead of measure"
+  fi
+  info "downtime: ${downtime}s (snapshot ${snap_s}s)"
+  # (2) the fact the core reports if the silence outran what was announced. Root
+  # owns the outbox; the core only reads it.
+  #
+  # EVERY step here is best-effort, and deliberately so: the outbox may be
+  # read-only, missing, or owned by a root that this invocation is not. None of
+  # that is a reason to fail an upgrade that already succeeded — the worst case
+  # is that the core comes back without a measurement, which is exactly the
+  # state every node was in before this existed.
+  resolve_signal_paths "$mode"
+  [ -d "$SIGNAL_OUTBOX" ] || return 0
+  tmp="$SIGNAL_OUTBOX/downtime.json.tmp"
+  if jq -nc --arg id "${stop}000" --arg from "$from" --arg to "$to" \
+       --argjson announced_seconds "${UPGRADE_ANNOUNCED_SECONDS:-0}" \
+       --argjson downtime_seconds "$downtime" \
+       '{id:$id,from:$from,to:$to,announced_seconds:$announced_seconds,downtime_seconds:$downtime_seconds}' \
+       > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$SIGNAL_OUTBOX/downtime.json" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  else
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+  return 0
+}
 
 systemd_backup_sqlite() { # systemd_backup_sqlite <label> — <label> is the code tag this snapshot belongs next to. Prints the new dir's path on stdout (nothing if managed Postgres). Never touches .last-upgrade — callers decide that.
   if uses_managed_postgres; then
@@ -1335,6 +1550,7 @@ set_env_version() { # set_env_version <tag>
 
 systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   local to="${1:-}" manifest tag tarball sha url prev tmp_dir snap started
+  local stop_epoch snap_started snap_seconds
   if [ -n "$to" ]; then
     manifest="$(curl -fsSL "https://github.com/${DIST_REPO}/releases/download/${to}/stable.json")" \
       || die "no stable.json for ${to}"
@@ -1390,11 +1606,23 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   chown -R "$AGENTOS_ACCOUNT:$AGENTOS_ACCOUNT" "$AGENTOS_HOME/versions/$tag"
 
   step "Upgrading $prev → $tag"
+  # The LAST moment anything on this node can speak to the owner: after this the
+  # core is gone for the whole snapshot+swap+boot window. Blocking and bounded —
+  # it returns only once the core has put the line in the chat (or given up), so
+  # the message is in Telegram strictly before systemd logs "Stopping
+  # <unit>.service". See "the update's silence" above (ClickUp 12418agfpq9).
+  announce_going_down "${prev#v}" "${tag#v}"
   # Managed PG: record the pre-flip restore point + shout that there is no
   # automatic rollback here, BEFORE the unit is even stopped. No-op on SQLite.
   managed_pg_restore_point "$prev" "$tag"
+  # The silence starts HERE, not at the snapshot: this is the instant the owner
+  # stops being able to reach the node, and it is the instant the next
+  # upgrade's estimate has to be measured from.
+  stop_epoch="$(date +%s)"
   systemctl stop "$AGENTOS_SERVICE"
+  snap_started="$(date +%s)"
   snap="$(systemd_backup_sqlite "$prev" | tail -1)"   # consistent copy: the unit is stopped
+  snap_seconds=$(( $(date +%s) - snap_started ))
   [ -n "$snap" ] && echo "$snap" > "$BACKUP_DIR/.last-upgrade"   # pairs snapshot + code tag atomically, before the swap
   ln -sfn "$AGENTOS_HOME/versions/$tag" "$AGENTOS_HOME/current"
   # Paired with the symlink flip, BEFORE the start — .env is the unit's
@@ -1418,6 +1646,10 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
 
   if [ "$started" = 1 ] && wait_healthz; then
     ok "upgraded: $prev → $tag"
+    # Measured at the first green healthz — the moment the owner can reach the
+    # node again — and therefore BEFORE the best-effort reconciliation below,
+    # which happens on a node that is already answering.
+    record_upgrade_downtime systemd "${prev#v}" "${tag#v}" "$stop_epoch" "$snap_seconds"
     # Only now: the units belong to the release that is actually live, and the
     # branch below can still put $prev back. Best-effort — a snag here never
     # undoes an upgrade that is already healthy.
@@ -1437,6 +1669,11 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     set_env_version "$prev"
     systemctl start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
     wait_healthz || die "rollback ALSO unhealthy — inspect: journalctl -u $AGENTOS_SERVICE"
+    # The node is back — on the OLD version, after the longest silence this path
+    # can produce (stop, snapshot, a failed boot, a restore, a second boot).
+    # That is precisely the window the owner must not have to guess about, so it
+    # is recorded like any other: `to` is where the node actually ended up.
+    record_upgrade_downtime systemd "${prev#v}" "${prev#v}" "$stop_epoch" "$snap_seconds"
     die "upgrade to $tag failed; $prev restored"
   fi
 }
