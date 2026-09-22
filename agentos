@@ -1251,12 +1251,44 @@ docker_backup() { # manual, standalone backup — leaves the node running afterw
 # constants below exist only for the one upgrade that has no predecessor to
 # learn from, and the notice says so in that case.
 UPGRADE_TIMING_FILE="$BACKUP_DIR/.last-upgrade-timing"
-# Copy rate assumed for the FIRST upgrade only, when no downtime has ever been
-# measured on this node: 50 MiB/s, deliberately pessimistic for `cp -a` of a
-# multi-gigabyte data/ onto the same disk. Over-promising speed is the failure
-# mode that hurts — an owner told "about a minute" who then waits ten is exactly
-# where this task started.
+# What the FIRST upgrade assumes, when no downtime has ever been measured on
+# this node. TWO terms, because a `cp -a` pays for two different things and
+# pricing only one of them is what broke this the first time it ran for real.
+#
+# Why the entry term exists (self-heal ad8ff93fac13762f, 2026-09-22): the hub
+# announced «about 4 min 42 s» and went silent for 16 min 43 s — 3.5x over, on
+# the very first upgrade, from the estimate branch below. The guess was
+# 14592924 KB / 51200 = 285 s; the snapshot alone took 876 s of a 1003 s
+# outage. Bandwidth was never the constraint — a sequential GiB on that same
+# disk copies in under a second. That 14 GiB is ~850k paths averaging ~20 KB,
+# and `cp -a` paid for open/read/write/close/metadata PER ENTRY, not per
+# megabyte. A bytes-only model cannot see that, so it under-promised by 3.5x
+# and the owner was told a number that was never achievable.
+#
+# 50 MiB/s stays as the BULK-BYTES rate: it is right for the few-large-files
+# node, and on that shape the entry term rounds to nothing.
+#
+# 400 entries/s is calibrated against what snapshot_input can actually COUNT,
+# which is not the number of paths: `du` charges a hard-linked inode once, so
+# it saw 375539 entries where find saw 850620 paths (pnpm-style stores hardlink
+# heavily). The rate is those 375539 countable entries over what is LEFT of the
+# outage once the bytes term is paid: 375539 / (1003 - 285) -> ~523/s. NOT
+# 375539/1003 (= 374/s) — that charges the entries for seconds the bytes term
+# already accounts for, and a future recalibration reading this comment must
+# repeat the subtraction, not the whole number. 400 is ~523 rounded DOWN for
+# margin. (A cleaner base, if this is ever redone: the node records
+# `snapshot_seconds` separately — 876 here — which excludes the stop/start that
+# 1003 still contains.) Calibrate to the
+# number the code can see, never to the one it cannot.
+#
+# Against the measurement that motivated this: 14592924/51200 + 375539/400
+# = 285 + 938 = 1223 s announced vs 1003 s actual. Announced now EXCEEDS
+# reality, which is the safe side, and stays under UPGRADE_ETA_CEILING.
+# Over-promising speed is the failure mode that hurts — an owner told "about a
+# minute" who then waits ten is exactly where this task started. Over-promising
+# SILENCE just ends early.
 SNAPSHOT_KB_PER_SEC=51200
+SNAPSHOT_ENTRIES_PER_SEC=400
 # Bounds. The floor applies to EVERY source — the stop/start alone is not free,
 # and "about 0 s" is not a window anyone can plan around. The ceiling applies
 # only to the GUESS: a measured window of forty minutes is a fact and should be
@@ -1267,14 +1299,20 @@ UPGRADE_ETA_FLOOR=30
 UPGRADE_ETA_CEILING=1800
 UPGRADE_ETA_HARD_CAP=86400
 
-# Kilobytes the pre-upgrade snapshot has to copy. `du -sk`, not `du -sb`: -k is
-# POSIX and -b is GNU-only, and this file is read by a suite that also runs on
-# macOS. Empty when the directory is not there to size — docker mode keeps the
-# data in a named volume, not under $AGENTOS_HOME — and every caller treats
-# empty as "cannot size", never as zero.
-snapshot_input_kb() {
+# What the pre-upgrade snapshot has to copy, as "<kilobytes> <entries>" on one
+# line. Both numbers come from ONE walk: `du -ak` lists every entry and prints
+# the grand total last, so $1 of the final line is the size `du -sk` would have
+# given and NR is the entry count. -a and -k are POSIX (-b and `find -printf`
+# are GNU-only, and this file is read by a suite that also runs on macOS).
+# Directories are counted alongside files on purpose: cp pays to create them
+# too. A hard-linked inode is charged ONCE here, because that is what `du`
+# does — SNAPSHOT_ENTRIES_PER_SEC is calibrated against this same deduplicated
+# count, so the two agree. Empty when the directory is not there to size —
+# docker mode keeps the data in a named volume, not under $AGENTOS_HOME — and
+# every caller treats empty as "cannot size", never as zero.
+snapshot_input() {
   [ -d "$AGENTOS_HOME/data" ] || return 0
-  du -sk "$AGENTOS_HOME/data" 2>/dev/null | awk 'NR==1{print $1}' || true
+  du -ak "$AGENTOS_HOME/data" 2>/dev/null | awk 'END{if (NR>0) print $1" "NR}' || true
 }
 
 UPGRADE_ETA_SECONDS=""
@@ -1284,11 +1322,11 @@ UPGRADE_ETA_BASIS=""
 #   1. an operator override in .env (AGENTOS_UPGRADE_ETA_SECONDS) — a human who
 #      has measured their own box outranks both guesses below;
 #   2. the previous upgrade's measured downtime — the owner's requirement;
-#   3. the size of data/ over a pessimistic copy rate — still a fact about this
-#      node, and labelled `estimated` so the notice never claims to have
-#      measured anything.
+#   3. the size AND file count of data/ over pessimistic copy rates — still a
+#      fact about this node, and labelled `estimated` so the notice never
+#      claims to have measured anything.
 upgrade_eta() {
-  local prev kb override
+  local prev kb entries sized override
   UPGRADE_ETA_BASIS=estimated
   override="$(dotenv_val AGENTOS_UPGRADE_ETA_SECONDS)"
   case "$override" in ''|*[!0-9]*) override="" ;; esac
@@ -1305,10 +1343,18 @@ upgrade_eta() {
       UPGRADE_ETA_SECONDS="$prev"
       UPGRADE_ETA_BASIS=measured
     else
-      kb="$(snapshot_input_kb)"
+      sized="$(snapshot_input)"
+      kb="${sized%% *}"
+      # Split only on a reading that actually HAS both fields: with one token
+      # the two expansions would return the same number and the size would be
+      # charged a second time as an entry count.
+      case "$sized" in *" "*) entries="${sized##* }" ;; *) entries=0 ;; esac
       case "$kb" in ''|*[!0-9]*) kb="" ;; esac
+      # A tree we could size but not count still gets its bytes priced; the
+      # entry term simply contributes nothing rather than voiding the estimate.
+      case "$entries" in ''|*[!0-9]*) entries=0 ;; esac
       if [ -n "$kb" ] && [ "$kb" -gt 0 ]; then
-        UPGRADE_ETA_SECONDS=$(( kb / SNAPSHOT_KB_PER_SEC ))
+        UPGRADE_ETA_SECONDS=$(( kb / SNAPSHOT_KB_PER_SEC + entries / SNAPSHOT_ENTRIES_PER_SEC ))
       else
         UPGRADE_ETA_SECONDS=0
       fi
