@@ -463,7 +463,8 @@ GH_MIN_VERSION="2.60.0"
 
 # `gh version 2.45.0 (2024-03-04)` → `2.45.0`. Empty when the text is not gh's.
 gh_version_of() { # gh_version_of <`gh --version` output>
-  printf '%s\n' "${1:-}" | sed -n 's/^gh version \([0-9][0-9.]*\).*/\1/p' | head -1
+  local all; all="$(sed -n 's/^gh version \([0-9][0-9.]*\).*/\1/p' <<<"${1:-}")"
+  printf '%s\n' "${all%%$'\n'*}"
 }
 
 # Field-by-field numeric compare — `sort -V` is not everywhere, and a string
@@ -824,7 +825,7 @@ parse_admin() { # parse_admin <comma-list> — fills ADMIN_IDS + ADMIN_USERNAMES
     case "$item" in
       *[!0-9]*)
         item="${item#@}"   # exactly one leading @, and only in that position
-        printf '%s' "$item" | grep -qE '^[A-Za-z][A-Za-z0-9_]{4,31}$' || die \
+        grep -qE '^[A-Za-z][A-Za-z0-9_]{4,31}$' <<<"$item" || die \
 "--admin: \"${given}\" is neither of the two accepted forms.
     numeric Telegram id    123510069         (DM @userinfobot to get yours)
     Telegram username      vasily, @vasily   (5-32 chars, starts with a letter,
@@ -1865,7 +1866,7 @@ if [ "$INSTALL_MODE" = "systemd" ]; then
     BOT_TOKEN="$(ask 'Telegram bot token' '')"
   fi
   [ -n "$BOT_TOKEN" ] || die "a bot token is required."
-  echo "$BOT_TOKEN" | grep -qE '^[0-9]+:[A-Za-z0-9_-]+$' \
+  grep -qE '^[0-9]+:[A-Za-z0-9_-]+$' <<<"$BOT_TOKEN" \
     || warn "that token does not look like a @BotFather token — continuing, but check it if the bot stays silent."
 
   # Second attempt, now that $SUDO exists: on a re-run the install dir's .env is
@@ -1998,7 +1999,7 @@ resolve_image() { # resolve_image <channel> — echo repo@sha256:...
     "https://${registry}/v2/${name}/manifests/${channel}" 2>/dev/null || true)"
   digest="$(printf '%s' "$headers" | tr -d '\r' \
     | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | tail -1)"
-  printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || return 1
+  grep -Eq '^sha256:[0-9a-f]{64}$' <<<"$digest" || return 1
   printf '%s@%s\n' "$IMAGE_REPO" "$digest"
 }
 
@@ -2100,7 +2101,7 @@ if [ -z "$BOT_TOKEN" ]; then
   BOT_TOKEN="$(ask 'Telegram bot token' '')"
 fi
 [ -n "$BOT_TOKEN" ] || die "a bot token is required."
-echo "$BOT_TOKEN" | grep -qE '^[0-9]+:[A-Za-z0-9_-]+$' \
+grep -qE '^[0-9]+:[A-Za-z0-9_-]+$' <<<"$BOT_TOKEN" \
   || warn "that token does not look like a @BotFather token — continuing, but check it if the bot stays silent."
 
 # Admin, on a re-run: inherited from $INSTALL_DIR/.env unless --admin (or its env
@@ -2149,7 +2150,8 @@ case "$HTTPS_MODE" in
     # Caddy will ask Let's Encrypt for a cert and LE will come back to :80. If DNS
     # or the port is wrong, that fails minutes later inside a container log nobody
     # reads. Check it now, while there is still a human here to fix it.
-    resolved="$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -1 || true)"
+    resolved="$(getent hosts "$DOMAIN" 2>/dev/null || true)"
+    resolved="${resolved%%$'\n'*}"; resolved="${resolved%%[[:space:]]*}"
     public_ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
     if [ -z "$resolved" ]; then
       warn "$DOMAIN does not resolve yet. Add an A record → ${public_ip:-this host} and re-run."
@@ -2161,7 +2163,8 @@ case "$HTTPS_MODE" in
       ok "$DOMAIN → $resolved (this host)"
     fi
     for p in 80 443; do
-      if command -v ss >/dev/null 2>&1 && ss -ltn "( sport = :$p )" 2>/dev/null | grep -q ":$p"; then
+      listeners="$(command -v ss >/dev/null 2>&1 && ss -ltn "( sport = :$p )" 2>/dev/null || true)"
+      if grep -q ":$p" <<<"$listeners"; then
         die "port $p is already in use — free it (another web server?) or use --tunnel-token instead."
       fi
     done
