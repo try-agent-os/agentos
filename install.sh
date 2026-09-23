@@ -1840,16 +1840,45 @@ EOF
 # Missing visudo is first repaired, not reported: on an apt host the sudo
 # package is installed here (install_systemd already asks for it; this covers a
 # package step that did not deliver it).
+#
+# visudo is resolved by resolve_visudo, never by the operator's PATH alone: the
+# script runs as the operator ("as yourself, not under sudo"), and on Debian a
+# non-root PATH has no /usr/sbin, where visudo lives. A bare `command -v visudo`
+# there missed an installed sudo package, the apt repair changed nothing, and
+# the install exited 3 with "visudo not found" although the drop-in could have
+# been installed (12418agfzk9).
 HOST_AUTHORITY_MISSING=""
 EXIT_NO_HOST_AUTHORITY=3
+VISUDO=""
+# resolve_visudo → sets VISUDO to an absolute path to visudo, or returns 1.
+# Order: the caller's PATH; then the PATH the privileged side sees (sudo's
+# secure_path includes the sbin dirs); then the standard sbin dirs directly.
+# The fixed dirs sit under HOST_PREFIX ("" on a real install) so the test hook
+# can stand in a visudo that is on disk but not on PATH.
+resolve_visudo() {
+  local found d
+  VISUDO=""
+  found="$(command -v visudo 2>/dev/null || true)"
+  if [ -z "$found" ] && [ -n "${SUDO:-}" ]; then
+    found="$($SUDO -n sh -c 'command -v visudo' 2>/dev/null || true)"
+  fi
+  case "$found" in /*) ;; *) found="" ;; esac
+  if [ -z "$found" ]; then
+    for d in /usr/sbin /sbin /usr/local/sbin; do
+      if [ -x "${HOST_PREFIX}${d}/visudo" ]; then found="${HOST_PREFIX}${d}/visudo"; break; fi
+    done
+  fi
+  [ -n "$found" ] || return 1
+  VISUDO="$found"
+}
 install_selfmgmt_sudoers() {
   step "Host authority (sudoers)"
-  if ! command -v visudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+  if ! resolve_visudo && command -v apt-get >/dev/null 2>&1; then
     info "visudo not found — installing the sudo package"
     $SUDO apt-get -o DPkg::Lock::Timeout=300 install -y -qq sudo >/dev/null 2>&1 || true
     hash -r 2>/dev/null || true
   fi
-  if ! command -v visudo >/dev/null 2>&1; then
+  if ! resolve_visudo; then
     warn "visudo not found — the instance's sudoers drop-in was NOT installed."
     info "install the sudo package, then re-run to grant it."
     HOST_AUTHORITY_MISSING="visudo not found (the sudo package is not installed)"
@@ -1859,7 +1888,7 @@ install_selfmgmt_sudoers() {
   local tmp; tmp="$(mktemp)"
   render_selfmgmt_sudoers "$SERVICE_USER" "$SERVICE_NAME" "$SUDO_SCOPE" > "$tmp"
   # visudo -cf checks THIS file's syntax in isolation; -f names the file.
-  if ! $SUDO visudo -cf "$tmp" >/dev/null 2>&1; then
+  if ! $SUDO "$VISUDO" -cf "$tmp" >/dev/null 2>&1; then
     warn "generated sudoers failed visudo -cf — the sudoers drop-in was NOT installed (the node cannot sudo)."
     HOST_AUTHORITY_MISSING="the generated drop-in failed visudo -cf"
   # 0440 root:root is the required mode for a sudoers.d drop-in; `install`
