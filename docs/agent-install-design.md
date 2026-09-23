@@ -203,8 +203,9 @@ the node's own gates take care of it:
 
 - a filled `memory/owner.md` in the active context makes the wizard reply "done"
   and stop, instead of opening (`apps/api/src/core/onboarding/wizard.ts`,
-  `isProfileFilled`). **This is the gate this channel relies on**, and Phase 3
-  of the prompt exists partly to arm it;
+  `isProfileFilled`). **This is the gate this channel relies on**, and Phase 3B
+  of the prompt exists partly to arm it — on every brain path, including a repo
+  the owner brought, which is why that part is never skipped;
 - a context binding that is not the node's own local one makes the wizard skip
   permanently (`detectEstablishedNode`, `core/onboarding/local-context.ts`).
   That second gate does **not** fire on a fresh install through this channel:
