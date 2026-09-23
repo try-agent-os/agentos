@@ -39,8 +39,13 @@ Done means all four of these, not three:
 AgentOS on this box: `install.sh` from this repository. Do not download release
 tarballs, do not unpack anything by hand, do not write a systemd unit, do not
 start the image yourself. It verifies a SHA256 over the release tarball,
-validates its sudoers drop-in with `visudo -cf`, refuses to follow planted
-symlinks, and declines to move the version of an existing install. Hand-rolling
+validates its sudoers drop-in with `visudo -cf`, checks the directories it
+creates against planted symlinks, and declines to move the version of an
+existing install. (It does not yet close every link: the step that writes the
+merged secrets into `.env` still writes through a name the service account can
+reach — the script says so in its own comments, and it is filed as a bug. That
+is one more reason to let the script own the box, not a reason to trust a
+hand-rolled copy more.) Hand-rolling
 any step throws all of that away. If the script cannot do something you need,
 that is a bug worth reporting at `try-agent-os/agentos`, not a gap for you to
 fill.
@@ -75,10 +80,14 @@ it.
 
 **5. Never move an existing node's version.** If this box already has an
 install, a re-run refreshes configuration and deliberately keeps the installed
-version. Do not pass `--upgrade` to "get it current": moving versions runs
-forward-only migrations against a live database, and `agentos upgrade` is the
-path that snapshots it first and can roll back. Changing the owner's version is
-their decision, asked for in words, never your tidiness.
+version. Do not pass `--upgrade` to "get it current". The reason is not that
+`--upgrade` is unsafe everywhere: on the default (bare-metal systemd) profile it
+hands the version change to `agentos upgrade`, with the same pre-upgrade
+snapshot and health-gated auto-rollback. On the `--docker` profile it does not —
+there it moves the image under a live database whose migrations only run
+forward, and `agentos upgrade` is the path that backs the data up first. Either
+way, changing the owner's version is their decision, asked for in words, never
+your tidiness.
 
 **6. Ask before anything irreversible, act on everything else.** Creating a
 GitHub repository, granting the service account root, opening a firewall port,
@@ -176,7 +185,7 @@ do not invent an answer to a question in group A.
 |---|---|
 | The bot token from [@BotFather](https://t.me/BotFather) (`/newbot`) | It is created by a human in Telegram. The installer never validates it against Telegram — a wrong but well-formed token installs "fine" and the bot stays silent. |
 | Their numeric Telegram id from [@userinfobot](https://t.me/userinfobot), or their username | It becomes `--admin`. **Always pass it.** With no admin the node is UNCLAIMED and the first stranger who DMs it becomes its owner, once, with no time limit. |
-| Mini App, or bot only? | `--domain <host>` needs an A record already pointing at this box and ports 80+443 open; Caddy then gets a Let's Encrypt certificate. `--no-https` is a complete install — the bot long-polls Telegram and works behind NAT — it only costs the Mini App, which Telegram opens on a public `https` origin or not at all. Ask which they have, do not guess, and pass exactly one of the two: these flags are last-one-wins, not mutually exclusive, so passing both silently keeps only the last. |
+| Mini App, or bot only? | `--domain <host>` needs an A record already pointing at this box and ports 80+443 open; Caddy then gets a Let's Encrypt certificate. `--no-https` is a complete install — the bot long-polls Telegram and works behind NAT — it only costs the Mini App, which Telegram opens on a public `https` origin or not at all. Ask which they have, do not guess, and pass exactly one of the two. The script does not reject both, and the result is not clean either way round: `--no-https` switches Caddy off but leaves the domain set, so `MINIAPP_URL=https://<domain>/app` still lands in `.env` — no certificate, and a Mini App button that points nowhere. |
 | May the node have passwordless root on this box? | The default install grants the service account exactly that, because administering the box is the job. It is the one consent in this flow that cannot be taken back quietly. If the box hosts anything else, offer `--scoped-sudo`, which narrows the grant to restart/status/journal on its own unit. |
 
 **B. The brain**
@@ -214,11 +223,14 @@ conversation, not a form, and write down what you get:
 Two more, only if they already exist; never talk anyone into creating one now:
 
 - A **Claude setup token** (`claude setup-token`, run on *their own* machine,
-  never here) or an `ANTHROPIC_API_KEY`. Browser OAuth from a rented VPS does
-  not work — Anthropic refuses the flow from datacenter IPs — so a token they
-  generate locally is the path that actually completes. If they have one, it
-  goes in the secrets file and the node is thinking from its first minute; if
-  not, they connect it from Telegram in Phase 5.
+  never here) or an `ANTHROPIC_API_KEY`. Neither is required, and neither is
+  the better path: `/login` from Telegram in Phase 5 works from a rented VPS
+  too (the node runs the login in a terminal of its own and hands the owner the
+  URL), and it gives the node full `claude.ai` credentials. A setup token can
+  only make model requests — no Remote Control sessions, no `claude.ai`
+  connectors. If they already have a token and want the node thinking from its
+  first minute, it goes in the secrets file; otherwise leave it out and use
+  `/login`.
 - A **GitHub token** if you are creating or cloning a repo for them.
 
 ## Phase 2 — Write the secrets file
@@ -383,9 +395,16 @@ context. If instead you see that it was skipped as "not a git checkout", the
 clone did not happen — check the `--repo` warning in the install output, the
 token's scope (`repo`, `read:org`) and the URL, fix it, and re-run the
 installer. If the directory is a good checkout and the log says nothing at all,
-restart once (`agentos ctl restart --reason "adopt context"`) and look again:
-adoption happens at boot, and on a very first install the checkout can arrive
-after the registry has already been read.
+restart the node once and look again:
+
+```bash
+systemctl restart agentos
+```
+
+This is not a race, and it is expected after a re-run: adoption happens only at
+boot, and re-running the installer to add `--repo` clones the checkout without
+restarting a node that is already running. (On a named instance the unit is
+`agentos-<user>`.)
 
 ## Phase 6 — Make it useful today
 
@@ -457,7 +476,15 @@ command's own status and message. Read the message — it usually names the fix.
 Three habits that decide whether this goes well:
 
 - **Re-run the installer rather than repairing by hand.** It is idempotent,
-  keeps `.env` and data, skips work already done, and never moves the version.
+  keeps data, skips work already done, and never moves the version. Know what
+  it does to `.env`: the `--docker` profile keeps it and overrides only the keys
+  your flags name, but the default bare-metal profile **rewrites `.env` from the
+  flags of this run** — only the admin pair, the update policy and a fixed list
+  of context keys (`AGENTOS_REPO_DIR` among them) carry over. Anything else in
+  it — a token merged by an earlier `--secrets`, a key added by hand — is gone
+  unless this run brings it again. So re-run with the full set of flags and the
+  same secrets file the box was installed with, not just the one you are
+  changing.
   Hand-repair is how a box ends up in a state nobody can reproduce.
 - **Stop on anything that smells like integrity.** A checksum mismatch, a
   certificate error, a suggestion to skip verification: report and stop. That is
