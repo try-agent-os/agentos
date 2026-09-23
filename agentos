@@ -161,6 +161,33 @@ dotenv_val() { # dotenv_val <key> — the last assignment of <key> in .env, or e
     | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" || true
 }
 
+# The Node runtime the compiled sub-CLIs (`ctl`, `preset`, `routines`, `state`,
+# `sessions`, `mcp`, `import-history`) run under, in AGENTOS_NODE_BIN.
+#
+# The systemd install VENDORS its runtime at $AGENTOS_HOME/node/bin/node and
+# puts it on no PATH but the unit's own (scripts/release/agentos.service sets
+# Environment=PATH=… for the core). An operator's shell therefore has no `node`
+# at all, and a bare `exec node` here died with RC=127 — every sub-CLI on every
+# default install (ClickUp 12418agfwfq). The vendored runtime wins because it is
+# the one the core itself runs, so the sub-CLI and the node it talks to share a
+# Node major; a `node` on PATH is only the fallback for a source checkout or a
+# hand-built install that has no vendored tree. The vendored bin directory is
+# also prepended to PATH, so anything the CLI spawns resolves the same runtime.
+#
+# Sets a variable instead of printing one: die() inside $(…) would only end the
+# subshell, and the caller would then exec an empty string.
+resolve_node_bin() {
+  local vendored="$AGENTOS_HOME/node/bin/node"
+  if [ -x "$vendored" ]; then
+    AGENTOS_NODE_BIN="$vendored"
+    PATH="$AGENTOS_HOME/node/bin:$PATH"; export PATH
+  elif AGENTOS_NODE_BIN="$(command -v node 2>/dev/null)" && [ -n "$AGENTOS_NODE_BIN" ]; then
+    :
+  else
+    die "no Node runtime: neither $vendored nor \`node\` on PATH (re-run install.sh to restore the vendored runtime)"
+  fi
+}
+
 # One key into .env, atomically, without disturbing the file's identity.
 # Every step is checked and the ORIGINAL is only replaced by a complete temp
 # file, because the alternatives both lose data on a full disk: a `>` redirect
@@ -193,6 +220,49 @@ write_env_key() { # write_env_key <key> <value> — 0 only if .env now holds it
   chown --reference="$env_file" "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$env_file" || { rm -f "$tmp"; return 1; }
   return 0
+}
+
+# What `agentos ctl` / `agentos sessions` need from a node's .env to reach it,
+# supplied on a node that was installed without them (ClickUp 12418agfwfq).
+#
+# The CLIs find the node through AGENTOS_PEER_ENDPOINT_FILE (the core publishes
+# its EPHEMERAL loopback port there at boot) or a pinned MCP_PORT, and open the
+# console door with AGENTOS_NODE_KEY. install.sh wrote none of the three, so on
+# a default install `ctl status` answered "cannot tell where this node listens"
+# and, past that, "AGENTOS_NODE_KEY is not set" — the one command the install
+# guide recommends as the token-free health check did not work anywhere.
+# install.sh now writes both on a fresh install; THIS is the path for the nodes
+# that exist already, which get their changes through `agentos upgrade` and never
+# re-run the installer.
+#
+# Additive only: a key the operator set is never touched, and a pinned MCP_PORT
+# counts as "the node can be found" — adding an endpoint file next to it would
+# change nothing the CLI reads first. The node key is generated here and written
+# straight into the 0600 .env; it is never printed. Returns 0 when .env changed,
+# so the caller knows whether the running core still has the old environment.
+ensure_ctl_env() {
+  local env_file="$AGENTOS_HOME/.env" changed=1 data_dir key
+  [ -f "$env_file" ] || return 1
+  if [ -z "$(dotenv_val AGENTOS_PEER_ENDPOINT_FILE)" ] && [ -z "$(dotenv_val MCP_PORT)" ]; then
+    data_dir="$(dotenv_val AGENTOS_DATA_DIR)"
+    [ -n "$data_dir" ] || data_dir="$AGENTOS_HOME/data"
+    if write_env_key AGENTOS_PEER_ENDPOINT_FILE "$data_dir/peer-endpoint.json"; then
+      ok "AGENTOS_PEER_ENDPOINT_FILE set in .env — \`agentos ctl\` can now find the node's loopback port"
+      changed=0
+    else
+      warn "could not write AGENTOS_PEER_ENDPOINT_FILE into $env_file — \`agentos ctl\` will not find this node"
+    fi
+  fi
+  if [ -z "$(dotenv_val AGENTOS_NODE_KEY)" ]; then
+    key="$(od -An -tx1 -N32 /dev/urandom 2>/dev/null | tr -d ' \n' || true)"
+    if [ "${#key}" -eq 64 ] && write_env_key AGENTOS_NODE_KEY "$key"; then
+      ok "AGENTOS_NODE_KEY generated into .env — \`agentos ctl\` can now open the console door"
+      changed=0
+    else
+      warn "could not write AGENTOS_NODE_KEY into $env_file — \`agentos ctl\` will be refused by this node"
+    fi
+  fi
+  return "$changed"
 }
 
 # The five words the policy may be — the same enum the core's env schema accepts
@@ -1915,6 +1985,11 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     # much as any other. Idempotent: unchanged units mean no daemon-reload.
     reconcile_units "$AGENTOS_HOME/current/profiles" || warn "unit reconciliation hit a snag"
     reconcile_secret_reader_acls || warn "secret-reader ACL reconciliation hit a snag"
+    # Written, but the running core still has the environment it booted with, so
+    # say what makes it count rather than restarting a healthy node unasked.
+    if ensure_ctl_env; then
+      warn "the node reads .env at boot — run \`agentos restart\` for \`agentos ctl\` to reach it"
+    fi
     return 0
   fi
   tarball="$(jq -r .tarball <<<"$manifest")"
@@ -1982,6 +2057,9 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   # systemd) — and it is the unit set it installs, the .path watching this very
   # directory, that makes the inbox's absence matter.
   ensure_signal_dirs systemd
+  # Same moment and same reason: the core about to boot is the one that must
+  # publish its endpoint and know its key for `agentos ctl` to reach it.
+  ensure_ctl_env || true
   # A start that fails to ACTIVATE (non-zero systemctl) must land in the same
   # rollback below as a failed healthz — a bare call here would abort under
   # set -e with the node down and no rollback.
@@ -2725,7 +2803,8 @@ cmd_preset() {
         [ -f "$c" ] && { cli="$c"; break; }
       done
       [ -n "$cli" ] || die "preset CLI not found under $base (is the node installed?)"
-      exec node "$cli" "$@" ;;
+      resolve_node_bin
+      exec "$AGENTOS_NODE_BIN" "$cli" "$@" ;;
     none)
       die "no install found under $AGENTOS_HOME" ;;
   esac
@@ -2753,7 +2832,8 @@ cmd_routines() {
         [ -f "$c" ] && { cli="$c"; break; }
       done
       [ -n "$cli" ] || die "routines CLI not found under $base (is the node installed?)"
-      exec node "$cli" "$@" ;;
+      resolve_node_bin
+      exec "$AGENTOS_NODE_BIN" "$cli" "$@" ;;
     none)
       die "no install found under $AGENTOS_HOME" ;;
   esac
@@ -2792,7 +2872,8 @@ cmd_state() {
         [ -f "$c" ] && { cli="$c"; break; }
       done
       [ -n "$cli" ] || die "state CLI not found under $base (is the node installed?)"
-      exec node "$cli" "$@" ;;
+      resolve_node_bin
+      exec "$AGENTOS_NODE_BIN" "$cli" "$@" ;;
     none)
       die "no install found under $AGENTOS_HOME" ;;
   esac
@@ -2856,7 +2937,8 @@ cmd_ctl() {
         [ -f "$c" ] && { cli="$c"; break; }
       done
       [ -n "$cli" ] || die "ctl CLI not found under $base (is the node installed?)"
-      exec node "$cli" "$@" ;;
+      resolve_node_bin
+      exec "$AGENTOS_NODE_BIN" "$cli" "$@" ;;
     none)
       die "no install found under $AGENTOS_HOME" ;;
   esac
@@ -2891,7 +2973,8 @@ cmd_sessions() {
         [ -f "$c" ] && { cli="$c"; break; }
       done
       [ -n "$cli" ] || die "sessions CLI not found under $base (is the node installed?)"
-      exec node "$cli" "$@" ;;
+      resolve_node_bin
+      exec "$AGENTOS_NODE_BIN" "$cli" "$@" ;;
     none)
       die "no install found under $AGENTOS_HOME" ;;
   esac
@@ -2944,7 +3027,8 @@ cmd_mcp() {
       export AGENTOS_NODE_KEY AGENTOS_PEER_ENDPOINT_FILE
       export AGENTOS_DIR="${AGENTOS_DIR:-$AGENTOS_HOME}"
       [ -n "${AGENTOS_MCP_CLIENT_LABEL:-}" ] && export AGENTOS_MCP_CLIENT_LABEL
-      exec node "$cli" "$@" ;;
+      resolve_node_bin
+      exec "$AGENTOS_NODE_BIN" "$cli" "$@" ;;
     none)
       die "no install found under $AGENTOS_HOME" ;;
   esac
@@ -2968,7 +3052,8 @@ cmd_import_history() { # agentos import-history --from <path> --chat <id> [--dry
         [ -f "$c" ] && { cli="$c"; break; }
       done
       [ -n "$cli" ] || die "import-history CLI not found under $base (is the node installed?)"
-      exec node "$cli" "$@" ;;
+      resolve_node_bin
+      exec "$AGENTOS_NODE_BIN" "$cli" "$@" ;;
     none)
       die "no install found under $AGENTOS_HOME" ;;
   esac
