@@ -1164,7 +1164,12 @@ write_env_systemd() {
     SYNC_SUBMODULE_DEPTH:AGENTOS_SYNC_SUBMODULE_DEPTH \
     SYNC_SUBMODULE_TIMEOUT_MS:AGENTOS_SYNC_SUBMODULE_TIMEOUT_MS \
     DEPS_ENABLED:AGENTOS_DEPS_ENABLED GITHUB_TOKEN:AGENTOS_GITHUB_TOKEN \
-    AUTH_PTY:AGENTOS_AUTH_PTY STATE_MARKER:AGENTOS_STATE_MARKER; do
+    AUTH_PTY:AGENTOS_AUTH_PTY STATE_MARKER:AGENTOS_STATE_MARKER \
+    NODE_KEY:AGENTOS_NODE_KEY PEER_ENDPOINT_FILE:AGENTOS_PEER_ENDPOINT_FILE \
+    MCP_PORT:MCP_PORT; do
+    # The last three are what `agentos ctl` reaches the node with (ClickUp
+    # 12418agfwfq). Carried across a re-run like the rest: a re-run that minted a
+    # NEW node key would silently lock out every script that holds the old one.
     suffix="${pair%%:*}"; canonical="${pair#*:}"; legacy="RECE$(printf %s IVER_)${suffix}"
     value="$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null | sed -n "s/^${canonical}=//p" | tail -1 || true)"
     [ -n "$value" ] || value="$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null | sed -n "s/^${legacy}=//p" | tail -1 || true)"
@@ -1210,6 +1215,24 @@ AGENTOS_SIGNAL_INBOX=${INSTALL_DIR}/signals
 AGENTOS_SIGNAL_OUTBOX=${HOST_PREFIX}/var/lib/${SERVICE_NAME}/outbox
 EOF
   [ -n "$preserved" ] && printf '%s' "$preserved" | $SUDO tee -a "$INSTALL_DIR/.env" >/dev/null
+  # Without these two `agentos ctl status` — the token-free health check the
+  # install guide recommends — answered "cannot tell where this node listens",
+  # and past that "AGENTOS_NODE_KEY is not set", on every default install
+  # (ClickUp 12418agfwfq). The endpoint file sits in the data directory the
+  # service account owns, so the core can write it at boot; the key is generated
+  # straight into the 0600 file and never echoed. A pinned MCP_PORT already says
+  # where the node listens, so it suppresses the endpoint default. Existing nodes
+  # get the same two through `agentos upgrade` (ensure_ctl_env, scripts/agentos).
+  case "$preserved" in
+    *AGENTOS_PEER_ENDPOINT_FILE=*|*MCP_PORT=*) ;;
+    *) echo "AGENTOS_PEER_ENDPOINT_FILE=${INSTALL_DIR}/data/peer-endpoint.json" \
+         | $SUDO tee -a "$INSTALL_DIR/.env" >/dev/null ;;
+  esac
+  case "$preserved" in
+    *AGENTOS_NODE_KEY=*) ;;
+    *) { printf 'AGENTOS_NODE_KEY='; od -An -tx1 -N32 /dev/urandom | tr -d ' \n'; echo; } \
+         | $SUDO tee -a "$INSTALL_DIR/.env" >/dev/null ;;
+  esac
   # The alert label (default_instance_label above): an operator's own value
   # survives a re-run, otherwise a named instance gets its unit name.
   if [ -n "$instance" ]; then
