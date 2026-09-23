@@ -248,7 +248,9 @@ routines. Offer three, in this order:
    `my-agent`, and let them change it). Ask for both now; `gh repo create
    <owner>/<name>` needs them, and the name also fixes the checkout path in
    Phase 2.
-2. **A repo they already have.** Take the clone URL.
+2. **A repo they already have.** Take the clone URL. Phase 3 still writes the
+   charter and the owner profile into it if they are missing, so the GitHub
+   token needs write access to it too.
 3. **Local for now** — a checkout on this box only. It works; it just means the
    brain lives on one disk and dies with it.
 
@@ -350,27 +352,57 @@ clones. For a plain install and a repo called `my-agent` that comes out as
 
 For the **local-only** brain, create the checkout yourself before installing —
 `git init`, the template's layout, a first commit — and point `AGENTOS_REPO_DIR`
-at it. A directory without `.git` is not adopted; it is skipped with a line in
-the log saying so.
+at it. Phase 3B then fills its required files in place. A directory without
+`.git` is not adopted; it is skipped with a line in the log saying so.
 
-## Phase 3 — Create the brain
+## Phase 3 — The brain
 
-Skip this if the owner brought their own repo; use their URL instead.
+Two parts, and only the first one is optional. **3A creates the repository**;
+skip it when the owner brought their own. **3B fills the files that make a
+repository a brain**, and it is never skipped — whichever of the three Phase 1B
+options the owner picked. An existing repository is the case that needs 3B the
+most: it arrives with whatever its owner happened to put in it, which is usually
+no charter and no owner profile at all.
+
+### 3A. Create the repository (skip if they brought their own)
 
 `<owner>` and `<name>` are the two names you asked for in Phase 1B; do not
 guess the owner from `gh api user` when the owner said an organisation.
 
+- **A new repo from the template:**
+
+  ```bash
+  gh repo create <owner>/<name> --private --template try-agent-os/claude-code-template
+  gh repo clone <owner>/<name> /tmp/brain
+  ```
+
+- **A repo they already have:** no creation, only a working copy for 3B —
+  `gh repo clone <their-url> /tmp/brain`. Their URL is what `--repo` gets in
+  Phase 4.
+- **Local for now:** the checkout you created in Phase 2 *is* the brain. Work in
+  it directly wherever 3B says `/tmp/brain`.
+
+### 3B. Fill the required files (never skip)
+
+First look at what is there — do not assume the template's layout, and do not
+assume it is missing either:
+
 ```bash
-gh repo create <owner>/<name> --private --template try-agent-os/claude-code-template
-gh repo clone <owner>/<name> /tmp/brain
+cd /tmp/brain
+for f in CLAUDE.md memory/owner.md memory/owner._template.md; do
+  [ -f "$f" ] && echo "HAVE $f" || echo "NO   $f"
+done
 ```
 
-Fill it in from Phase 1C, in the two files the template keeps for exactly this:
+Two files are required, and what you do with each depends on that listing. An
+existing file is the owner's: complete it, never replace it.
 
-- **`memory/owner.md`** — copy `memory/owner._template.md` and write the real
-  answers into it: name, preferred name, timezone, role, how they want updates
-  delivered, what they are working on now, the people who matter. Short and
-  true beats long and padded.
+- **`memory/owner.md`** — missing: copy `memory/owner._template.md` if the repo
+  has one, or create `memory/` and the file yourself with the frontmatter shown
+  below. Present: keep its body and fill only what is empty. Either way, write
+  the real answers from Phase 1C into it: name, preferred name, timezone, role,
+  how they want updates delivered, what they are working on now, the people who
+  matter. Short and true beats long and padded.
 
   **Fill the YAML frontmatter, not only the prose below it.** The template opens
   with a fence of empty strings, and the node reads exactly three keys out of
@@ -394,10 +426,27 @@ Fill it in from Phase 1C, in the two files the template keeps for exactly this:
 - **`CLAUDE.md`** — the charter. Set the working language, name the two or three
   jobs from Phase 1C, and write the standing consent as a rule the agent can
   actually apply ("act on reversible things and report; ask before anything
-  outward-facing").
+  outward-facing"). Missing: write it. Present — the owner's own repo often has
+  one written for other work: leave what is there, add what is not (language,
+  jobs, consent) as a section of its own, and tell the owner what you added.
 
-Then commit and push. Do not put a token, a key, or anything from the secrets
-file in this repository.
+Check the result before you commit, not after the node has greeted anyone:
+
+```bash
+head -n 1 memory/owner.md                       # exactly: ---
+awk 'NR>1 && /^---$/ {exit} NR>1' memory/owner.md \
+  | grep -E '^(name|preferred_name|timezone):'  # three lines, none of them ""
+test -s CLAUDE.md && echo "charter ok"
+```
+
+Then commit and push — before Phase 4, because `--repo` clones whatever is on
+the remote at that moment, and a brain that reaches the node without these two
+files is exactly the adoption this part exists to prevent. For a local-only
+brain, commit; there is nothing to push. If the push to the owner's own repo is
+refused (a token without write access, a protected default branch), do not
+install around it: tell the owner which of the two they need to change, or
+offer the template path instead. Do not put a token, a key, or anything from
+the secrets file in this repository.
 
 That filled `memory/owner.md` is load-bearing beyond being useful: the node's
 own chat onboarding treats a filled owner profile as proof that onboarding
