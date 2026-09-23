@@ -52,6 +52,47 @@ fetch_manifest() { # → stable.json on stdout
   curl -fsSL --max-time 30 "$CHANNEL_URL" || die "cannot fetch channel manifest: $CHANNEL_URL"
 }
 
+# One release asset from the GitHub release, retried with a doubling backoff.
+#
+# Why a retry at all: GitHub publishes a release, and the channel manifest that
+# names it becomes readable, BEFORE its large assets have finished uploading. On
+# 2026-09-21 stable.json for v4.20.1 was served at 15:23:56Z while the 560 MB
+# tarball it declares only landed at 15:24:20Z — and every node that polled in
+# between got a 404 from a single `curl -f`, which was then its whole upgrade
+# (ClickUp 12418agfr7m). A few spaced attempts absorb that race on the spot.
+# Every attempt starts from scratch (curl truncates -o), so a partial file from
+# a failed attempt never reaches the checksum.
+#
+# On the final failure it DIES with the fixed prefix "release download failed"
+# and says that nothing was touched. That prefix is a contract: the unattended
+# poller (scripts/agentos-autoupdate.sh) reads it to tell "the release could not
+# be fetched" from "the release failed its health gate" — only the second may
+# blacklist the release on this node. Retry chatter goes to stderr so a caller
+# capturing stdout (the manifest fetch) only ever receives the asset itself.
+#
+# AGENTOS_FETCH_ATTEMPTS (default 6) and AGENTOS_FETCH_RETRY_DELAY (seconds,
+# default 5, doubling: 5+10+20+40+80 = 155 s of waiting at most) tune it.
+fetch_release_asset() { # fetch_release_asset <what> <url> [outfile]  — no outfile = stdout
+  local what="$1" url="$2" out="${3:-}" attempts delay n=1 rc
+  attempts="${AGENTOS_FETCH_ATTEMPTS:-6}"; delay="${AGENTOS_FETCH_RETRY_DELAY:-5}"
+  case "$attempts" in ''|*[!0-9]*|0) attempts=6 ;; esac
+  case "$delay" in ''|*[!0-9]*) delay=5 ;; esac
+  local -a dest=()
+  [ -n "$out" ] && dest=(-o "$out")
+  while :; do
+    rc=0
+    curl -fsSL "$url" "${dest[@]+"${dest[@]}"}" || rc=$?
+    [ "$rc" = 0 ] && return 0
+    if [ "$n" -ge "$attempts" ]; then
+      UPGRADE_FETCH_FAILED=1   # read by upgrade_abort_report (manual path); lost in a $(…) — callers re-set it
+      die "release download failed: could not fetch ${what} from ${url} (curl exit ${rc}, ${attempts} attempt(s)) — nothing was stopped or replaced, the running release is untouched"
+    fi
+    echo "  ! download of ${what} failed (curl exit ${rc}, attempt ${n}/${attempts}) — retrying in ${delay}s" >&2
+    sleep "$delay"
+    n=$((n + 1)); delay=$((delay * 2))
+  done
+}
+
 wait_healthz() {
   for _ in $(seq 1 45); do
     curl -fsS --max-time 3 "http://127.0.0.1:${AGENTOS_PORT:-8787}/healthz" >/dev/null 2>&1 && return 0
@@ -1153,8 +1194,9 @@ docker_upgrade() { # docker_upgrade [tag] [image-ref]  — empty tag = latest st
     image="$image_ref"
   else
     if [ -n "$to" ]; then
-      manifest="$(curl -fsSL "https://github.com/${DIST_REPO}/releases/download/${to}/stable.json")" \
-        || die "no stable.json for ${to}"
+      manifest="$(fetch_release_asset "stable.json for ${to}" \
+        "https://github.com/${DIST_REPO}/releases/download/${to}/stable.json")" \
+        || { UPGRADE_FETCH_FAILED=1; die "no stable.json for ${to}"; }
     else
       manifest="$(fetch_manifest)"
     fi
@@ -1966,8 +2008,9 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   local to="${1:-}" manifest tag tarball sha url prev tmp_dir snap started
   local stop_epoch snap_started snap_seconds
   if [ -n "$to" ]; then
-    manifest="$(curl -fsSL "https://github.com/${DIST_REPO}/releases/download/${to}/stable.json")" \
-      || die "no stable.json for ${to}"
+    manifest="$(fetch_release_asset "stable.json for ${to}" \
+      "https://github.com/${DIST_REPO}/releases/download/${to}/stable.json")" \
+      || { UPGRADE_FETCH_FAILED=1; die "no stable.json for ${to}"; }
   else
     manifest="$(fetch_manifest)"
   fi
@@ -2006,13 +2049,21 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     # `local` has unwound, so `$tmp_dir` is unbound (the trap aborts with
     # "tmp_dir: unbound variable" and the versions/.tmp-<tag> staging dir is
     # left behind after a failed unpack).
-    trap "rm -rf '$tmp_dir'" EXIT
+    #
+    # The trap is SHARED with upgrade_abort_report, which `manual-upgrade` arms
+    # before the engine runs: bash keeps one EXIT trap, and a bare `trap … EXIT`
+    # here silently replaced it — so a /update press whose download or unpack
+    # failed left no result.json at all, and after `trap - EXIT` neither did a
+    # later failed health gate (ClickUp 12418agfr7m). Chain to it, handing it
+    # the exit status as an argument (a `(exit $rc)` would trip errexit inside
+    # the trap), and give the trap back to it once staging is done.
+    trap "rc=\$?; rm -rf '$tmp_dir'; upgrade_abort_report \$rc" EXIT
     mkdir -p "$tmp_dir"
-    curl -fsSL "$url" -o "$tmp_dir/${tarball}"
+    fetch_release_asset "$tarball" "$url" "$tmp_dir/${tarball}"
     echo "${sha}  $tmp_dir/${tarball}" | sha256sum -c - || die "tarball checksum mismatch"
     tar --use-compress-program=unzstd -xf "$tmp_dir/${tarball}" -C "$tmp_dir"
     rm -f "$tmp_dir/${tarball}"
-    trap - EXIT
+    if [ -n "${MANUAL_UPGRADE_TO:-}" ]; then trap upgrade_abort_report EXIT; else trap - EXIT; fi
     mv "$tmp_dir" "$AGENTOS_HOME/versions/$tag"   # atomic: versions/$tag only ever appears fully populated
   fi
 
@@ -2487,17 +2538,25 @@ EOF
 # outcome in the outbox, so the reply is not silence. A handler rather than a
 # check after the call is also what covers the deaths that are not returns at
 # all: the unit's TimeoutStartSec, an OOM, an operator's Ctrl-C.
-UPGRADE_CHAIN_N=0; UPGRADE_CHAIN_TOTAL=0; UPGRADE_CHAIN_HOP=""
+UPGRADE_CHAIN_N=0; UPGRADE_CHAIN_TOTAL=0; UPGRADE_CHAIN_HOP=""; UPGRADE_FETCH_FAILED=0
 MANUAL_UPGRADE_FROM=""; MANUAL_UPGRADE_TO=""
-upgrade_abort_report() {
-  local rc=$?
+upgrade_abort_report() { # upgrade_abort_report [exit-status]  — default: $? at the call
+  local rc="${1:-$?}"
   [ "$rc" = 0 ] && return 0
   if [ "${UPGRADE_CHAIN_TOTAL:-0}" -gt 1 ]; then
     warn "hop ${UPGRADE_CHAIN_N}/${UPGRADE_CHAIN_TOTAL} (${UPGRADE_CHAIN_HOP}) did not complete — the chain stops here. The node is on the last release that came up healthy; nothing after ${UPGRADE_CHAIN_HOP} was attempted."
   fi
   if [ -n "${MANUAL_UPGRADE_TO:-}" ]; then
-    write_upgrade_result rolled-back "$MANUAL_UPGRADE_FROM" "$MANUAL_UPGRADE_TO" \
-      "a hop did not complete; see journalctl -u ${AGENTOS_SERVICE}"
+    if [ "${UPGRADE_FETCH_FAILED:-0}" = 1 ]; then
+      # The release could not be downloaded: the engine died before it stopped
+      # anything, so there is no rollback to report and no health gate that
+      # failed — saying so would send the owner looking for a bad release
+      # (ClickUp 12418agfr7m). Same reason string as the unattended poller.
+      write_upgrade_result failed-no-rollback "$MANUAL_UPGRADE_FROM" "$MANUAL_UPGRADE_TO" "fetch-failed"
+    else
+      write_upgrade_result rolled-back "$MANUAL_UPGRADE_FROM" "$MANUAL_UPGRADE_TO" \
+        "a hop did not complete; see journalctl -u ${AGENTOS_SERVICE}"
+    fi
   fi
   return 0
 }
