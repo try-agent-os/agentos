@@ -1293,30 +1293,32 @@ UPGRADE_TIMING_WINDOW=3
 # megabyte. A bytes-only model cannot see that, so it under-promised by 3.5x
 # and the owner was told a number that was never achievable.
 #
-# 50 MiB/s stays as the BULK-BYTES rate: it is right for the few-large-files
-# node, and on that shape the entry term rounds to nothing.
+# The rates were first calibrated (50 MiB/s, 400 entries/s) against a `du`
+# count of the whole of data/, which charged a hard-linked inode once and so
+# saw 375539 entries where the copy walked 850620 paths. Since 12418agfvup the
+# estimate counts the snapshot's own path LIST (snapshot_plan: every path the
+# copy will create, no dedup), so the rates are re-derived against paths, from
+# two copies of the hub's contexts tree taken on the hub on 2026-09-23:
 #
-# 400 entries/s is calibrated against what snapshot_input can actually COUNT,
-# which is not the number of paths: `du` charges a hard-linked inode once, so
-# it saw 375539 entries where find saw 850620 paths (pnpm-style stores hardlink
-# heavily). The rate is those 375539 countable entries over what is LEFT of the
-# outage once the bytes term is paid: 375539 / (1003 - 285) -> ~523/s. NOT
-# 375539/1003 (= 374/s) — that charges the entries for seconds the bytes term
-# already accounts for, and a future recalibration reading this comment must
-# repeat the subtraction, not the whole number. 400 is ~523 rounded DOWN for
-# margin. (A cleaner base, if this is ever redone: the node records
-# `snapshot_seconds` separately — 876 here — which excludes the stop/start that
-# 1003 still contains.) Calibrate to the
-# number the code can see, never to the one it cannot.
+#   186306 paths, 10688772 KB  (node_modules left out)        -> 208 s
+#    45125 paths,  7072874 KB  (the full snapshot_plan list)  ->  66 s
 #
-# Against the measurement that motivated this: 14592924/51200 + 375539/400
-# = 285 + 938 = 1223 s announced vs 1003 s actual. Announced now EXCEEDS
-# reality, which is the safe side, and stays under UPGRADE_ETA_CEILING.
+# Solving the pair gives ~286 MB/s and ~1090 paths/s. The same two rates price
+# the cold 4.29.0 -> 4.32.2 snapshot (~870k paths, ~14.4 GB) at ~850 s against
+# the 879 s it took, so they are not a warm-cache artefact. Both are rounded
+# DOWN for margin — 200 MiB/s and 800 paths/s — which announces ~91 s for the
+# 66 s list copy and ~1160 s for the old 879 s tree: over-promised silence,
+# never under-promised.
+#
+# Against the measurement that first motivated the entry term: announced now
+# EXCEEDS reality, which is the safe side, and stays under UPGRADE_ETA_CEILING.
 # Over-promising speed is the failure mode that hurts — an owner told "about a
 # minute" who then waits ten is exactly where this task started. Over-promising
-# SILENCE just ends early.
-SNAPSHOT_KB_PER_SEC=51200
-SNAPSHOT_ENTRIES_PER_SEC=400
+# SILENCE just ends early. Calibrate to the number the code can see, never to
+# the one it cannot; a recalibration must solve against BOTH terms, not charge
+# one term for seconds the other already accounts for.
+SNAPSHOT_KB_PER_SEC=204800
+SNAPSHOT_ENTRIES_PER_SEC=800
 # Bounds. The floor applies to EVERY source — the stop/start alone is not free,
 # and "about 0 s" is not a window anyone can plan around. The ceiling applies
 # only to the GUESS: a measured window of forty minutes is a fact and should be
@@ -1327,24 +1329,227 @@ UPGRADE_ETA_FLOOR=30
 UPGRADE_ETA_CEILING=1800
 UPGRADE_ETA_HARD_CAP=86400
 
+# ── what the pre-upgrade snapshot copies (ClickUp 12418agfvup) ──────────────
+#
+# THE MEASUREMENT THIS EXISTS FOR (hub, 4.29.0 -> 4.32.2, 2026-09-23): a 14 GB
+# snapshot, `snapshot_seconds` 879 of a 901 s outage. The database was 1.7 GB
+# of it. The rest was the context TREE — ~870k paths under contexts/, of which
+# 682k were node_modules and ~140k were the working trees of ~40 linked git
+# worktrees (a full checkout of the context repo each). A copy pays per path,
+# so the snapshot's cost was almost entirely things git or a package manager
+# rebuilds on demand.
+#
+# So the snapshot is now an explicit LIST of paths, built by snapshot_plan and
+# used twice: the estimate before the stop counts it, the copy after the stop
+# copies exactly it. What stays out:
+#
+#   1. Directories named in SNAPSHOT_REBUILDABLE_DIRS, anywhere under the copied
+#      items. They are install/build output: a rollback node reinstalls them on
+#      the next `pnpm install`, and nothing in them is history.
+#
+#   2. The CLEAN TRACKED files of a linked git worktree (a tree whose `.git` is a
+#      file and whose git dir differs from its common dir), when that common dir
+#      lives inside contexts/ and is therefore copied in full. Every commit such
+#      a tree ever made — pushed or not — is an object in that common dir, its
+#      HEAD and its index are in <common>/worktrees/<name>/, and a clean tracked
+#      file is by definition byte-for-byte the index blob. What the snapshot
+#      keeps of the tree is exactly what git CANNOT rebuild: the `.git` link,
+#      modified and untracked files, ignored files (a local .env is ignored, not
+#      rebuildable), populated submodule checkouts, and the list of tracked
+#      files deleted in the tree. systemd_restore_sqlite puts the clean files
+#      back from the index (snapshot_rehydrate), so a rolled-back worktree is the
+#      tree that was stopped, uncommitted edits included.
+#
+# Why not "copy the .git and drop the working tree" or "git bundle what is
+# unpushed" (the two options the task offered): both keep the history and both
+# lose the uncommitted edits in a live worktree — the factory reuses one tree per
+# task across rounds and protects exactly those edits from its own GC. The
+# dirty-set copy keeps them for a few hundred paths per tree.
+#
+# Main checkouts and submodule checkouts are still copied whole (minus 1.): they
+# ARE the common dir, and their working tree is ~5% of the paths.
+#
+# Every git call runs as the node's service account, never as root: `ls-files`
+# may run a repository's configured clean filter or fsmonitor, and a repository
+# under contexts/ is agent-writable — root must not execute its config. A tree
+# git cannot be asked about (no git, no account, any error) is copied whole: the
+# optimisation may be lost, the data never.
+SNAPSHOT_REBUILDABLE_DIRS="node_modules .turbo .pnpm-store"
+SNAPSHOT_ITEMS="messages.db messages.db-wal messages.db-shm search.db .aop contexts"
+# Inside a snapshot dir: the list of rehydratable trees and their deletions.
+# Never copied back into data/ (systemd_restore_sqlite removes it there).
+SNAPSHOT_MANIFEST=".agentos-snapshot"
+
+snapshot_as_account() { # snapshot_as_account <cmd...> — run as the service account; fails when that is impossible
+  if [ "${EUID:-$(id -u 2>/dev/null || echo 0)}" != 0 ]; then
+    "$@"
+    return
+  fi
+  command -v runuser >/dev/null 2>&1 || return 1
+  # runuser keeps root's HOME, and git ABORTS (not warns) on a global config it
+  # may not read — /root/.gitconfig is exactly that for the service account.
+  # A HOME that does not exist is read as "no global config" instead.
+  runuser -u "$AGENTOS_ACCOUNT" -- env HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent "$@"
+}
+
+snapshot_git() { # snapshot_git <tree> <git args...> — git in <tree> as the service account, no locks, no fsmonitor
+  local tree="$1"; shift
+  GIT_OPTIONAL_LOCKS=0 snapshot_as_account git -c core.fsmonitor=false -C "$tree" "$@"
+}
+
+snapshot_glob_quote() { # snapshot_glob_quote <path> — escape find -path glob metacharacters
+  printf '%s' "$1" | sed 's/[][*?\\]/\\&/g'
+}
+
+# snapshot_plan <data-dir> <plan-dir> — writes into <plan-dir>:
+#   list     NUL-separated paths relative to <data-dir>: every entry to copy
+#            (directories included, the copy runs --no-recursion)
+#   trees    one linked worktree per line (relative), rehydrated on restore
+#   deleted/<n>  NUL list of tracked paths deleted in tree n (line n of trees)
+# Empty list when <data-dir> is missing. Never fails on a git problem — that
+# tree is copied whole instead.
+snapshot_plan() {
+  local data="$1" plan="$2" item name w common rel n=0 accepted p
+  local -a prune=() items=() linked=()
+  mkdir -p "$plan/deleted"
+  : > "$plan/list"; : > "$plan/trees"
+  [ -d "$data" ] || return 0
+  for item in $SNAPSHOT_ITEMS; do
+    { [ -e "$data/$item" ] || [ -L "$data/$item" ]; } && items+=("$item")
+  done
+  [ "${#items[@]}" -gt 0 ] || return 0
+  for name in $SNAPSHOT_REBUILDABLE_DIRS; do
+    prune+=(-o -name "$name")
+  done
+  prune=("${prune[@]:1}")
+
+  # Linked worktrees. Sorted, so a tree nested inside an accepted one is seen
+  # after it and left alone: the outer tree's untracked listing already copies it.
+  if [ -d "$data/contexts" ] && command -v git >/dev/null 2>&1; then
+    while IFS= read -r -d '' p; do
+      w="${p%/.git}"
+      case "$w" in *$'\n'*) continue ;; esac
+      accepted=0
+      for rel in "${linked[@]+"${linked[@]}"}"; do
+        case "$w/" in "$rel"/*) accepted=1; break ;; esac
+      done
+      [ "$accepted" = 0 ] || continue
+      common="$(snapshot_git "$data/$w" rev-parse --path-format=absolute --git-dir --git-common-dir 2>/dev/null)" || continue
+      # two lines: git dir, common dir; linked iff they differ
+      [ "${common%%$'\n'*}" != "${common#*$'\n'}" ] || continue
+      common="${common#*$'\n'}"
+      case "$common" in "$(cd "$data/contexts" && pwd -P)"/*) ;; *) continue ;; esac
+      # The tree's own share of the list. Any failure leaves it copied whole.
+      if snapshot_tree_members "$data" "$w" "$plan/tree.members" "$plan/deleted/$n"; then
+        linked+=("$w")
+        printf '%s\n' "$w" >> "$plan/trees"
+        cat "$plan/tree.members" >> "$plan/tree.all"
+        n=$((n + 1))
+      fi
+      rm -f "$plan/tree.members"
+    done < <(cd "$data" && find contexts \( -type d \( "${prune[@]}" -o -name .git \) \) -prune \
+               -o -type f -name .git -print0 2>/dev/null | LC_ALL=C sort -z)
+  fi
+
+  # Everything outside the linked trees, minus the rebuildable dirs.
+  local -a skip=()
+  for rel in "${linked[@]+"${linked[@]}"}"; do
+    skip+=(-o -path "$(snapshot_glob_quote "$rel")")
+  done
+  (cd "$data" && find "${items[@]}" \( -type d \( "${prune[@]}" "${skip[@]+"${skip[@]}"}" \) \) -prune \
+     -o -print0) >> "$plan/list"
+  if [ -f "$plan/tree.all" ]; then
+    cat "$plan/tree.all" >> "$plan/list"
+    rm -f "$plan/tree.all"
+  fi
+  return 0
+}
+
+# snapshot_tree_members <data> <tree-rel> <members-out> <deleted-out> — the
+# entries of one linked worktree git cannot rebuild, expanded (NUL, relative
+# to <data>), plus its deleted-tracked list. Non-zero on any git failure.
+snapshot_tree_members() {
+  local data="$1" w="$2" out="$3" del="$4" name mode rest
+  local -a prune=() roots=()
+  for name in $SNAPSHOT_REBUILDABLE_DIRS; do prune+=(-o -name "$name"); done
+  prune=("${prune[@]:1}")
+  # Captured to files first: a process substitution swallows git's exit code,
+  # and a listing that failed half-way must void the optimisation, not shrink
+  # the snapshot.
+  # Untracked and IGNORED (no --exclude-standard: an ignored .env is data),
+  # whole untracked directories as one entry.
+  snapshot_git "$data/$w" ls-files -z -o --directory > "$out.o" 2>/dev/null || return 1
+  # Modified tracked files (-m also reports deleted ones; those do not exist).
+  snapshot_git "$data/$w" ls-files -z -m > "$out.m" 2>/dev/null || return 1
+  # Populated submodule checkouts: a gitlink's files are not index blobs of
+  # this tree, so checkout-index could not bring them back.
+  snapshot_git "$data/$w" ls-files -z -s > "$out.s" 2>/dev/null || return 1
+  snapshot_git "$data/$w" ls-files -z -d > "$del" 2>/dev/null || return 1
+  roots=(.git)
+  while IFS= read -r -d '' name; do roots+=("${name%/}"); done < "$out.o"
+  while IFS= read -r -d '' name; do roots+=("$name"); done < "$out.m"
+  while IFS= read -r -d '' rest; do
+    mode="${rest%% *}"; name="${rest#*$'\t'}"
+    [ "$mode" = 160000 ] && roots+=("$name")
+  done < "$out.s"
+  rm -f "$out.o" "$out.m" "$out.s"
+  : > "$out"
+  # The tree's own directory entry first, so its mode and owner survive.
+  printf '%s\0' "$w" >> "$out"
+  (cd "$data" && for name in "${roots[@]}"; do
+     # Deleted-tracked paths from -m and unpopulated gitlinks do not exist.
+     { [ -e "$w/$name" ] || [ -L "$w/$name" ]; } || continue
+     find "$w/$name" \( -type d \( "${prune[@]}" \) \) -prune -o -print0
+   done) >> "$out" || return 1
+  return 0
+}
+
+# snapshot_rehydrate <data-dir> <manifest-dir> — after a restore, put back the
+# clean tracked files of every linked worktree the snapshot recorded, then
+# re-delete what was deleted there. Best effort per tree: the history is
+# already safe in the common dir, so a tree that cannot be rehydrated is
+# reported, not fatal.
+snapshot_rehydrate() {
+  local data="$1" manifest="$2" w n=0
+  [ -f "$manifest/trees" ] || return 0
+  while IFS= read -r w; do
+    if [ -n "$w" ] && [ -e "$data/$w/.git" ]; then
+      if snapshot_git "$data/$w" ls-files -z -d 2>/dev/null \
+          | snapshot_git "$data/$w" checkout-index -q -z --stdin 2>/dev/null; then
+        if [ -s "$manifest/deleted/$n" ]; then
+          (cd "$data/$w" && xargs -0 rm -f -- < "$manifest/deleted/$n") || true
+        fi
+      else
+        warn "could not rebuild the working tree of $w from its index; its history and uncommitted files are restored, run 'git checkout-index -a' there by hand"
+      fi
+    fi
+    n=$((n + 1))
+  done < "$manifest/trees"
+  return 0
+}
+
 # What the pre-upgrade snapshot has to copy, as "<kilobytes> <entries>" on one
-# line. Both numbers come from ONE walk: `du -ak` lists every entry and prints
-# the grand total last, so $1 of the final line is the size `du -sk` would have
-# given and NR is the entry count. -a and -k are POSIX (-b and `find -printf`
-# are GNU-only, and this file is read by a suite that also runs on macOS).
-# Directories are counted alongside files on purpose: cp pays to create them
-# too. A hard-linked inode is charged ONCE here, because that is what `du`
-# does — SNAPSHOT_ENTRIES_PER_SEC is calibrated against this same deduplicated
-# count, so the two agree. Empty when the directory is not there to size —
-# docker mode keeps the data in a named volume, not under $AGENTOS_HOME — and
-# every caller treats empty as "cannot size", never as zero.
+# line — measured over the SAME list the copy uses (snapshot_plan), so the
+# announcement prices exactly what the stop will pay for. Entries are paths,
+# directories included (the copy creates them too); kilobytes are apparent
+# sizes. Empty when the directory is not there to size — docker mode keeps the
+# data in a named volume, not under $AGENTOS_HOME — and every caller treats
+# empty as "cannot size", never as zero.
 snapshot_input() {
   [ -d "$AGENTOS_HOME/data" ] || return 0
-  du -ak "$AGENTOS_HOME/data" 2>/dev/null | awk 'END{if (NR>0) print $1" "NR}' || true
+  local plan entries kb
+  plan="$(mktemp -d 2>/dev/null)" || return 0
+  snapshot_plan "$AGENTOS_HOME/data" "$plan" 2>/dev/null || true
+  entries="$(tr -cd '\0' < "$plan/list" | wc -c | tr -d ' ')"
+  kb="$(cd "$AGENTOS_HOME/data" && xargs -0 ls -ldn -- < "$plan/list" 2>/dev/null \
+        | awk '{s += $5} END {printf "%d", s / 1024}')" || kb=""
+  rm -rf "$plan"
+  [ -n "$entries" ] && [ "$entries" -gt 0 ] || return 0
+  printf '%s %s\n' "${kb:-0}" "$entries"
 }
 
 UPGRADE_ETA_GUESS=0
-# Sets UPGRADE_ETA_GUESS: the size AND file count of data/ over pessimistic copy
+# Sets UPGRADE_ETA_GUESS: the size AND path count of the snapshot list over pessimistic copy
 # rates, capped at UPGRADE_ETA_CEILING. 0 when data/ cannot be sized.
 upgrade_eta_guess() {
   local sized kb entries
@@ -1378,7 +1583,8 @@ UPGRADE_ETA_BASIS=""
 #      requirement ("N from the previous snapshot's duration"), widened from
 #      one sample to a window because one sample swings too far to promise
 #      against (see UPGRADE_TIMING_WINDOW);
-#   3. the size AND file count of data/ over pessimistic copy rates — still a
+#   3. the size AND path count of what the snapshot copies (snapshot_plan)
+#      over pessimistic copy rates — still a
 #      fact about this node, and labelled `estimated` so the notice never
 #      claims to have measured anything.
 upgrade_eta() {
@@ -1546,21 +1752,27 @@ systemd_backup_sqlite() { # systemd_backup_sqlite <label> — <label> is the cod
     return 0
   fi
   local label="${1:?systemd_backup_sqlite needs a label}"
-  local ts dest f
+  local ts dest
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   dest="$BACKUP_DIR/${ts}-${label}"
-  mkdir -p "$dest"
-  for f in messages.db messages.db-wal messages.db-shm search.db; do
-    [ -f "$AGENTOS_HOME/data/$f" ] && cp -a "$AGENTOS_HOME/data/$f" "$dest/"
-  done
-  # .aop/ is the agent run-state (in-flight run dirs, cursors) — docker mode
-  # already captures it by tarring the whole /data volume, so bare metal must
-  # snapshot it too or a rollback would strand the node with mismatched runs.
-  [ -d "$AGENTOS_HOME/data/.aop" ] && cp -a "$AGENTOS_HOME/data/.aop" "$dest/"
-  # Context registry metadata lives in messages.db; every per-context ledger and
-  # local-only repository lives under contexts/. Snapshot the tree as a unit so
-  # A/B workspaces, including unpushed local history, restore consistently.
-  [ -d "$AGENTOS_HOME/data/contexts" ] && cp -a "$AGENTOS_HOME/data/contexts" "$dest/"
+  mkdir -p "$dest/$SNAPSHOT_MANIFEST"
+  # What is copied: the SQLite files; .aop/ — the agent run-state (in-flight
+  # run dirs, cursors), which docker mode captures by tarring the whole /data
+  # volume, so bare metal must snapshot it too or a rollback would strand the
+  # node with mismatched runs; and contexts/ — every per-context ledger and
+  # local-only repository, including unpushed local history. The exact path
+  # list, and what it leaves out as rebuildable, is snapshot_plan's (above).
+  snapshot_plan "$AGENTOS_HOME/data" "$dest/$SNAPSHOT_MANIFEST"
+  if [ -s "$dest/$SNAPSHOT_MANIFEST/list" ]; then
+    # --no-recursion: the list already names every directory and file, and
+    # recursion would pull back in exactly what the plan left out.
+    if ! tar -C "$AGENTOS_HOME/data" --null --no-recursion -T "$dest/$SNAPSHOT_MANIFEST/list" -cf - \
+         | tar -C "$dest" -xpf -; then
+      warn "snapshot copy failed: $dest is incomplete" >&2
+      return 1
+    fi
+  fi
+  rm -f "$dest/$SNAPSHOT_MANIFEST/list"
   echo "$label" > "$dest/version"
   ok "backup: $(basename "$dest")"
   systemd_prune_backups
@@ -1604,6 +1816,13 @@ systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores 
   # rolled-back User=agentos node would then hit SQLITE_READONLY_DIRECTORY and
   # never start. Give the whole data dir back to the service account.
   chown -R "$AGENTOS_ACCOUNT:$AGENTOS_ACCOUNT" "$AGENTOS_HOME/data"
+  # The manifest travelled with `cp -a <dir>/.`; it describes the snapshot, not
+  # the node. Rehydrate the linked worktrees it names (after the chown: git runs
+  # as the service account and writes files it owns), then drop it.
+  if [ -d "$AGENTOS_HOME/data/$SNAPSHOT_MANIFEST" ]; then
+    snapshot_rehydrate "$AGENTOS_HOME/data" "$AGENTOS_HOME/data/$SNAPSHOT_MANIFEST"
+    rm -rf "$AGENTOS_HOME/data/$SNAPSHOT_MANIFEST"
+  fi
   ok "restored $(basename "$src")"
 }
 
