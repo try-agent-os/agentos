@@ -27,6 +27,8 @@ here, and what it would have written into the node, you write.
 Done means all four of these, not three:
 
 1. `install.sh` finished with exit 0 and the node answers its health check.
+   Exit 3 is not done: the node runs, but without the root it was promised
+   (Phase 4).
 2. The owner can talk to the bot in Telegram and is its admin.
 3. The node has a brain — a git checkout it treats as its context — with the
    owner's profile in it, not an empty skeleton.
@@ -121,6 +123,7 @@ uname -m                                  # x86_64 or not
 . /etc/os-release && echo "$PRETTY_NAME"  # Debian 12 / Ubuntu 24.04 wanted
 id -u                                     # 0, or sudo must work
 command -v apt-get systemctl curl
+command -v visudo                         # empty → install.sh must install sudo
 systemctl list-units 'agentos*'           # an install already here? (any instance)
 ls -d /opt/agentos* 2>/dev/null
 free -m | awk '/Mem:/{print $2" MB RAM"}'
@@ -149,6 +152,15 @@ Read it like this:
   rule 5, and ask the owner what they actually want before you run anything.
 - **Less than ~1 GB RAM or a nearly full disk** → say it now. It will fail later
   and less clearly.
+- **No `visudo`** → the node's root comes from a sudoers drop-in that
+  `install.sh` validates with `visudo -cf`, so without it there is no root.
+  Warn the owner now: on an apt host the installer installs the `sudo` package
+  itself and carries on; without apt it cannot, the install ends with exit 3,
+  and you must not report this node as having root. One trap: `visudo` lives in
+  `/usr/sbin`, which a non-root shell on Debian often leaves off `PATH`, and the
+  installer looks for it on the `PATH` of the shell you run it from. If
+  `command -v visudo` is empty but `ls /usr/sbin/visudo` finds it, run
+  `export PATH="$PATH:/usr/sbin:/sbin"` in the shell that will run Phase 4.
 
 Then dry-run your intended command line. These two probes read your flags, print
 a decision and exit without touching the machine:
@@ -465,8 +477,14 @@ bash /tmp/agentos-install.sh \
   --no-https \
   --repo https://github.com/<owner>/<name>.git \
   --secrets "$SECRETS" \
-  -y
+  -y 2>&1 | tee /tmp/agentos-install.log
+echo "exit=${PIPESTATUS[0]}"
 ```
+
+The `tee` keeps the installer's output in `/tmp/agentos-install.log`, and
+`PIPESTATUS[0]` is the installer's own exit status, not `tee`'s — a plain `$?`
+after the pipe reports `tee`. Read it in the same tool call as the install:
+it is gone by the next one. Both are what Phase 4 asserts below.
 
 The first line puts the bot token into the installer's environment straight
 from the secrets file: it never reaches argv, `ps` or your transcript. Run it
@@ -503,7 +521,7 @@ vendored Node runtime, the Claude Code CLI, the unit, then a health gate that
 polls `http://127.0.0.1:<port>/healthz` — 45 attempts two seconds apart, so up
 to roughly two minutes before it gives up.
 
-**Assert the finish, do not eyeball it.** Four things must hold, and the first
+**Assert the finish, do not eyeball it.** Five things must hold, and the first
 two are gone if you do not capture them: the installer's **exit status is 0**,
 and its stdout contained the literal `AgentOS Node is running.` — ANSI colour
 wraps that line, so match the substring, not the whole line. Then, independently
@@ -512,10 +530,26 @@ of what it printed:
 ```bash
 systemctl is-active <unit>                       # active
 curl -fsS http://127.0.0.1:<port>/healthz        # exits 0
+! grep -q 'sudoers drop-in was NOT installed' /tmp/agentos-install.log  # exits 0
 ```
 
 Both values come from the identity probe in Phase 0; a named instance's unit is
-`agentos-<user>`, not `agentos`.
+`agentos-<user>`, not `agentos`. The fifth check is the node's root: the
+installer writes that line whenever its sudoers drop-in did not land, and the
+node then has no root however green the other four look.
+
+**Exit 3 means "the node runs, but it has no root".** Only the bare-metal
+(systemd) profile returns it: the unit is up and `/healthz` answers, but the
+sudoers drop-in could not be installed — no `visudo`, a render `visudo -cf`
+rejected, or an unwritable `/etc/sudoers.d`. The closing headline then reads
+`AgentOS Node is up, but WITHOUT HOST AUTHORITY` instead of `AgentOS Node is
+running.`, and a `!! NO HOST AUTHORITY` banner below it names the reason on its
+`Why:` line. That is exactly what you report to the owner: the node is running,
+it does not have root, and why, in the banner's words. Never report it as
+installed with root. The banner's fix is to install the `sudo` package and
+re-run the installer with the same flags; a re-run that ends with exit 0 and
+all five checks green is done. Any exit status other than 0 or 3 is a failed
+install — see "When a step fails".
 
 Also read what the banner says about your own flags. If it printed
 `installed <old>; channel has <new> — keeping <old>`, you were refreshing an
@@ -641,6 +675,7 @@ command's own status and message. Read the message — it usually names the fix.
 |---|---|---|
 | `unknown option`, `--user: expected…`, `--port: expected…`, `--secrets: no such file`, `--admin: … is neither of the two accepted forms` | Your own argv. Nothing was touched. | Fix and re-run. Never ask the owner to re-answer something you mangled. |
 | `run as root, or install sudo.` / `sudo failed` | No privileges. Nothing was touched. | Get root, or say you cannot. |
+| Exit 3, `AgentOS Node is up, but WITHOUT HOST AUTHORITY`, `!! NO HOST AUTHORITY` | The node is installed and running, but its sudoers drop-in was NOT installed, so it has no root. The `Why:` line of the banner names the cause. | Tell the owner exactly that, with the cause. Fix it (usually `apt-get install sudo`; on Debian as non-root, also `/usr/sbin` on `PATH` — see Phase 0) and re-run with the same flags. |
 | `the bare-metal node needs x86_64…` / `needs an apt-based distro…` | Wrong host for this profile. Nothing was touched. | Re-run with `--docker`, and tell the owner what that changes. |
 | `cannot resolve the stable channel`, a curl failure on the tarball or the Node runtime | Network or GitHub. Packages may be installed; nothing else is. | Retry once. Still failing: report it as an outage, do not hand-download anything. |
 | `tarball checksum mismatch` | **Stop.** A release tarball that does not match its SHA256 is not a thing to work around. | Nothing was unpacked: the version directory is created only after the check passes, so the box is untouched apart from a partial download in `/tmp` that the next attempt overwrites. Retry once in case the download was truncated. If it repeats, report it and stop; never disable the check. |
