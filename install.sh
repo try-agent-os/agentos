@@ -258,6 +258,30 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# ─── HTTPS flags are last-one-wins, values included ─────────────────────────
+#
+# --domain / --tunnel-token / --quick / --no-https each pick HTTPS_MODE, but the
+# first two also stash a value, and a later mode flag used to overwrite only the
+# mode. `--domain x --no-https` then ran with HTTPS_MODE=none AND DOMAIN=x: no
+# Caddy, no certificate, yet MINIAPP_URL=https://x/app landed in .env (systemd
+# write_env keys it off DOMAIN) and AGENTOS_DOMAIN in the docker .env — a Mini
+# App button pointing nowhere under a "bot-only install" banner. A stale
+# TUNNEL_TOKEN likewise dragged `--tunnel-token t --no-https` into Docker mode.
+# So the mode that won decides which value survives; everything else is dropped.
+case "$HTTPS_MODE" in
+  caddy)       TUNNEL_TOKEN="" ;;
+  cloudflared) DOMAIN="" ;;
+  *)           DOMAIN=""; TUNNEL_TOKEN="" ;;
+esac
+
+# "Which HTTPS setup would these flags produce?" — resolved mode plus the values
+# that survived, without touching the machine. scripts/tests/install-https.test.sh.
+if [ -n "${AGENTOS_PRINT_HTTPS:-}" ]; then
+  printf 'mode=%s domain=%s tunnel=%s\n' "${HTTPS_MODE:-unset}" "${DOMAIN:-}" \
+    "$([ -n "$TUNNEL_TOKEN" ] && echo set || echo unset)"
+  exit 0
+fi
+
 # ─── instance identity: user → install root, unit name, CLI name ────────────
 #
 # One knob. A second node on the same host is the same install run again with a
