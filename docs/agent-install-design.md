@@ -45,11 +45,11 @@ becomes a support ticket a week later.
 
 | Phase | The agent | Gate |
 |---|---|---|
-| 0 Preflight | arch, distro, privileges, existing install, disk/RAM; dry-runs the intended command line through the installer's own no-op probes (`AGENTOS_PRINT_MODE`, `AGENTOS_PRINT_IDENTITY`) and reads `<install-dir>/current` off the box | profile decided; no node already installed |
+| 0 Preflight | arch, distro, privileges, `visudo`, existing install, disk/RAM; dry-runs the intended command line through the installer's own no-op probes (`AGENTOS_PRINT_MODE`, `AGENTOS_PRINT_IDENTITY`) and reads `<install-dir>/current` off the box | profile decided; no node already installed |
 | 1 Interview | group A: what the install cannot proceed without · group B: where the brain lives · group C: who the owner is | every group-A answer present |
 | 2 Secrets file | one 0600 env file: `GH_TOKEN`, optional `CLAUDE_CODE_OAUTH_TOKEN`, `AGENTOS_REPO_DIR` | file exists, mode 0600 |
 | 3 Brain | repo from the template, `memory/owner.md` and `CLAUDE.md` filled from group C, pushed | commit on the remote |
-| 4 Install | one `install.sh` call with `--admin`, one HTTPS flag, `--repo`, `--secrets`, `-y` | exit 0 · `AgentOS Node is running.` · `systemctl is-active` · `/healthz` |
+| 4 Install | one `install.sh` call with `--admin`, one HTTPS flag, `--repo`, `--secrets`, `-y` | exit 0 · `AgentOS Node is running.` · `systemctl is-active` · `/healthz` · no `sudoers drop-in was NOT installed` in the log (exit 3 = running without root, reported as such) |
 | 5 Connect | owner DMs the bot (`/start`), `/login` if no token was placed; brain adoption verified in the log | bot answers · context adopted |
 | 6 Useful | harness if not Claude, first routine from the preset catalog, one real task in chat | routine present in the repo |
 | 7 Handover | what/where/how, in the owner's words and as `memory/node.md`; secrets file destroyed | both written |
