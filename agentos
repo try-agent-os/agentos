@@ -1251,6 +1251,34 @@ docker_backup() { # manual, standalone backup — leaves the node running afterw
 # constants below exist only for the one upgrade that has no predecessor to
 # learn from, and the notice says so in that case.
 UPGRADE_TIMING_FILE="$BACKUP_DIR/.last-upgrade-timing"
+# How many recent measurements the estimate is allowed to see (self-heal
+# ad8ff93fac13762f, second cycle, 2026-09-22).
+#
+# The first cycle fixed the GUESS (the entry term below) and left the measured
+# branch reading exactly one sample — the previous upgrade's downtime. That is
+# what broke next. Seven consecutive upgrades on the hub measured:
+#
+#   1003, 1031, 1364, 1071, 738, 573, 1020   (seconds, stop -> healthy)
+#
+# A 2.4x spread, because the silence is almost entirely the snapshot of `data/`
+# and that tree is churned by workers, worktrees and cleanup between upgrades.
+# Announcing sample N-1 and then alarming when sample N exceeds it by half
+# again is a coin flip against that spread: the 573 s upgrade was the low
+# outlier of the series, the next one took 1020 s, and the owner was told
+# «9 min 33 s» before sitting through 17 minutes. Nothing was wrong with the
+# node either time — the estimator simply had a sample size of one.
+#
+# So the measured branch now reads the HIGH-WATER MARK of the last few
+# upgrades instead of the last one. Three is the smallest window that absorbs a
+# single low outlier; against the series above it announces 1071 s for a 1020 s
+# outage (within 5%) and produces no overrun at any point, while a genuine
+# regression still clears the 1.5x bar and still reports (a 3000 s outage
+# against a 1071 s high-water mark fires, as it should).
+#
+# MAX rather than mean on purpose, and the file says why a line below: over-
+# promising silence ends early, under-promising it is the failure this whole
+# feature exists to prevent.
+UPGRADE_TIMING_WINDOW=3
 # What the FIRST upgrade assumes, when no downtime has ever been measured on
 # this node. TWO terms, because a `cp -a` pays for two different things and
 # pricing only one of them is what broke this the first time it ran for real.
@@ -1321,7 +1349,10 @@ UPGRADE_ETA_BASIS=""
 # much they actually know about THIS node:
 #   1. an operator override in .env (AGENTOS_UPGRADE_ETA_SECONDS) — a human who
 #      has measured their own box outranks both guesses below;
-#   2. the previous upgrade's measured downtime — the owner's requirement;
+#   2. the high-water mark of the last few measured downtimes — the owner's
+#      requirement ("N from the previous snapshot's duration"), widened from
+#      one sample to a window because one sample swings too far to promise
+#      against (see UPGRADE_TIMING_WINDOW);
 #   3. the size AND file count of data/ over pessimistic copy rates — still a
 #      fact about this node, and labelled `estimated` so the notice never
 #      claims to have measured anything.
@@ -1337,7 +1368,17 @@ upgrade_eta() {
     # upgrade was timed, and the answer was "under a second of resolution". The
     # floor below turns that into an announceable number without turning it
     # back into a guess.
-    prev="$(jq -r '.downtime_seconds // empty' "$UPGRADE_TIMING_FILE" 2>/dev/null || true)"
+    # The high-water mark of the last UPGRADE_TIMING_WINDOW upgrades, not the
+    # single previous one (see UPGRADE_TIMING_WINDOW above). `recent` is written
+    # by record_upgrade_downtime, oldest first, already trimmed to the window;
+    # a file written before that existed carries only the scalar, and a node
+    # upgrading from such a file still gets its one measurement rather than
+    # falling back to the guess.
+    prev="$(jq -r '
+        ((.recent // []) | map(select(type == "number" and . >= 0))) as $h
+        | if ($h | length) > 0 then ($h | max)
+          else (.downtime_seconds // empty) end' \
+      "$UPGRADE_TIMING_FILE" 2>/dev/null || true)"
     case "$prev" in ''|*[!0-9]*) prev="" ;; esac
     if [ -n "$prev" ]; then
       UPGRADE_ETA_SECONDS="$prev"
@@ -1419,7 +1460,7 @@ announce_going_down() { # announce_going_down <from> <to> — one chat line, BEF
 }
 
 record_upgrade_downtime() { # record_upgrade_downtime <docker|systemd> <from> <to> <stop-epoch> <snapshot-seconds>
-  local mode="$1" from="$2" to="$3" stop="$4" snap_s="$5" now downtime tmp
+  local mode="$1" from="$2" to="$3" stop="$4" snap_s="$5" now downtime tmp prev_json
   now="$(date +%s)"
   downtime=$(( now - stop ))
   [ "$downtime" -lt 0 ] && downtime=0
@@ -1427,10 +1468,28 @@ record_upgrade_downtime() { # record_upgrade_downtime <docker|systemd> <from> <t
   mkdir -p "$BACKUP_DIR" 2>/dev/null || true
   # (1) the measurement the NEXT upgrade estimates from. Temp+rename so a run
   # killed mid-write cannot leave the next upgrade reading half a number.
+  #
+  # `recent` carries the last UPGRADE_TIMING_WINDOW downtimes, oldest first, so
+  # the next upgrade can take their high-water mark instead of trusting one
+  # sample. A file that predates this field contributes its scalar as the sole
+  # history entry, so the rollover costs no measurement. Anything unreadable
+  # degrades to an empty history rather than voiding the write: losing the
+  # window is survivable, losing the record is what sends the next upgrade back
+  # to guessing.
+  prev_json="$(jq -c 'if type == "object" then . else {} end' \
+    "$UPGRADE_TIMING_FILE" 2>/dev/null)" || prev_json=""
+  [ -n "$prev_json" ] || prev_json='{}'
   tmp="${UPGRADE_TIMING_FILE}.tmp"
   if jq -nc --argjson at "$now" --arg from "$from" --arg to "$to" \
        --argjson snapshot_seconds "$snap_s" --argjson downtime_seconds "$downtime" \
-       '{at:$at,from:$from,to:$to,snapshot_seconds:$snapshot_seconds,downtime_seconds:$downtime_seconds}' \
+       --argjson window "$UPGRADE_TIMING_WINDOW" --argjson prev "$prev_json" \
+       '(($prev.recent // (if ($prev.downtime_seconds | type) == "number"
+                           then [$prev.downtime_seconds] else [] end))
+         | map(select(type == "number" and . >= 0))) as $h
+        | (($h + [$downtime_seconds])
+           | if length > $window then .[length - $window:] else . end) as $next
+        | {at:$at,from:$from,to:$to,snapshot_seconds:$snapshot_seconds,
+           downtime_seconds:$downtime_seconds,recent:$next}' \
        > "$tmp" 2>/dev/null; then
     mv -f "$tmp" "$UPGRADE_TIMING_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
   else

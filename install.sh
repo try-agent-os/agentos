@@ -156,6 +156,31 @@ TUNNEL_TOKEN=""
 HTTPS_MODE=""        # caddy | cloudflared | quick | none
 ASSUME_YES=0
 
+# ─── which hop the node may believe ─────────────────────────────────────────
+#
+# express's `trust proxy` is what makes req.ip / req.protocol / req.secure /
+# req.hostname describe the CLIENT instead of the proxy, and the node keeps it
+# OFF unless TRUST_PROXY names a hop (apps/api/src/app/trust-proxy.ts). This
+# script is the only thing that knows which hop that is, because it is what put
+# the proxy there — so it writes the value, and "no proxy" writes nothing.
+#
+# NOT `true`: that form believes X-Forwarded-For from any peer that can reach
+# the port, which on a self-hosted node published past the firewall hands every
+# client its own req.ip. Name the hop instead (task 12418agfrv3).
+trust_proxy_setting() { # trust_proxy_setting <docker|systemd> — echoes the value for $HTTPS_MODE
+  case "${HTTPS_MODE:-}" in
+    caddy|cloudflared|quick)
+      # Docker: the caddy / cloudflared / quick sidecar reaches the node over
+      # the compose bridge, and the node's port is published on 127.0.0.1 only,
+      # so the peers that can exist are that bridge's private addresses.
+      # Bare metal (--domain only): Caddy is a unit on this same host proxying
+      # to 127.0.0.1:$PORT, so the loopback is the whole of it.
+      if [ "$1" = "docker" ]; then echo "uniquelocal"; else echo "loopback"; fi ;;
+    # --no-https: no proxy, so no hop, so no header is believed.
+    *) echo "" ;;
+  esac
+}
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'
 BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
@@ -1110,6 +1135,7 @@ inherit_policy_from_dotenv() {
 
 write_env_systemd() {
   local preserved="" pair suffix canonical legacy value
+  local TRUST_PROXY_SETTING; TRUST_PROXY_SETTING="$(trust_proxy_setting systemd)"
   for pair in \
     REPO_DIR:AGENTOS_REPO_DIR REPO_URL:AGENTOS_CONTEXT_IMPORT_URL \
     REPO_REF:AGENTOS_CONTEXT_IMPORT_REF SYNC_BRANCH:AGENTOS_CONTEXT_IMPORT_REF \
@@ -1141,6 +1167,12 @@ PORT=${PORT}
 MINIAPP_PORT=${PORT}
 # Loopback bind: only Caddy (443) faces the network; the origin stays private.
 HOST=127.0.0.1
+# Which hop in front of the node express may believe (apps/api/src/app/trust-proxy.ts).
+# --domain puts Caddy on THIS host talking to 127.0.0.1:${PORT}, so the hop to
+# trust is the loopback and nothing else; --no-https has no proxy at all and
+# leaves this empty, which means the node believes no X-Forwarded-* header from
+# anyone. Written from the flags on every re-run, like every other key here.
+TRUST_PROXY=${TRUST_PROXY_SETTING}
 AGENTOS_VERSION=${tag}
 TELEGRAM_MCP_DB_PATH=${INSTALL_DIR}/data/messages.db
 AGENTOS_SEARCH_DB_PATH=${INSTALL_DIR}/data/search.db
@@ -2272,6 +2304,16 @@ set_env AGENTOS_AUTOUPDATE_POLICY "${AGENTOS_AUTOUPDATE_POLICY:-all}"
 write_signal_env_docker
 [ -n "$DOMAIN" ]       && set_env AGENTOS_DOMAIN "$DOMAIN"
 [ -n "$TUNNEL_TOKEN" ] && set_env CLOUDFLARE_TUNNEL_TOKEN "$TUNNEL_TOKEN"
+# The hop the node may believe, from the profile this run actually starts. Set
+# AND unset from the flags, for the same reason MINIAPP_URL below is: a re-run
+# that drops the proxy (`--no-https` after a `--domain`) must not leave the node
+# trusting X-Forwarded-* from a sidecar that is no longer there.
+TRUST_PROXY_SETTING="$(trust_proxy_setting docker)"
+if [ -n "$TRUST_PROXY_SETTING" ]; then
+  set_env TRUST_PROXY "$TRUST_PROXY_SETTING"
+else
+  unset_env TRUST_PROXY
+fi
 # --no-https (and quick before the tunnel resolves) leaves MINIAPP_URL empty. A
 # guarded set would keep a stale value from an earlier --quick run — a dead
 # trycloudflare URL that still publishes the Mini App button, contradicting the
