@@ -373,35 +373,59 @@ merge_contour_secrets() {
     return 0
   fi
   keypat="$(printf '%s\n' "$declared" | paste -sd'|' -)"
-  current="$(read_maybe_sudo "$envfile" 2>/dev/null || true)"
+  # $envfile sits in a directory the core owns, and this runs as root: every
+  # touch of that NAME below is written so a link the core planted there cannot
+  # steer it (12418agfwfz). The read refuses a link outright: a root `cat`
+  # through one would copy any root-readable file (/etc/shadow, another
+  # contour's secrets) into this .env, which is then handed to the service account.
+  [ -L "$envfile" ] && die "refusing to merge --secrets: ${envfile} is a symlink, not a file — remove it and re-run"
+  if [ -e "$envfile" ] && [ ! -f "$envfile" ]; then
+    die "refusing to merge --secrets: ${envfile} exists but is not a regular file — remove it and re-run"
+  fi
+  # iflag=nofollow makes the check above binding rather than advisory: a link
+  # swapped in after it fails the open (ELOOP) instead of being read through.
+  # A file that exists but cannot be read aborts — merging over "empty" would
+  # silently drop every key .env already carried.
+  current=""
+  if [ -e "$envfile" ]; then
+    current="$($su dd if="$envfile" iflag=nofollow status=none 2>/dev/null)" \
+      || die "cannot read ${envfile} without following links — refusing to merge --secrets"
+  fi
   # Drop the keys we are about to redeclare, and any pre-existing blank lines, so
   # a re-run cannot pile up duplicates or grow a gap on every pass.
   filtered="$(printf '%s\n' "$current" | grep -Ev "^(${keypat})=" | grep -v '^[[:space:]]*$' || true)"
   lines="$(printf '%s\n' "$secrets" | grep -E '^[A-Za-z_][A-Za-z0-9_]*=')"
   new="$(printf '%s\n%s' "$filtered" "$lines")"
-  # 0600 from birth (install /dev/null first), then stream the content in — the
-  # values reach the file through a pipe, never an argument.
-  $su install -m 600 /dev/null "$envfile"
-  printf '%s\n' "$new" | $su tee "$envfile" >/dev/null
-  $su chmod 600 "$envfile"
+  # Never write the secrets THROUGH the name .env. The old form (`install`, then
+  # `tee "$envfile"`) opened .env by name twice, so a link planted between those
+  # opens sent the merged file — a bot token, a GitHub token — to a path of the
+  # core's choosing (12418agfwfz). Instead:
+  #   1. create a FRESH file under an unpredictable name in the same directory
+  #      with O_CREAT|O_EXCL (bash noclobber on a name that does not exist): an
+  #      exclusive create never follows a link, even a dangling one, and never
+  #      opens anything that already exists; umask 077 makes it 0600 from birth;
+  #   2. stream the content in through that same open — values ride a pipe,
+  #      never an argument;
+  #   3. hand it to the service account (-h: a link swapped in at the temp name
+  #      takes the change on itself), then rename(2) it over .env. rename
+  #      replaces the directory ENTRY — a link at .env is replaced, never
+  #      followed — and -T stops mv from reading a link to a directory as "move
+  #      into it".
+  local dir tmp
+  dir="$(dirname "$envfile")"
+  tmp="${dir}/.env.merge.$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  if ! printf '%s\n' "$new" | $su bash -c 'umask 077; set -C; exec cat > "$1"' _ "$tmp" 2>/dev/null; then
+    $su rm -f "$tmp" 2>/dev/null || true
+    die "cannot create a private temp file next to ${envfile} — refusing to merge --secrets"
+  fi
   # Hand it to the service account only in systemd mode (docker leaves it with the
   # invoking user). Guarded: the account may not exist yet in a dry run.
-  #
-  # -h, because $envfile sits in a directory the core owns and this is root. It
-  # cannot follow a link, so a link planted at that name takes the ownership
-  # change on itself instead of passing it to whatever it points at. Costs
-  # nothing: the line already ends in `|| true`, so it cannot abort either way.
-  #
-  # What -h does NOT close, stated because it is the more valuable half: the
-  # `tee` three lines up writes the merged secrets to that same name, so a link
-  # planted before it puts the contents — a bot token, a GitHub token — into a
-  # path of the core's choosing. Nothing available in bash closes that: the file
-  # is written by redirecting into a name, and naming a path is the whole of the
-  # exposure. A guard here would only narrow the window, not remove it, and the
-  # honest fix is that the core should not be able to reach this directory at
-  # all. Filed, not attempted here.
   [ "${INSTALL_MODE:-}" = "systemd" ] && [ -n "${SUDO:-}" ] \
-    && $SUDO chown -h "${SERVICE_USER}:${SERVICE_USER}" "$envfile" 2>/dev/null || true
+    && $SUDO chown -h "${SERVICE_USER}:${SERVICE_USER}" "$tmp" 2>/dev/null || true
+  if ! $su mv -f -T "$tmp" "$envfile"; then
+    $su rm -f "$tmp" 2>/dev/null || true
+    die "cannot move the merged secrets into place at ${envfile}"
+  fi
   n="$(printf '%s\n' "$declared" | grep -c . || true)"
   ok "merged ${n} contour secret key(s) into .env: $(printf '%s ' $declared)"
 }
