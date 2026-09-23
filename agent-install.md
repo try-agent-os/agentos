@@ -74,9 +74,24 @@ GitHub token and a Claude setup token are all secrets. Put them in a
 script merges it into the node's `.env` without any value ever reaching `ps`, a
 journal, or your own command line. The bot token may also come from
 `$TELEGRAM_BOT_TOKEN` in your environment — the script reads it there. Never
-echo a secret back, never write one into a file you are about to commit, and
-treat your own transcript as secret-bearing once the owner has pasted one into
-it.
+echo a secret back, never write one into a file you are about to commit.
+
+**The default is that a secret never enters your context at all.** Do not ask
+the owner to paste a token into this conversation. Have it piped from their
+clipboard or a file straight into the secrets file (Phase 2 shows how), and
+read it from that file only inside the command that needs it. If the owner
+pastes one into the chat anyway, use it, but treat your own transcript as
+secret-bearing from then on and tell them the token should be rotated once the
+node works.
+
+**7. One bot token, one live node.** Telegram hands each update to exactly one
+poller. Two processes on the same token — a rehearsal install and the real one,
+an old box and a new one, a node and a script on the owner's laptop — fight over
+`getUpdates`, and the visible symptom is a bot that answers sometimes or never.
+Do not "rehearse, then install for real" with the owner's token: rehearse with a
+second throwaway bot from @BotFather, or not at all. Before you install, ask
+whether this token already runs anywhere, and if it does, have that process
+stopped first.
 
 **5. Never move an existing node's version.** If this box already has an
 install, a re-run refreshes configuration and deliberately keeps the installed
@@ -106,14 +121,25 @@ uname -m                                  # x86_64 or not
 . /etc/os-release && echo "$PRETTY_NAME"  # Debian 12 / Ubuntu 24.04 wanted
 id -u                                     # 0, or sudo must work
 command -v apt-get systemctl curl
-systemctl is-active agentos 2>/dev/null   # an install already here?
-ls -d /opt/agentos 2>/dev/null
+systemctl list-units 'agentos*'           # an install already here? (any instance)
+ls -d /opt/agentos* 2>/dev/null
 free -m | awk '/Mem:/{print $2" MB RAM"}'
 df -h / | tail -1
+findmnt -no SOURCE,FSTYPE,OPTIONS /       # will the root filesystem survive a reboot?
+hostname
 ```
 
 Read it like this:
 
+- **The root filesystem must be persistent.** Everything can install and every
+  check can go green on a rescue or live system, and none of it survives a power
+  cycle. Stop and tell the owner if `findmnt` shows `tmpfs`, `ramfs` or
+  `squashfs`, if its source is not a real block device (`/dev/…`, an LVM or
+  RAID volume), or if it shows `overlay` — and read the options, not only the
+  type: a rescue system can report `overlay` with the writable layer in RAM
+  (`upperdir=/ramfs/root` or anything under `/run`, `/tmp` or a `ramfs`). A
+  hostname like `rescue` is the same warning. Ask the owner to boot the
+  installed OS first; do not install into RAM.
 - **x86_64 + apt-get + systemd** → the default bare-metal profile. This is what
   you want: no Docker daemon, a vendored Node runtime, one systemd unit.
 - **Anything else** (arm64, no apt) → the container profile, `--docker`. Say so
@@ -141,9 +167,29 @@ If `AGENTOS_PRINT_MODE` says `docker` when you expected `systemd`, either you
 passed a container-only flag (`--tunnel-token`, `--quick`, `--image`, or a
 `--channel` other than `stable`) — they switch profiles silently — or this box
 already carries a Docker install, which pins the profile on its own and says so
-(`existing Docker install in <install-dir>`). `AGENTOS_PRINT_IDENTITY` gives you
-the install directory the rest of this file calls `<install-dir>`; take it from
-here rather than assuming `/opt/agentos`.
+(`existing Docker install in <install-dir>`). To go from that Docker install
+back to bare metal, pass `--no-docker` explicitly — it is the only thing that
+migrates the profile; without it a re-run stays on the container.
+
+**Capture the identity once, and use only these values from here on.** The
+install root defaults to `/opt/<user>`, not to `/opt/agentos`; the unit, the
+port and the CLI name all follow `--user`, `--dir` and `--port`. Read them from
+the probe instead of assuming the defaults:
+
+```bash
+IFS='|' read -r AOS_USER AOS_DIR AOS_UNIT AOS_PORT \
+  < <(AGENTOS_PRINT_IDENTITY=1 bash /tmp/agentos-install.sh <your flags>)
+echo "user=$AOS_USER dir=$AOS_DIR unit=$AOS_UNIT port=$AOS_PORT"
+```
+
+The rest of this file calls them `<install-dir>` (`$AOS_DIR`), `<unit>`
+(`$AOS_UNIT`) and `<port>` (`$AOS_PORT`). The CLI is `agentos` for the default
+account and `agentos-<user>` for a named one; every `agentos …` command below
+means whichever of the two this install has. For a plain install they come out
+as `/opt/agentos`, `agentos` and `8787` — that is a result of the probe, not
+something to write down in advance. Shell variables do not survive between your
+tool calls in every agent, so write the four values into your notes, not only
+into the shell.
 
 **Whether a node is already installed is a question about the box, not about
 your flags.** Ask the box, using the directory the identity probe just printed:
@@ -183,7 +229,7 @@ do not invent an answer to a question in group A.
 
 | Ask | Why it cannot be derived |
 |---|---|
-| The bot token from [@BotFather](https://t.me/BotFather) (`/newbot`) | It is created by a human in Telegram. The installer never validates it against Telegram — a wrong but well-formed token installs "fine" and the bot stays silent. |
+| That they have a bot token from [@BotFather](https://t.me/BotFather) (`/newbot`), and that it runs nowhere else | It is created by a human in Telegram. The installer never validates it against Telegram — a wrong but well-formed token installs "fine" and the bot stays silent. Ask them to *have* it, not to paste it here: it goes into the secrets file by the path in Phase 2 (rule 4). A token already live on another box or script is two pollers (rule 7). |
 | Their numeric Telegram id from [@userinfobot](https://t.me/userinfobot), or their username | It becomes `--admin`. **Always pass it.** With no admin the node is UNCLAIMED and the first stranger who DMs it becomes its owner, once, with no time limit. |
 | Mini App, or bot only? | `--domain <host>` needs an A record already pointing at this box and ports 80+443 open; Caddy then gets a Let's Encrypt certificate. `--no-https` is a complete install — the bot long-polls Telegram and works behind NAT — it only costs the Mini App, which Telegram opens on a public `https` origin or not at all. Ask which they have, do not guess, and pass exactly one of the two. The script does not reject both, and the result is not clean either way round: `--no-https` switches Caddy off but leaves the domain set, so `MINIAPP_URL=https://<domain>/app` still lands in `.env` — no certificate, and a Mini App button that points nowhere. |
 | May the node have passwordless root on this box? | The default install grants the service account exactly that, because administering the box is the job. It is the one consent in this flow that cannot be taken back quietly. If the box hosts anything else, offer `--scoped-sudo`, which narrows the grant to restart/status/journal on its own unit. |
@@ -196,7 +242,12 @@ routines. Offer three, in this order:
 1. **A new repo from the template** —
    [`try-agent-os/claude-code-template`](https://github.com/try-agent-os/claude-code-template),
    private. The best default. Needs a GitHub token with `repo` scope (or a
-   `gh auth status` that is already good).
+   `gh auth status` that is already good), and two names Phase 3 cannot
+   derive: the **owner** — their GitHub username or the organisation the repo
+   belongs in — and the **repository name** (suggest something like
+   `my-agent`, and let them change it). Ask for both now; `gh repo create
+   <owner>/<name>` needs them, and the name also fixes the checkout path in
+   Phase 2.
 2. **A repo they already have.** Take the clone URL.
 3. **Local for now** — a checkout on this box only. It works; it just means the
    brain lives on one disk and dies with it.
@@ -235,22 +286,57 @@ Two more, only if they already exist; never talk anyone into creating one now:
 
 ## Phase 2 — Write the secrets file
 
-One file, mode 0600, outside any repository, deleted when you are done:
+One file, mode 0600, outside any repository, deleted when you are done. Put it
+in the home directory of the account you are running as — `/root` only if that
+account is root; Phase 0 accepts a non-root operator with sudo, and that
+operator cannot write to `/root`:
 
 ```bash
+SECRETS="$HOME/agentos-secrets.env"
 umask 077
-cat > /root/agentos-secrets.env <<'EOF'
-GH_TOKEN=<github token, if any>
-CLAUDE_CODE_OAUTH_TOKEN=<claude setup token, if any>
-AGENTOS_REPO_DIR=/opt/agentos/repos/<repo-name>
-EOF
-chmod 600 /root/agentos-secrets.env
+printf 'AGENTOS_REPO_DIR=%s\n' "<install-dir>/repos/<repo-name>" > "$SECRETS"
+chmod 600 "$SECRETS"
 ```
 
-Three things are going on here, and only the first is obvious.
+The secrets go in next, **without passing through your context**. Each value
+is piped from where the owner already has it — their clipboard or a file —
+straight onto the end of that file, so it never appears in this conversation,
+in argv or in `ps`. If you are working on the owner's own machine and reach
+the box over ssh, run this there (`pbpaste` on macOS; `wl-paste` or
+`xclip -o -selection clipboard` on Linux), once per secret, after the owner has
+copied it:
+
+```bash
+{ printf 'TELEGRAM_BOT_TOKEN='; pbpaste; echo; } \
+  | ssh <box> 'umask 077; cat >> ~/agentos-secrets.env'
+```
+
+On the box itself, the same shape reads from a file the owner dropped there:
+`{ printf 'GH_TOKEN='; cat <file>; echo; } >> "$SECRETS"`. Only if neither
+works do you fall back to the owner pasting into chat — rule 4 says what that
+costs. The keys that belong in this file:
+
+| Key | When |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Always. Phase 4 reads it from here into the installer's environment. |
+| `GH_TOKEN` | If you are creating or cloning a repo. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | If the owner has a Claude setup token. |
+| `AGENTOS_REPO_DIR` | Always, unless there is no brain yet (written above). |
+
+Check the result by key names only — never print the file:
+`sed -n 's/=.*//p' "$SECRETS"`.
+
+Four things are going on here, and only the first is obvious.
+
+`TELEGRAM_BOT_TOKEN` in this file is not enough on its own for a first install:
+the installer asks for the bot token before it merges `--secrets`, so with `-y`
+and no token in its environment it stops with `a bot token is required.` That
+is why Phase 4 lifts it from this file into the installer's environment.
 
 `GH_TOKEN` is what the installer authenticates git with (`gh auth setup-git`)
-before cloning anything you passed to `--repo`. `CLAUDE_CODE_OAUTH_TOKEN` is the
+before cloning anything you passed to `--repo`. If the token has to live under
+another key, `--gh-token-key <KEY>` names it (default: `GH_TOKEN`, then
+`GITHUB_TOKEN`). `CLAUDE_CODE_OAUTH_TOKEN` is the
 supported way to give a node its Claude credentials without a browser.
 `AGENTOS_REPO_DIR` is how the node learns which checkout is its brain: on a boot
 where its context registry is still empty, it adopts that directory — in place,
@@ -258,9 +344,9 @@ read-only, nothing scaffolded — as its active context. The installer preserves
 the key across every re-run but never sets it, so this file is where it belongs.
 
 Set `AGENTOS_REPO_DIR` to `<install-dir>/repos/<name>`, where `<name>` is the
-repository name with no `.git` — that is exactly where `--repo` clones. For the
-default install and a repo called `my-agent` that is
-`/opt/agentos/repos/my-agent`.
+repository name from Phase 1B with no `.git` — that is exactly where `--repo`
+clones. For a plain install and a repo called `my-agent` that comes out as
+`/opt/agentos/repos/my-agent`, but take `<install-dir>` from the probe.
 
 For the **local-only** brain, create the checkout yourself before installing —
 `git init`, the template's layout, a first commit — and point `AGENTOS_REPO_DIR`
@@ -270,6 +356,9 @@ the log saying so.
 ## Phase 3 — Create the brain
 
 Skip this if the owner brought their own repo; use their URL instead.
+
+`<owner>` and `<name>` are the two names you asked for in Phase 1B; do not
+guess the owner from `gh api user` when the owner said an organisation.
 
 ```bash
 gh repo create <owner>/<name> --private --template try-agent-os/claude-code-template
@@ -321,20 +410,44 @@ already did.
 One command, all flags decided, nothing interactive:
 
 ```bash
+TELEGRAM_BOT_TOKEN="$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$SECRETS" | tail -1)" \
 bash /tmp/agentos-install.sh \
   --admin <telegram-id-or-username> \
   --no-https \
   --repo https://github.com/<owner>/<name>.git \
-  --secrets /root/agentos-secrets.env \
+  --secrets "$SECRETS" \
   -y
 ```
 
-with `TELEGRAM_BOT_TOKEN` exported in the environment of that command (or
-`--token <token>` if you must, accepting that it lands in `ps`). Swap
+The first line puts the bot token into the installer's environment straight
+from the secrets file: it never reaches argv, `ps` or your transcript. Run it
+as yourself, not under `sudo` — the installer escalates on its own, and `sudo`
+would strip that variable. (`--token <token>` also works, accepting that the
+token then lands in `ps` and in your context.) Keep every flag you probed with
+in Phase 0 — a `--user`, `--dir` or `--port` dropped here installs somewhere
+other than `<install-dir>`. Swap
 `--no-https` for `--domain <host>` if the owner has DNS ready. Add `--docker`
 only if Phase 0 said the bare-metal profile cannot run here, and drop `--repo`
 when you do — it is a systemd-mode flag and the container profile only warns.
 `-y` turns a missing answer into an error instead of a hang.
+
+Flags this command does not need by default, but you should know exist
+(`--help` has the full wording):
+
+- `--user <name>` and `--port <n>` — a second node on the same box: its own
+  service account, install root, unit and port. Pass both, or neither.
+- `--dir <path>` — the install root, when `/opt/<user>` is wrong for this box
+  (a separate data disk, say). It moves `<install-dir>`; re-probe after adding it.
+- `--no-docker` — the bare-metal profile. It is the default on a clean box, so
+  you pass it only for one reason: this box already carries a Docker install,
+  and the owner wants it moved back to bare metal. Without the flag a re-run
+  stays on Docker.
+- `--gh-token-key <KEY>` — which key in the merged `.env` holds the GitHub token
+  for `gh auth setup-git` and the `--repo` clones, when it is not `GH_TOKEN` or
+  `GITHUB_TOKEN`.
+- `--secret-reader <user>` — a host account (a backup job, a monitor) that must
+  keep read access to `<install-dir>/secrets` across updates. Repeatable,
+  bare-metal only, needs `acl`. Pass it only if the owner names such an account.
 
 It takes a few minutes: apt packages, the release tarball and its checksum, a
 vendored Node runtime, the Claude Code CLI, the unit, then a health gate that
@@ -348,12 +461,12 @@ wraps that line, so match the substring, not the whole line. Then, independently
 of what it printed:
 
 ```bash
-systemctl is-active agentos                      # active
-curl -fsS http://127.0.0.1:8787/healthz          # exits 0
+systemctl is-active <unit>                       # active
+curl -fsS http://127.0.0.1:<port>/healthz        # exits 0
 ```
 
-Substitute the unit name and port if you passed `--user` or `--port`: a named
-instance is `agentos-<user>`.
+Both values come from the identity probe in Phase 0; a named instance's unit is
+`agentos-<user>`, not `agentos`.
 
 Also read what the banner says about your own flags. If it printed
 `installed <old>; channel has <new> — keeping <old>`, you were refreshing an
@@ -377,6 +490,23 @@ Two steps only the human can do. Do not fake progress here; ask, then verify.
 agentos ctl status --json    # version, uptime, harness, live runs
 ```
 
+Do not judge the login by `~/.claude/.credentials.json`. The node does not keep
+its Claude state there, and `CLAUDE_CONFIG_DIR` is unset in your shell, so the
+familiar path reads as "not logged in" on a node that is logged in. After
+`/login` the credentials live at
+`<install-dir>/data/.aop/claude-config/.credentials.json`; with a
+`CLAUDE_CODE_OAUTH_TOKEN` in `.env` there may be no such file at all. The check
+that does not lie is the node's own log, after the owner has sent a message:
+
+```bash
+sudo grep -ci 'not logged in' <install-dir>/logs/node.log            # must stop growing
+sudo grep -c '\[session\] Result: subtype=success' <install-dir>/logs/node.log  # must be > 0
+```
+
+The first count is cumulative, so compare it before and after the owner's test
+message rather than expecting zero; the second is the proof that a real turn
+completed.
+
 If they have no credential at all and no way to make one right now, say plainly
 what that means: the node runs, routines tick, and every agent reply comes back
 as the Claude CLI's `Not logged in` banner with the node's own hint to run
@@ -387,7 +517,7 @@ failure:
 
 ```bash
 agentos logs 500 | grep -i 'contexts'
-ls -la /opt/agentos/repos/<name>
+sudo ls -la <install-dir>/repos/<name>
 ```
 
 You are looking for a line saying `AGENTOS_REPO_DIR` was adopted as the local
@@ -418,7 +548,7 @@ one way you know it works.
 
 ```bash
 agentos preset ls
-agentos preset add daily-brief hour=8 minute=0 --repo /opt/agentos/repos/<name>
+agentos preset add daily-brief hour=8 minute=0 --repo <install-dir>/repos/<name>
 ```
 
   It writes the routine into the brain repo, where the owner can read and edit
@@ -445,7 +575,7 @@ session. Both say the same things:
 - That the service account has passwordless root, if it does, in one plain
   sentence.
 
-Then delete the secrets file (`shred -u /root/agentos-secrets.env`, or `rm`) and
+Then delete the secrets file (`shred -u "$SECRETS"`, or `rm`) and
 `/tmp/agentos-install.sh`, and say that you did. Note that the node's `.env`
 keeps its own copy at mode 0600 — that is where they live now.
 
@@ -466,12 +596,12 @@ command's own status and message. Read the message — it usually names the fix.
 | `cannot resolve the stable channel`, a curl failure on the tarball or the Node runtime | Network or GitHub. Packages may be installed; nothing else is. | Retry once. Still failing: report it as an outage, do not hand-download anything. |
 | `tarball checksum mismatch` | **Stop.** A release tarball that does not match its SHA256 is not a thing to work around. | Nothing was unpacked: the version directory is created only after the check passes, so the box is untouched apart from a partial download in `/tmp` that the next attempt overwrites. Retry once in case the download was truncated. If it repeats, report it and stop; never disable the check. |
 | A `tar`/`unzstd` failure right after the checksum passed | The download was good, the extraction was not. **This one does leave a trap**: `<install-dir>/versions/<tag>` now exists but is empty or partial, and the installer skips the whole download-and-unpack block when that directory is present — so a naive re-run points `current` at an empty tree and the node never starts. | Delete `<install-dir>/versions/<tag>` (and the tarball in `/tmp`) before retrying. Then re-run the installer. |
-| `node did not become healthy` (the last 50 journal lines were printed above it) | The unit is installed and enabled; the node did not answer `/healthz` in 45 attempts (~1.5-2 min). | Read that dump first. Then `journalctl -u agentos -n 200 --no-pager` and `tail -200 /opt/agentos/logs/node.log` — note that `/usr/local/bin/agentos` is not created until after the health gate, so the CLI is not there yet (and on a named instance it is `/usr/local/bin/agentos-<user>`, a wrapper, not a symlink). A wrong value in `.env` and a port already taken are the common causes. Fix the cause and re-run the installer; it is cheap the second time. |
+| `node did not become healthy` (the last 50 journal lines were printed above it) | The unit is installed and enabled; the node did not answer `/healthz` in 45 attempts (~1.5-2 min). | Read that dump first. Then `journalctl -u <unit> -n 200 --no-pager` and `sudo tail -200 <install-dir>/logs/node.log` — note that `/usr/local/bin/agentos` is not created until after the health gate, so the CLI is not there yet (and on a named instance it is `/usr/local/bin/agentos-<user>`, a wrapper, not a symlink). A wrong value in `.env` and a port already taken are the common causes. Fix the cause and re-run the installer; it is cheap the second time. |
 | `docker install failed`, `docker daemon is not reachable` | Docker, not AgentOS. | Follow the message, or drop `--docker` if the box can take the bare-metal profile. |
 | `install did not finish cleanly… your .env and data are kept` (container profile) | Same class as the health timeout. | Read the container's last log lines, fix, re-run. |
 | `! git clone <name> failed`, `! gh auth setup-git failed` | **Warnings, not failures.** The install succeeded; the brain did not arrive. | Check the token scope (`repo`, `read:org`) and the URL, then re-run the installer — `--repo` is re-run safe and fetches when the checkout is already there. |
 | `! that token does not look like a @BotFather token` | Shape check only; the installer never asks Telegram. | Let it finish, then verify by having the owner DM the bot. Silence means the token. |
-| The bot is silent, everything else is green | Wrong token, or another process is polling the same bot. | Ask whether this bot is running anywhere else. Two pollers is the usual answer. |
+| The bot is silent, everything else is green | Wrong token, or another process is polling the same bot. | Ask whether this bot is running anywhere else — including a rehearsal install you made yourself. Two pollers is the usual answer; rule 7 is how you avoid it. |
 
 Three habits that decide whether this goes well:
 
