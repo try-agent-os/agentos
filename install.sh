@@ -754,6 +754,21 @@ if [ -n "${AGENTOS_PRINT_IDENTITY:-}" ]; then
   exit 0
 fi
 
+# The instance label the core prints in front of its owner-facing alerts
+# (`[<label>/routine:foo] error: ...`, apps/api/src/core/instance-label.ts).
+# Several named instances share one host, so the machine hostname would sign an
+# agentos-aos failure with the box's name (agentos-hub) - 12418agfrm8. A named
+# instance is written its unit name as an explicit AGENTOS_INSTANCE; the default
+# unit `agentos` is the only instance on its box, where the hostname already
+# says the right thing, so it gets no key. Dry-run: AGENTOS_PRINT_INSTANCE.
+default_instance_label() {
+  if [ "$SERVICE_NAME" != "agentos" ]; then echo "$SERVICE_NAME"; fi
+}
+if [ -n "${AGENTOS_PRINT_INSTANCE:-}" ]; then
+  echo "instance=$(default_instance_label)"
+  exit 0
+fi
+
 # ─── host authority: the sudoers drop-in ─────────────────────────────────────
 #
 # install_selfmgmt_sudoers (systemd path) drops a file at
@@ -1135,6 +1150,10 @@ inherit_policy_from_dotenv() {
 
 write_env_systemd() {
   local preserved="" pair suffix canonical legacy value
+  local instance
+  # Read BEFORE the heredoc below truncates the file.
+  instance="$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null | sed -n 's/^AGENTOS_INSTANCE=//p' | tail -1 || true)"
+  [ -n "$instance" ] || instance="$(default_instance_label)"
   local TRUST_PROXY_SETTING; TRUST_PROXY_SETTING="$(trust_proxy_setting systemd)"
   for pair in \
     REPO_DIR:AGENTOS_REPO_DIR REPO_URL:AGENTOS_CONTEXT_IMPORT_URL \
@@ -1191,6 +1210,11 @@ AGENTOS_SIGNAL_INBOX=${INSTALL_DIR}/signals
 AGENTOS_SIGNAL_OUTBOX=${HOST_PREFIX}/var/lib/${SERVICE_NAME}/outbox
 EOF
   [ -n "$preserved" ] && printf '%s' "$preserved" | $SUDO tee -a "$INSTALL_DIR/.env" >/dev/null
+  # The alert label (default_instance_label above): an operator's own value
+  # survives a re-run, otherwise a named instance gets its unit name.
+  if [ -n "$instance" ]; then
+    echo "AGENTOS_INSTANCE=${instance}" | $SUDO tee -a "$INSTALL_DIR/.env" >/dev/null
+  fi
   $SUDO chmod 600 "$INSTALL_DIR/.env"
   # Explicit if, NOT `[ -n ] && …`: as the function's last command, a false
   # test would become its exit status and `set -e` would kill the install at

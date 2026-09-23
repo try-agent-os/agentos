@@ -1343,6 +1343,31 @@ snapshot_input() {
   du -ak "$AGENTOS_HOME/data" 2>/dev/null | awk 'END{if (NR>0) print $1" "NR}' || true
 }
 
+UPGRADE_ETA_GUESS=0
+# Sets UPGRADE_ETA_GUESS: the size AND file count of data/ over pessimistic copy
+# rates, capped at UPGRADE_ETA_CEILING. 0 when data/ cannot be sized.
+upgrade_eta_guess() {
+  local sized kb entries
+  UPGRADE_ETA_GUESS=0
+  sized="$(snapshot_input)"
+  kb="${sized%% *}"
+  # Split only on a reading that actually HAS both fields: with one token
+  # the two expansions would return the same number and the size would be
+  # charged a second time as an entry count.
+  case "$sized" in *" "*) entries="${sized##* }" ;; *) entries=0 ;; esac
+  case "$kb" in ''|*[!0-9]*) kb="" ;; esac
+  # A tree we could size but not count still gets its bytes priced; the
+  # entry term simply contributes nothing rather than voiding the estimate.
+  case "$entries" in ''|*[!0-9]*) entries=0 ;; esac
+  if [ -n "$kb" ] && [ "$kb" -gt 0 ]; then
+    UPGRADE_ETA_GUESS=$(( kb / SNAPSHOT_KB_PER_SEC + entries / SNAPSHOT_ENTRIES_PER_SEC ))
+  fi
+  if [ "$UPGRADE_ETA_GUESS" -gt "$UPGRADE_ETA_CEILING" ]; then
+    UPGRADE_ETA_GUESS="$UPGRADE_ETA_CEILING"
+  fi
+  return 0
+}
+
 UPGRADE_ETA_SECONDS=""
 UPGRADE_ETA_BASIS=""
 # Sets UPGRADE_ETA_SECONDS + UPGRADE_ETA_BASIS. Three sources, in order of how
@@ -1357,7 +1382,7 @@ UPGRADE_ETA_BASIS=""
 #      fact about this node, and labelled `estimated` so the notice never
 #      claims to have measured anything.
 upgrade_eta() {
-  local prev kb entries sized override
+  local prev override
   UPGRADE_ETA_BASIS=estimated
   override="$(dotenv_val AGENTOS_UPGRADE_ETA_SECONDS)"
   case "$override" in ''|*[!0-9]*) override="" ;; esac
@@ -1380,28 +1405,23 @@ upgrade_eta() {
           else (.downtime_seconds // empty) end' \
       "$UPGRADE_TIMING_FILE" 2>/dev/null || true)"
     case "$prev" in ''|*[!0-9]*) prev="" ;; esac
-    if [ -n "$prev" ]; then
+    # The guess is ALSO the lower bound of a measurement (self-heal
+    # ad8ff93fac13762f, third cycle, 2026-09-23). The window above only absorbs
+    # an outlier once it has three samples; a node whose file was written
+    # before the window existed carries ONE scalar, and when that one sample is
+    # a fast outlier nothing contradicts it. The hub recorded 140 s for
+    # 4.23.8 -> 4.24.0, announced «2 min 20 s» for 4.24.0 -> 4.25.0 and sat
+    # 846 s dark (snapshot 799 s) — while its own tree priced at
+    # 14776848/51200 + 380706/400 = 1239 s. A measurement is a fact about the
+    # PAST upgrade; the tree about to be copied is a fact about THIS one, so
+    # the announcement is whichever is larger. Labelled by the winner, so the
+    # notice never calls a guess a measurement.
+    upgrade_eta_guess
+    if [ -n "$prev" ] && [ "$prev" -ge "$UPGRADE_ETA_GUESS" ]; then
       UPGRADE_ETA_SECONDS="$prev"
       UPGRADE_ETA_BASIS=measured
     else
-      sized="$(snapshot_input)"
-      kb="${sized%% *}"
-      # Split only on a reading that actually HAS both fields: with one token
-      # the two expansions would return the same number and the size would be
-      # charged a second time as an entry count.
-      case "$sized" in *" "*) entries="${sized##* }" ;; *) entries=0 ;; esac
-      case "$kb" in ''|*[!0-9]*) kb="" ;; esac
-      # A tree we could size but not count still gets its bytes priced; the
-      # entry term simply contributes nothing rather than voiding the estimate.
-      case "$entries" in ''|*[!0-9]*) entries=0 ;; esac
-      if [ -n "$kb" ] && [ "$kb" -gt 0 ]; then
-        UPGRADE_ETA_SECONDS=$(( kb / SNAPSHOT_KB_PER_SEC + entries / SNAPSHOT_ENTRIES_PER_SEC ))
-      else
-        UPGRADE_ETA_SECONDS=0
-      fi
-      if [ "$UPGRADE_ETA_SECONDS" -gt "$UPGRADE_ETA_CEILING" ]; then
-        UPGRADE_ETA_SECONDS="$UPGRADE_ETA_CEILING"
-      fi
+      UPGRADE_ETA_SECONDS="$UPGRADE_ETA_GUESS"
     fi
   fi
   if [ "$UPGRADE_ETA_SECONDS" -lt "$UPGRADE_ETA_FLOOR" ]; then
