@@ -42,6 +42,13 @@
 #                              unit. Pick it when the node shares a host with something off-limits.
 #   -y, --yes                  Never prompt; fail instead of asking.
 #
+# EXIT CODES: 0 — the node is running with the host authority above in place
+# (the closing headline is exactly "AgentOS Node is running."). 3 — systemd mode
+# only: the node is running, but its sudoers drop-in could NOT be installed (no
+# visudo, a render visudo rejected, or an unwritable /etc/sudoers.d), so it has
+# NO root; the closing banner says why and how to fix it. Anything else — the
+# install failed.
+#
 # CONTOUR ACCESS — an instance gets ALL of its contour's access at install time,
 # so nothing has to be handed to it by hand afterwards (secrets, gh/git to its
 # repos, checkouts). Three flags declare it; all are systemd-mode and re-run safe:
@@ -253,7 +260,7 @@ while [ $# -gt 0 ]; do
     -y|--yes)       ASSUME_YES=1; shift ;;
     # Line range = the whole header block above (ends one line before
     # `set -euo pipefail`). Grow the header, grow this range, or --help truncates.
-    -h|--help)      sed -n '2,97p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,104p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              die "unknown option: $1 (try --help)" ;;
   esac
 done
@@ -668,6 +675,10 @@ setup_contour_repos() {
       fi
     else
       if GH_TOKEN="$token" run_as_service git clone "$url" "$reposdir/$name" >/dev/null 2>&1; then
+        # A checkout that did not exist when the node booted: the node reads its
+        # context registry once, at boot, so this clone is invisible to it until
+        # the next start. adopt_contour_changes restarts on this count.
+        CONTOUR_REPOS_NEW=$((CONTOUR_REPOS_NEW + 1))
         ok "cloned ${name} → ${reposdir}/${name}"
       else
         warn "git clone ${name} failed — check the token or the URL (${url})"
@@ -675,6 +686,108 @@ setup_contour_repos() {
     fi
   done
 }
+
+# ─── adopting what a run changed (systemd) ──────────────────────────────────
+#
+# The node reads .env (EnvironmentFile=) and its context registry exactly once,
+# at boot. `systemctl enable --now` starts a STOPPED unit and does nothing to a
+# running one, and the contour repos are cloned only after the node has already
+# answered /healthz. So a re-run over a live node used to merge new secrets into
+# .env and clone the context checkout, report both as done — and leave the node
+# running on the old environment with no idea the checkout exists (no
+# `[contexts]` line, MainPID unchanged) until someone ran `systemctl restart` by
+# hand. That is not a race; it happened every time (ClickUp 12418agfwfr). The
+# same holds on a very first install that passes --repo: the clone lands after
+# the boot that read the registry.
+#
+# The rule: restart the unit once, at the end, when this run changed something
+# the running process read at boot — its config (the .env contents or the unit
+# file) while it was already running, or a checkout that did not exist at boot.
+# A re-run that changed nothing does not bounce the node.
+CONTOUR_REPOS_NEW=0
+
+# A digest of what the running process read at boot: the .env contents (order-
+# insensitive — write_env_systemd and the secrets merge re-emit the same keys in
+# a different order without changing anything) plus the rendered unit and the
+# release the `current` link points at. Only a hash leaves this function; the
+# .env values it covers are never printed.
+node_config_fingerprint() { # node_config_fingerprint → sha256 hex
+  {
+    read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null \
+      | grep -Ev '^[[:space:]]*(#|$)' | LC_ALL=C sort || true
+    echo "--- unit"
+    read_maybe_sudo "${HOST_PREFIX}/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null || true
+    echo "--- current"
+    ${SUDO:-} readlink "$INSTALL_DIR/current" 2>/dev/null || true
+  } | sha256sum | cut -d' ' -f1
+}
+
+# Pure decision, testable without a box: scripts/tests/install-restart.test.sh.
+restart_decision() { # restart_decision <was-active 0|1> <config-changed 0|1> <new-checkouts N> → none | restart <reason>
+  local was_active="$1" changed="$2" new="${3:-0}" why=""
+  case "$new" in ''|*[!0-9]*) new=0 ;; esac
+  [ "$was_active" = 1 ] && [ "$changed" = 1 ] && why="config changed under the running node"
+  if [ "$new" -gt 0 ]; then
+    why="${why:+${why}; }${new} contour checkout(s) cloned after boot"
+  fi
+  if [ -n "$why" ]; then echo "restart ${why}"; else echo "none"; fi
+}
+
+# What the node said about AGENTOS_REPO_DIR in the log written since the restart.
+# Reads the log chunk on stdin → adopted | not-a-checkout | registry-kept | silent
+adoption_verdict() {
+  local chunk; chunk="$(cat)"
+  if grep -q '\[contexts\] adoption: AGENTOS_REPO_DIR adopted' <<<"$chunk"; then echo adopted
+  elif grep -q '\[contexts\] adoption: AGENTOS_REPO_DIR=.* is not a git checkout' <<<"$chunk"; then echo not-a-checkout
+  elif grep -q '\[contexts\] bootstrap:' <<<"$chunk"; then echo registry-kept
+  else echo silent
+  fi
+}
+
+# Restart when restart_decision says so, gate on health, and read the verdict on
+# AGENTOS_REPO_DIR out of the node's own log (the unit appends to logs/node.log,
+# not the journal).
+adopt_contour_changes() { # adopt_contour_changes <was-active 0|1> <fingerprint-before>
+  local was_active="$1" before="$2" changed=0 decision log offset repo_dir verdict
+  [ "$(node_config_fingerprint)" = "$before" ] || changed=1
+  decision="$(restart_decision "$was_active" "$changed" "$CONTOUR_REPOS_NEW")"
+  [ "$decision" = none ] && return 0
+  step "Restart to adopt this run's changes"
+  info "${decision#restart }"
+  log="$INSTALL_DIR/logs/node.log"
+  offset="$($SUDO stat -c %s "$log" 2>/dev/null || echo 0)"
+  $SUDO systemctl restart "$SERVICE_NAME"
+  # `systemctl restart` returns once the new process is started, and /healthz
+  # below is then answered by the new process only.
+  wait_healthz || { $SUDO tail -n 50 "$log" 2>/dev/null || true; die "node did not become healthy after the restart"; }
+  ok "node restarted and healthy"
+  repo_dir="$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null | sed -n 's/^AGENTOS_REPO_DIR=//p' | tail -1 || true)"
+  [ -n "$repo_dir" ] || return 0
+  verdict="$({ $SUDO tail -c "+$((offset + 1))" "$log" 2>/dev/null || true; } | adoption_verdict)"
+  case "$verdict" in
+    adopted)        ok "context adopted: ${repo_dir}" ;;
+    registry-kept)  info "the node already has a context — AGENTOS_REPO_DIR (${repo_dir}) is adopted only into an empty registry" ;;
+    not-a-checkout) warn "the node skipped AGENTOS_REPO_DIR=${repo_dir}: not a git checkout — check the --repo clone above" ;;
+    *)              warn "no [contexts] line in ${log} after the restart — check: grep '\[contexts\]' ${log}" ;;
+  esac
+}
+
+# Dry-run hooks for scripts/tests/install-restart.test.sh — same early-exit
+# contract as AGENTOS_PRINT_MODE below: no machine, network or root touched.
+if [ -n "${AGENTOS_PRINT_RESTART_DECISION:-}" ]; then
+  restart_decision "${AGENTOS_TEST_WAS_ACTIVE:-0}" "${AGENTOS_TEST_CONFIG_CHANGED:-0}" "${AGENTOS_TEST_NEW_CHECKOUTS:-0}"
+  exit 0
+fi
+if [ -n "${AGENTOS_PRINT_ADOPTION:-}" ]; then
+  adoption_verdict
+  exit 0
+fi
+if [ -n "${AGENTOS_PRINT_CONFIG_FINGERPRINT:-}" ]; then
+  HOST_PREFIX="$AGENTOS_PRINT_CONFIG_FINGERPRINT"   # the hook's value is the stand-in for /
+  SUDO=""
+  node_config_fingerprint
+  exit 0
+fi
 
 # ─── install mode ───────────────────────────────────────────────────────────
 #
@@ -1459,7 +1572,11 @@ install_systemd() {
   $SUDO apt-get -o DPkg::Lock::Timeout=300 update -qq
   # `acl` (setfacl/getfacl): reconcile_secret_reader_acls re-asserts the rx ACL
   # of any declared external secret reader on every run — see --secret-reader.
-  $SUDO apt-get -o DPkg::Lock::Timeout=300 install -y -qq ffmpeg git tmux curl zstd jq ca-certificates acl
+  # `sudo` (sudo + visudo): the host-authority drop-in below is validated with
+  # visudo and is useless without sudo. A minimal Debian run as root ships
+  # neither, and the drop-in used to be skipped there with a warning while the
+  # install still reported success (12418agfwft).
+  $SUDO apt-get -o DPkg::Lock::Timeout=300 install -y -qq ffmpeg git tmux curl zstd jq ca-certificates acl sudo
 
   step "Release"
   local manifest tag tarball sha node_ver url
@@ -1552,6 +1669,11 @@ install_systemd() {
     install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.280"
 
   step "Config + unit"
+  # Snapshot what a RUNNING node booted with, before this run rewrites any of
+  # it: adopt_contour_changes restarts the unit at the end if it moved.
+  local was_active=0 cfg_before
+  if $SUDO systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then was_active=1; fi
+  cfg_before="$(node_config_fingerprint)"
   # Before the wholesale rewrite, never after: .env is the only place a narrowed
   # auto-update policy still lives once the drop-in is gone.
   inherit_policy_from_dotenv
@@ -1618,6 +1740,9 @@ install_systemd() {
   # account, using the token now in .env. Best-effort per repo: a repo that will
   # not clone must not fail an otherwise-healthy install.
   setup_contour_repos
+  # `enable --now` above did not touch an already-running node, and the clones
+  # just landed after its boot: restart once if either left it stale.
+  adopt_contour_changes "$was_active" "$cfg_before"
 
   # The CLI needs to know WHICH install it operates on. For the default node
   # that is its own built-in default, so it stays the plain symlink it has
@@ -1677,33 +1802,97 @@ EOF
 # re-running without it widens a scoped one back. Validated with `visudo -cf`
 # BEFORE it is moved into place — a malformed file in /etc/sudoers.d can lock
 # sudo out of the whole host, so a render that fails validation is discarded,
-# never installed. Degrades to a warning (never a failed install) on a host with
-# no sudo/visudo.
+# never installed.
+#
+# A drop-in that could not be installed does NOT fail the install (the node
+# itself runs fine), but it is never a quiet warning either: it records why in
+# HOST_AUTHORITY_MISSING, and the closing banner (host_authority_banner) then
+# drops the "AgentOS Node is running." headline, says in capitals that the node
+# has no root, and the script exits EXIT_NO_HOST_AUTHORITY instead of 0. Before
+# that, a box with no visudo produced exit 0 + the success headline + an active
+# unit + a green /healthz, and an agent following the install runbook reported
+# to its owner a root grant the node did not have (12418agfwft).
+#
+# Missing visudo is first repaired, not reported: on an apt host the sudo
+# package is installed here (install_systemd already asks for it; this covers a
+# package step that did not deliver it).
+HOST_AUTHORITY_MISSING=""
+EXIT_NO_HOST_AUTHORITY=3
 install_selfmgmt_sudoers() {
   step "Host authority (sudoers)"
+  if ! command -v visudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+    info "visudo not found — installing the sudo package"
+    $SUDO apt-get -o DPkg::Lock::Timeout=300 install -y -qq sudo >/dev/null 2>&1 || true
+    hash -r 2>/dev/null || true
+  fi
   if ! command -v visudo >/dev/null 2>&1; then
     warn "visudo not found — the instance's sudoers drop-in was NOT installed."
     info "install the sudo package, then re-run to grant it."
+    HOST_AUTHORITY_MISSING="visudo not found (the sudo package is not installed)"
     return 0
   fi
-  local dropin="/etc/sudoers.d/${SERVICE_USER}-selfmgmt"
+  local dropin="${HOST_PREFIX}/etc/sudoers.d/${SERVICE_USER}-selfmgmt"
   local tmp; tmp="$(mktemp)"
   render_selfmgmt_sudoers "$SERVICE_USER" "$SERVICE_NAME" "$SUDO_SCOPE" > "$tmp"
   # visudo -cf checks THIS file's syntax in isolation; -f names the file.
-  if $SUDO visudo -cf "$tmp" >/dev/null 2>&1; then
-    # 0440 root:root is the required mode for a sudoers.d drop-in; `install`
-    # sets owner+mode atomically as it copies.
-    $SUDO install -m 0440 -o root -g root "$tmp" "$dropin"
-    if [ "$SUDO_SCOPE" = "selfmgmt" ]; then
-      ok "self-management → ${dropin} (restart/status/journal on ${SERVICE_NAME} only)"
-    else
-      ok "host authority → ${dropin} (${SERVICE_USER} has passwordless root; --scoped-sudo narrows it)"
-    fi
+  if ! $SUDO visudo -cf "$tmp" >/dev/null 2>&1; then
+    warn "generated sudoers failed visudo -cf — the sudoers drop-in was NOT installed (the node cannot sudo)."
+    HOST_AUTHORITY_MISSING="the generated drop-in failed visudo -cf"
+  # 0440 root:root is the required mode for a sudoers.d drop-in; `install`
+  # sets owner+mode atomically as it copies.
+  elif ! $SUDO install -m 0440 -o root -g root "$tmp" "$dropin" 2>/dev/null; then
+    warn "could not write ${dropin} — the sudoers drop-in was NOT installed (the node cannot sudo)."
+    HOST_AUTHORITY_MISSING="could not write ${dropin}"
+  elif [ "$SUDO_SCOPE" = "selfmgmt" ]; then
+    ok "self-management → ${dropin} (restart/status/journal on ${SERVICE_NAME} only)"
   else
-    warn "generated sudoers failed visudo -cf — NOT installed (the node cannot sudo)."
+    ok "host authority → ${dropin} (${SERVICE_USER} has passwordless root; --scoped-sudo narrows it)"
   fi
   rm -f "$tmp"
 }
+
+# The closing headline of a systemd install, and the exit code that goes with
+# it. "AgentOS Node is running." is the literal an installing agent is told to
+# look for, so it is printed ONLY when the host authority the install promised
+# is actually in place; otherwise the headline itself says what is missing.
+host_authority_headline() {
+  if [ -z "$HOST_AUTHORITY_MISSING" ]; then
+    echo -e "${GREEN}${BOLD}AgentOS Node is running.${NC}"
+  else
+    echo -e "${YELLOW}${BOLD}AgentOS Node is up, but WITHOUT HOST AUTHORITY: the sudoers drop-in was NOT installed.${NC}"
+  fi
+}
+host_authority_banner() {
+  [ -n "$HOST_AUTHORITY_MISSING" ] || return 0
+  local what="passwordless root on this host"
+  [ "$SUDO_SCOPE" = "selfmgmt" ] && what="restart/status/journal on its own unit (--scoped-sudo)"
+  echo
+  echo -e "  ${YELLOW}${BOLD}!! NO HOST AUTHORITY${NC}  ${SERVICE_USER} does NOT have ${what}."
+  echo "               Why: ${HOST_AUTHORITY_MISSING}."
+  echo "               The bot works, but anything that needs sudo will fail. Do not report"
+  echo "               this node as having root. Fix: apt-get install sudo, then re-run this"
+  echo "               install with the same flags. Exit code: ${EXIT_NO_HOST_AUTHORITY}."
+}
+host_authority_exit_code() {
+  if [ -z "$HOST_AUTHORITY_MISSING" ]; then echo 0; else echo "$EXIT_NO_HOST_AUTHORITY"; fi
+}
+
+# "What would this command line report about host authority?" — runs the real
+# install_selfmgmt_sudoers against a temp stand-in for the host's /
+# ($AGENTOS_PRINT_HOST_AUTHORITY, the drop-in lands under its etc/sudoers.d)
+# with whatever visudo/apt-get the caller's PATH offers, then prints the
+# closing headline, the banner and the exit code the install would end with.
+# Same early-exit contract as the other print hooks. Driven by
+# scripts/tests/install-sudoers.test.sh.
+if [ -n "${AGENTOS_PRINT_HOST_AUTHORITY:-}" ]; then
+  SUDO="${SUDO:-}"                       # not yet resolved this early
+  HOST_PREFIX="$AGENTOS_PRINT_HOST_AUTHORITY"
+  install_selfmgmt_sudoers
+  host_authority_headline
+  host_authority_banner
+  echo "exit=$(host_authority_exit_code)"
+  exit 0
+fi
 
 # Install + arm the unattended update timer. Mode-agnostic: the poller and its
 # systemd units ride the same profiles/ layer as the agentos CLI, so both the
@@ -2013,7 +2202,7 @@ if [ "$INSTALL_MODE" = "systemd" ]; then
 
   cat <<EOF
 
-$(echo -e "${GREEN}${BOLD}AgentOS Node is running.${NC}")
+$(host_authority_headline)
 
   $(echo -e "${BOLD}Bot${NC}")        message it on Telegram — it is already polling.
 $(if [ -z "${ADMIN_IDS:-}${ADMIN_USERNAMES:-}" ]; then
@@ -2030,9 +2219,10 @@ $(if [ -z "${ADMIN_IDS:-}${ADMIN_USERNAMES:-}" ]; then
   logs      journalctl -u $SERVICE_NAME -f
   status    systemctl status $SERVICE_NAME
   cli       $SERVICE_NAME status | logs [n] | version | upgrade [--to <tag>] | rollback | backup
-
 EOF
-  exit 0
+  host_authority_banner
+  echo
+  exit "$(host_authority_exit_code)"
 fi
 
 # ─── 1. docker ──────────────────────────────────────────────────────────────
