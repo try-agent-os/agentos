@@ -6,6 +6,12 @@
 # Non-interactive (a client install, CI, or a re-run) — every answer has a flag:
 #
 #   --token <bot-token>        @BotFather token           (else: prompt, or $TELEGRAM_BOT_TOKEN)
+#   --create-bot               No BotFather: the AgentOS manager bot creates YOUR bot. The script
+#                              prints a t.me link (+ QR), you confirm in Telegram, and the new bot's
+#                              token arrives sealed to a key this run generated — never in your hands,
+#                              argv or logs. Asks "bot @x, created by @you — use it?" (--yes skips);
+#                              --admin defaults to the account that created the bot. Needs python3.
+#   --manager-url <url>        Base URL of the manager node for --create-bot (or $AGENTOS_MANAGER_URL).
 #   --admin <id|username>      Auto-approved admin: a numeric Telegram id (123510069) or a Telegram
 #                              username (vasily, or @vasily — the @ is optional). Comma-separate to
 #                              name several, in any mix. Omit it entirely and the node is UNCLAIMED:
@@ -149,6 +155,18 @@ INSTALL_MODE=""                  # docker | systemd; empty → resolved after ar
 HOST_PREFIX=""
 
 BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+# --create-bot: the bot is created through a managed-bots MANAGER node instead
+# of @BotFather (docs/plans/2026-09-23-managed-bot-onboarding.md §4.2).
+# DEFAULT_MANAGER_URL is the public origin of the product's manager node; it is
+# empty until that origin is published, and while it is empty the installer
+# offers the BotFather path only — "create the bot for me" is offered by default
+# exactly when a manager URL is known (flag, env, or this constant).
+DEFAULT_MANAGER_URL=""
+CREATE_BOT="${AGENTOS_CREATE_BOT:-0}"
+MANAGER_URL="${AGENTOS_MANAGER_URL:-$DEFAULT_MANAGER_URL}"
+CREATED_BOT_USERNAME=""   # filled by create_bot_via_manager
+CLAIMER_ID=""             # the Telegram account that created the bot → --admin default
+CLAIMER_USERNAME=""
 # --admin's raw value: one comma list mixing numeric ids and usernames, split by
 # parse_admin (below) into the two keys the core reads. Both env vars keep
 # working as the defaults they are today; --admin replaces them wholesale.
@@ -239,6 +257,8 @@ plain_dir_ok() { # plain_dir_ok <path> <label> -> 0 when it is safe to create/ch
 while [ $# -gt 0 ]; do
   case "$1" in
     --token)        BOT_TOKEN="${2:?--token needs a value}"; shift 2 ;;
+    --create-bot)   CREATE_BOT=1; shift ;;
+    --manager-url)  MANAGER_URL="${2:?--manager-url needs a value}"; shift 2 ;;
     --admin)        ADMIN_INPUT="${2:?--admin needs a value}"; shift 2 ;;
     --domain)       DOMAIN="${2:?--domain needs a value}"; HTTPS_MODE="caddy"; shift 2 ;;
     --tunnel-token) TUNNEL_TOKEN="${2:?--tunnel-token needs a value}"; HTTPS_MODE="cloudflared"; shift 2 ;;
@@ -260,7 +280,7 @@ while [ $# -gt 0 ]; do
     -y|--yes)       ASSUME_YES=1; shift ;;
     # Line range = the whole header block above (ends one line before
     # `set -euo pipefail`). Grow the header, grow this range, or --help truncates.
-    -h|--help)      sed -n '2,104p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,110p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              die "unknown option: $1 (try --help)" ;;
   esac
 done
@@ -1181,6 +1201,419 @@ ask_admin() {
     parse_admin "$answer"
   fi
 }
+
+# ─── --create-bot: a bot without @BotFather (managed bots, stage 2) ─────────
+#
+# Design: docs/plans/2026-09-23-managed-bot-onboarding.md §4.2-§4.3, threat
+# model §3. The manager side is apps/api/src/core/managed-bots (stage 1).
+#
+#   1. an ephemeral X25519 keypair; the private half lives in a 0600 file in a
+#      0700 temp dir that is removed on exit, and never in a variable or argv;
+#   2. POST <manager>/managed-bots/claims with the public half → claim id, a
+#      poll secret, a t.me link; the link (+ a QR when qrencode exists) is
+#      printed and the owner opens it in Telegram and confirms the new bot;
+#   3. GET <manager>/managed-bots/claims/<id> with the poll secret in the
+#      X-Poll-Secret HEADER — read by curl from a 0600 file (`-H @file`), so
+#      it is in neither the URL nor argv — until 200 (once), 404 or the timeout;
+#   4. the sealed envelope is opened in-process and the token comes back on the
+#      helper's stdout into $BOT_TOKEN, which only ever reaches .env through
+#      the builtin printf of set_env / write_env_systemd (threat T8);
+#   5. "bot @x, created by @y — use it?" before anything is written (T5).
+#
+# WHY PYTHON AND NOT OPENSSL: `openssl enc` has no AES-GCM, and every openssl
+# subcommand that would do the HKDF or the AES step takes its key as an argv
+# hex string — a secret in `ps`. The helper below is the Python standard
+# library only (X25519 ladder, HKDF-SHA256, AES-256 + GHASH), pinned to the
+# shared test vector apps/api/src/core/managed-bots/seal-vector.v1.json by
+# scripts/tests/install-create-bot.test.sh.
+managed_bot_helper_source() {
+  cat <<'PY'
+import base64, hashlib, hmac, json, os, re, sys
+
+# Envelope v1 of apps/api/src/core/managed-bots/seal.ts, opened with nothing but
+# the Python standard library. Every secret travels through files and stdout,
+# never through argv (threats T7/T8 of the design).
+
+P = 2**255 - 19
+
+
+def x25519(k, u):
+    k = bytearray(k)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    k = int.from_bytes(bytes(k), 'little')
+    u = int.from_bytes(u, 'little') & ((1 << 255) - 1)
+    x1, x2, z2, x3, z3, swap = u, 1, 0, u, 1, 0
+    for t in range(254, -1, -1):
+        kt = (k >> t) & 1
+        swap ^= kt
+        if swap:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = kt
+        a = x2 + z2; aa = a * a; b = x2 - z2; bb = b * b; e = aa - bb
+        c = x3 + z3; d = x3 - z3; da = d * a; cb = c * b
+        x3 = (da + cb) ** 2 % P
+        z3 = x1 * (da - cb) ** 2 % P
+        x2 = aa * bb % P
+        z2 = e * (aa + 121665 * e) % P
+    if swap:
+        x2, z2 = x3, z3
+    return (x2 * pow(z2, P - 2, P) % P).to_bytes(32, 'little')
+
+
+def _sbox():
+    box = [0] * 256
+    p = q = 1
+    while True:
+        p = p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)
+        q ^= q << 1; q ^= q << 2; q ^= q << 4; q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        r = q ^ (((q << 1) | (q >> 7)) & 0xFF) ^ (((q << 2) | (q >> 6)) & 0xFF) \
+            ^ (((q << 3) | (q >> 5)) & 0xFF) ^ (((q << 4) | (q >> 4)) & 0xFF)
+        box[p] = r ^ 0x63
+        if p == 1:
+            break
+    box[0] = 0x63
+    return box
+
+
+SBOX = _sbox()
+
+
+def _xt(a):
+    return ((a << 1) ^ 0x1B) & 0xFF if a & 0x80 else a << 1
+
+
+def aes256_round_keys(key):
+    w = [list(key[i:i + 4]) for i in range(0, 32, 4)]
+    rcon = 1
+    for i in range(8, 60):
+        t = list(w[i - 1])
+        if i % 8 == 0:
+            t = [SBOX[b] for b in t[1:] + t[:1]]
+            t[0] ^= rcon
+            rcon = _xt(rcon)
+        elif i % 8 == 4:
+            t = [SBOX[b] for b in t]
+        w.append([a ^ b for a, b in zip(w[i - 8], t)])
+    return [sum(w[r * 4:r * 4 + 4], []) for r in range(15)]
+
+
+def aes_encrypt_block(rk, block):
+    s = [b ^ k for b, k in zip(block, rk[0])]
+    for r in range(1, 15):
+        s = [SBOX[b] for b in s]
+        s = [s[(i + 4 * (i % 4)) % 16] for i in range(16)]  # ShiftRows (column-major)
+        if r != 14:
+            m = []
+            for c in range(4):
+                a = s[4 * c:4 * c + 4]
+                t = a[0] ^ a[1] ^ a[2] ^ a[3]
+                m += [a[i] ^ t ^ _xt(a[i] ^ a[(i + 1) % 4]) for i in range(4)]
+            s = m
+        s = [b ^ k for b, k in zip(s, rk[r])]
+    return bytes(s)
+
+
+def _gmul(x, y):
+    z, v = 0, y
+    for i in range(127, -1, -1):
+        if (x >> i) & 1:
+            z ^= v
+        v = (v >> 1) ^ (0xE1 << 120) if v & 1 else v >> 1
+    return z
+
+
+def gcm_open(key, iv, ct, tag):
+    if len(iv) != 12 or len(tag) != 16:
+        raise ValueError('bad nonce or tag length')
+    rk = aes256_round_keys(key)
+    h = int.from_bytes(aes_encrypt_block(rk, bytes(16)), 'big')
+    x = 0
+    for i in range(0, len(ct), 16):
+        x = _gmul(x ^ int.from_bytes(ct[i:i + 16].ljust(16, b'\0'), 'big'), h)
+    x = _gmul(x ^ (len(ct) * 8), h)
+    j0 = iv + b'\0\0\0\1'
+    want = (x ^ int.from_bytes(aes_encrypt_block(rk, j0), 'big')).to_bytes(16, 'big')
+    if not hmac.compare_digest(want, tag):
+        raise ValueError('authentication tag mismatch')
+    out = bytearray()
+    for n, i in enumerate(range(0, len(ct), 16)):
+        ks = aes_encrypt_block(rk, iv + (2 + n).to_bytes(4, 'big'))
+        out += bytes(a ^ b for a, b in zip(ct[i:i + 16], ks))
+    return bytes(out)
+
+
+def hkdf_sha256(ikm, salt, info, length=32):
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    okm, t, n = b'', b'', 1
+    while len(okm) < length:
+        t = hmac.new(prk, t + info + bytes([n]), hashlib.sha256).digest()
+        okm += t
+        n += 1
+    return okm[:length]
+
+
+def open_envelope(env, priv, claim_id):
+    if env.get('v') != 1 or env.get('alg') != 'X25519-HKDF-SHA256-AES-256-GCM':
+        raise ValueError('unsupported envelope')
+    b = lambda k: base64.b64decode(env[k], validate=True)
+    epk = b('epk')
+    if len(epk) != 32:
+        raise ValueError('bad ephemeral key')
+    shared = x25519(priv, epk)
+    if shared == bytes(32):
+        raise ValueError('degenerate shared secret')
+    key = hkdf_sha256(shared, claim_id.encode(), b'agentos/managed-bot-token/v1')
+    return gcm_open(key, b('iv'), b('ct'), b('tag')).decode('utf-8')
+
+
+def write_private(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'wb') as f:
+        f.write(data)
+
+
+def load(path):
+    with open(path, 'rb') as f:
+        return json.loads(f.read().decode('utf-8'))
+
+
+def user_fields(u):
+    u = u if isinstance(u, dict) else {}
+    uid = u.get('id')
+    uid = str(uid) if isinstance(uid, int) and not isinstance(uid, bool) and uid > 0 else ''
+    name = u.get('username')
+    name = name if isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9_]{1,64}', name) else ''
+    return uid, name
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ''
+    if cmd == 'keygen':  # keygen <private-key-file> -> base64(raw public key)
+        priv = os.urandom(32)
+        write_private(argv[2], priv)
+        print(base64.b64encode(x25519(priv, (9).to_bytes(32, 'little'))).decode())
+    elif cmd == 'claim':  # claim <response> <header-file> -> id, link; poll secret -> header file
+        r = load(argv[2])
+        cid, secret, link = r.get('id'), r.get('poll_secret'), r.get('link')
+        if not (isinstance(cid, str) and re.fullmatch(r'[A-Za-z0-9_-]{8,128}', cid)):
+            raise ValueError('bad claim id')
+        if not (isinstance(secret, str) and re.fullmatch(r'[A-Za-z0-9_-]{8,256}', secret)):
+            raise ValueError('bad poll secret')
+        if not (isinstance(link, str) and re.fullmatch(r'https://t\.me/[A-Za-z0-9_]+\?start=[A-Za-z0-9_-]+', link)):
+            raise ValueError('bad link')
+        write_private(argv[3], ('X-Poll-Secret: ' + secret + '\n').encode())
+        print(cid)
+        print(link)
+    elif cmd == 'status':  # status <response> -> status, claimer id/username, bot id/username
+        r = load(argv[2])
+        st = r.get('status') if r.get('status') in ('pending', 'fulfilled') else ''
+        print(st)
+        print('\n'.join(user_fields(r.get('claimed_by'))))
+        print('\n'.join(user_fields(r.get('bot'))))
+    elif cmd == 'open':  # open <private-key-file> <claim-id> <response> -> token on stdout
+        with open(argv[2], 'rb') as f:
+            priv = f.read()
+        if len(priv) != 32:
+            raise ValueError('bad private key')
+        env = load(argv[4]).get('sealed')
+        if not isinstance(env, dict):
+            raise ValueError('no sealed envelope')
+        sys.stdout.write(open_envelope(env, priv, argv[3]))
+    else:
+        raise SystemExit('usage: keygen|claim|status|open')
+
+
+try:
+    main(sys.argv)
+except SystemExit:
+    raise
+except Exception as e:  # the message never carries key material
+    sys.stderr.write('managed-bot helper: %s\n' % e)
+    sys.exit(2)
+PY
+}
+
+CREATE_BOT_TMP=""
+create_bot_cleanup() {
+  [ -n "$CREATE_BOT_TMP" ] && rm -rf "$CREATE_BOT_TMP"
+  CREATE_BOT_TMP=""
+}
+
+managed_bot_helper() { # managed_bot_helper <cmd> [args...] — every secret via files/stdout
+  python3 -c "$(managed_bot_helper_source)" "$@"
+}
+
+# The manager has to be reached over https; plain http is accepted for the
+# loopback only (a manager on this same host, and the test suite's stub).
+manager_url_ok() { # manager_url_ok <url>
+  case "$1" in
+    https://?*) return 0 ;;
+    http://127.0.0.1:*|http://127.0.0.1|http://localhost:*|http://localhost|http://\[::1\]:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_python3_for_create_bot() {
+  command -v python3 >/dev/null 2>&1 && return 0
+  if command -v apt-get >/dev/null 2>&1; then
+    info "installing python3 (opens the sealed bot token)…"
+    ${SUDO:-} sh -c 'apt-get update -qq && apt-get install -y -qq python3' >/dev/null 2>&1 || true
+  fi
+  command -v python3 >/dev/null 2>&1 \
+    || die "--create-bot needs python3 to open the sealed token and none could be installed. Install python3, or create the bot in @BotFather and pass --token."
+}
+
+create_bot_via_manager() { # sets BOT_TOKEN, CREATED_BOT_USERNAME, CLAIMER_ID, CLAIMER_USERNAME
+  local url="${MANAGER_URL%/}" code pub claim claim_id link status lines
+  local timeout="${AGENTOS_CREATE_BOT_TIMEOUT_S:-900}" interval="${AGENTOS_CREATE_BOT_POLL_S:-3}"
+  [ -n "$url" ] || die "--create-bot needs the manager's URL: pass --manager-url <https://…> (or set \$AGENTOS_MANAGER_URL). Without one, create the bot in @BotFather and pass --token."
+  manager_url_ok "$url" || die "--manager-url must be an https:// URL (plain http only for 127.0.0.1/localhost), got '${url}'"
+  if [ "$ASSUME_YES" != "1" ] && [ ! -t 0 ]; then
+    die "--create-bot asks you to confirm the bot it received and there is no terminal to ask on — pass --yes to accept it unasked."
+  fi
+  command -v curl >/dev/null 2>&1 || die "--create-bot needs curl."
+  ensure_python3_for_create_bot
+
+  CREATE_BOT_TMP="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/agentos-create-bot.XXXXXX")" \
+    || die "cannot create a private temp dir for the claim keypair"
+  trap create_bot_cleanup EXIT
+  local t="$CREATE_BOT_TMP"
+
+  step "Creating your bot through ${url}"
+  pub="$(managed_bot_helper keygen "$t/key")" || die "cannot generate the claim keypair"
+  printf '{"installer_public_key":"%s"}' "$pub" > "$t/req"
+  code="$(curl -sS --max-time 20 -o "$t/claim" -w '%{http_code}' \
+    -H 'Content-Type: application/json' --data-binary @"$t/req" \
+    "${url}/managed-bots/claims" 2>"$t/curl.err" || true)"
+  case "$code" in
+    201) : ;;
+    404) die "${url} is not a managed-bots manager (404 — the role is off there, or the URL is wrong). Create the bot in @BotFather and pass --token." ;;
+    429) die "the manager is rate-limiting claims from this address — wait ten minutes and re-run." ;;
+    000) die "cannot reach ${url}: $(head -c 300 "$t/curl.err")" ;;
+    *)   die "the manager refused the claim (HTTP ${code}). Create the bot in @BotFather and pass --token." ;;
+  esac
+  claim="$(managed_bot_helper claim "$t/claim" "$t/poll-header")" \
+    || die "the manager answered the claim with something this installer cannot read"
+  claim_id="$(sed -n 1p <<<"$claim")"
+  link="$(sed -n 2p <<<"$claim")"
+
+  echo
+  echo -e "  ${BOLD}Open this link in Telegram and tap \"Create my bot\":${NC}"
+  echo
+  echo -e "    ${CYAN}${link}${NC}"
+  echo
+  if command -v qrencode >/dev/null 2>&1; then
+    qrencode -t ANSIUTF8 -m 2 "$link" 2>/dev/null || true
+  else
+    info "(no QR code: qrencode is not installed — open the link on your phone)"
+  fi
+  info "Waiting for the bot (up to $((timeout / 60)) min)…"
+
+  local deadline=$((SECONDS + timeout)) announced="" failures=0
+  while :; do
+    [ "$SECONDS" -lt "$deadline" ] \
+      || die "no bot arrived in time — the claim expired. Re-run to get a new link, or create the bot in @BotFather and pass --token."
+    code="$(curl -sS --max-time 20 -o "$t/poll" -w '%{http_code}' \
+      -H @"$t/poll-header" "${url}/managed-bots/claims/${claim_id}" 2>"$t/curl.err" || true)"
+    case "$code" in
+      200|202)
+        failures=0
+        lines="$(managed_bot_helper status "$t/poll")" || lines=""
+        status="$(sed -n 1p <<<"$lines")"
+        CLAIMER_ID="$(sed -n 2p <<<"$lines")"
+        CLAIMER_USERNAME="$(sed -n 3p <<<"$lines")"
+        if [ -n "$CLAIMER_ID" ] && [ -z "$announced" ]; then
+          announced=1
+          ok "link opened by ${CLAIMER_USERNAME:+@${CLAIMER_USERNAME} }(id ${CLAIMER_ID}) — confirm the new bot in Telegram"
+        fi
+        if [ "$code" = "200" ] && [ "$status" = "fulfilled" ]; then
+          CREATED_BOT_USERNAME="$(sed -n 5p <<<"$lines")"
+          break
+        fi ;;
+      404) die "the claim is gone (expired, or already collected). Re-run to get a new link." ;;
+      429) : ;;
+      *)
+        failures=$((failures + 1))
+        [ "$failures" -lt 10 ] || die "the manager stopped answering (last HTTP ${code}). Re-run, or create the bot in @BotFather and pass --token." ;;
+    esac
+    sleep "$interval"
+  done
+
+  # The fulfilled answer is served exactly once; the claim no longer exists on
+  # the manager, so from here on a failure means "re-run", never "retry".
+  BOT_TOKEN="$(managed_bot_helper open "$t/key" "$claim_id" "$t/poll")" \
+    || die "the bot's token arrived but could not be opened (tampered, or not sealed to this run). Nothing was written. Re-run, or use @BotFather and --token."
+  create_bot_cleanup
+  trap - EXIT
+  if ! grep -qE '^[0-9]+:[A-Za-z0-9_-]+$' <<<"$BOT_TOKEN"; then
+    BOT_TOKEN=""
+    die "the opened token is not a Telegram bot token — nothing was written."
+  fi
+
+  local who="${CLAIMER_USERNAME:+@${CLAIMER_USERNAME} }(id ${CLAIMER_ID:-?})"
+  ok "bot ${CREATED_BOT_USERNAME:+@${CREATED_BOT_USERNAME} }created by ${who}"
+  if [ "$ASSUME_YES" != "1" ]; then
+    local answer=""
+    read -r -p "$(echo -e "  ${BOLD}Use this bot for the node?${NC} ${DIM}[Y/n]${NC}: ")" answer </dev/tty || answer="n"
+    case "$answer" in
+      ""|y|Y|yes|YES) : ;;
+      *) BOT_TOKEN=""; die "declined — nothing was written. If that is not your account, someone else opened the link first: re-run for a new one." ;;
+    esac
+  fi
+}
+
+# No token given and none to reuse: offer the manager path when a manager URL
+# is known and there is a terminal to choose on; otherwise the BotFather prompt,
+# exactly as before.
+obtain_bot_token() {
+  if [ -n "$MANAGER_URL" ] && [ "$ASSUME_YES" != "1" ] && [ -t 0 ]; then
+    echo
+    info "This node needs its own Telegram bot."
+    echo -e "    ${BOLD}1${NC}) Create it for me                  ${DIM}(one tap in Telegram, no token to copy)${NC}"
+    echo -e "    ${BOLD}2${NC}) I have a @BotFather token"
+    local c=""
+    read -r -p "$(echo -e "  ${BOLD}Choice${NC} ${DIM}(1-2)${NC}: ")" c </dev/tty || true
+    if [ "${c:-1}" = "1" ]; then
+      create_bot_via_manager
+      return 0
+    fi
+  fi
+  info "Get one from @BotFather → /newbot. Looks like 123456:ABC-..."
+  BOT_TOKEN="$(ask 'Telegram bot token' '')"
+}
+
+# --admin defaults to the account that created the bot. Only when no admin was
+# named AND none was inherited from .env: an explicit --admin and a re-run's
+# sticky admins both outrank it.
+default_admin_from_claimer() {
+  [ -n "$CLAIMER_ID" ] || return 0
+  [ -z "${ADMIN_IDS}${ADMIN_USERNAMES}" ] || return 0
+  ADMIN_IDS="$CLAIMER_ID"
+  info "admin: ${CLAIMER_USERNAME:+@${CLAIMER_USERNAME} }(id ${CLAIMER_ID}) — the account that created the bot"
+}
+
+if [ "$CREATE_BOT" = "1" ] && [ -n "$BOT_TOKEN" ]; then
+  die "--create-bot and --token (or \$TELEGRAM_BOT_TOKEN) both given — pick one."
+fi
+
+# "What would --create-bot hand over?" — runs the real claim flow against
+# --manager-url (the suite's stub manager) and prints what it would configure,
+# the token only as a sha256. No install, no root, no .env.
+# Driven by scripts/tests/install-create-bot.test.sh.
+if [ -n "${AGENTOS_PRINT_CREATE_BOT:-}" ]; then
+  if [ "$CREATE_BOT" = "1" ]; then create_bot_via_manager; else obtain_bot_token; fi
+  default_admin_from_claimer
+  echo "bot=${CREATED_BOT_USERNAME}"
+  echo "claimer=${CLAIMER_ID}:${CLAIMER_USERNAME}"
+  echo "admin_ids=${ADMIN_IDS}"
+  echo "admin_usernames=${ADMIN_USERNAMES}"
+  echo "token_sha256=$(printf '%s' "$BOT_TOKEN" | sha256sum | cut -d' ' -f1)"
+  exit 0
+fi
 
 # Shared by both install modes (scripts/agentos's own wait_healthz mirrors this
 # exactly — keep the two in step). Docker mode still waits on `docker inspect`
@@ -2202,13 +2635,17 @@ if [ "$INSTALL_MODE" = "systemd" ]; then
   # `install.sh --user X --secrets f --repo r -y` — would die for want of --token
   # even though the token is right there in .env. $SUDO exists from §0, so the
   # 0600 root/service-owned file is readable here.
+  # --create-bot is an explicit "give this node a NEW bot": it outranks the
+  # token already in .env instead of being silently shadowed by it.
+  if [ "$CREATE_BOT" = "1" ]; then
+    create_bot_via_manager
+  fi
   if [ -z "$BOT_TOKEN" ] && [ -e "$INSTALL_DIR/.env" ]; then
     BOT_TOKEN="$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null | sed -n 's/^TELEGRAM_BOT_TOKEN=//p' | tail -1 || true)"
     [ -n "$BOT_TOKEN" ] && info "reusing the bot token from the existing .env"
   fi
   if [ -z "$BOT_TOKEN" ]; then
-    info "Get one from @BotFather → /newbot. Looks like 123456:ABC-..."
-    BOT_TOKEN="$(ask 'Telegram bot token' '')"
+    obtain_bot_token
   fi
   [ -n "$BOT_TOKEN" ] || die "a bot token is required."
   grep -qE '^[0-9]+:[A-Za-z0-9_-]+$' <<<"$BOT_TOKEN" \
@@ -2221,6 +2658,7 @@ if [ "$INSTALL_MODE" = "systemd" ]; then
   if [ "$ADMIN_INHERITED" = "1" ]; then
     info "reusing the admin(s) from the existing .env — pass --admin to replace them"
   fi
+  default_admin_from_claimer
   if [ -z "${ADMIN_IDS}${ADMIN_USERNAMES}" ] && [ "$ASSUME_YES" != "1" ] && [ -t 0 ]; then
     ask_admin
   fi
@@ -2438,13 +2876,16 @@ install_autoupdate_timer "$INSTALL_DIR"
 # ─── 3. answers ─────────────────────────────────────────────────────────────
 
 step "Configuration"
+# --create-bot outranks the token in .env — same rule as the bare-metal path.
+if [ "$CREATE_BOT" = "1" ]; then
+  create_bot_via_manager
+fi
 if [ -z "$BOT_TOKEN" ] && [ -f .env ]; then
   BOT_TOKEN="$(grep -E '^TELEGRAM_BOT_TOKEN=' .env | cut -d= -f2- || true)"
   [ -n "$BOT_TOKEN" ] && info "reusing the bot token from the existing .env"
 fi
 if [ -z "$BOT_TOKEN" ]; then
-  info "Get one from @BotFather → /newbot. Looks like 123456:ABC-..."
-  BOT_TOKEN="$(ask 'Telegram bot token' '')"
+  obtain_bot_token
 fi
 [ -n "$BOT_TOKEN" ] || die "a bot token is required."
 grep -qE '^[0-9]+:[A-Za-z0-9_-]+$' <<<"$BOT_TOKEN" \
@@ -2458,6 +2899,7 @@ inherit_admin_from_dotenv
 if [ "$ADMIN_INHERITED" = "1" ]; then
   info "reusing the admin(s) from the existing .env — pass --admin to replace them"
 fi
+default_admin_from_claimer
 if [ -z "${ADMIN_IDS}${ADMIN_USERNAMES}" ] && [ "$ASSUME_YES" != "1" ] && [ -t 0 ]; then
   ask_admin
 fi
