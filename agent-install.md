@@ -123,7 +123,7 @@ uname -m                                  # x86_64 or not
 . /etc/os-release && echo "$PRETTY_NAME"  # Debian 12 / Ubuntu 24.04 wanted
 id -u                                     # 0, or sudo must work
 command -v apt-get systemctl curl
-command -v visudo                         # empty → install.sh must install sudo
+command -v visudo || ls /usr/sbin/visudo /sbin/visudo 2>/dev/null  # none → install.sh must install sudo
 systemctl list-units 'agentos*'           # an install already here? (any instance)
 ls -d /opt/agentos* 2>/dev/null
 free -m | awk '/Mem:/{print $2" MB RAM"}'
@@ -156,11 +156,11 @@ Read it like this:
   `install.sh` validates with `visudo -cf`, so without it there is no root.
   Warn the owner now: on an apt host the installer installs the `sudo` package
   itself and carries on; without apt it cannot, the install ends with exit 3,
-  and you must not report this node as having root. One trap: `visudo` lives in
-  `/usr/sbin`, which a non-root shell on Debian often leaves off `PATH`, and the
-  installer looks for it on the `PATH` of the shell you run it from. If
-  `command -v visudo` is empty but `ls /usr/sbin/visudo` finds it, run
-  `export PATH="$PATH:/usr/sbin:/sbin"` in the shell that will run Phase 4.
+  and you must not report this node as having root. A non-root shell on Debian
+  often leaves `/usr/sbin` off `PATH`, so `command -v visudo` can be empty while
+  `visudo` is installed; that is not a missing `visudo`. The installer finds it
+  there on its own (it also looks in `/usr/sbin`, `/sbin` and sudo's
+  `secure_path`), so there is nothing to change in your shell.
 
 Then dry-run your intended command line. These two probes read your flags, print
 a decision and exit without touching the machine:
@@ -675,7 +675,7 @@ command's own status and message. Read the message — it usually names the fix.
 |---|---|---|
 | `unknown option`, `--user: expected…`, `--port: expected…`, `--secrets: no such file`, `--admin: … is neither of the two accepted forms` | Your own argv. Nothing was touched. | Fix and re-run. Never ask the owner to re-answer something you mangled. |
 | `run as root, or install sudo.` / `sudo failed` | No privileges. Nothing was touched. | Get root, or say you cannot. |
-| Exit 3, `AgentOS Node is up, but WITHOUT HOST AUTHORITY`, `!! NO HOST AUTHORITY` | The node is installed and running, but its sudoers drop-in was NOT installed, so it has no root. The `Why:` line of the banner names the cause. | Tell the owner exactly that, with the cause. Fix it (usually `apt-get install sudo`; on Debian as non-root, also `/usr/sbin` on `PATH` — see Phase 0) and re-run with the same flags. |
+| Exit 3, `AgentOS Node is up, but WITHOUT HOST AUTHORITY`, `!! NO HOST AUTHORITY` | The node is installed and running, but its sudoers drop-in was NOT installed, so it has no root. The `Why:` line of the banner names the cause. | Tell the owner exactly that, with the cause. Fix it (usually `apt-get install sudo`) and re-run with the same flags. |
 | `the bare-metal node needs x86_64…` / `needs an apt-based distro…` | Wrong host for this profile. Nothing was touched. | Re-run with `--docker`, and tell the owner what that changes. |
 | `cannot resolve the stable channel`, a curl failure on the tarball or the Node runtime | Network or GitHub. Packages may be installed; nothing else is. | Retry once. Still failing: report it as an outage, do not hand-download anything. |
 | `tarball checksum mismatch` | **Stop.** A release tarball that does not match its SHA256 is not a thing to work around. | Nothing was unpacked: the version directory is created only after the check passes, so the box is untouched apart from a partial download in `/tmp` that the next attempt overwrites. Retry once in case the download was truncated. If it repeats, report it and stop; never disable the check. |
