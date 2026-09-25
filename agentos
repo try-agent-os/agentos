@@ -835,7 +835,7 @@ $3"
   # dropped rather than passed through, so a fat-fingered .env cannot arm root
   # with a word the poller would then sanitise to a different number than the core.
   local _gk _gv
-  for _gk in AGENTOS_UPDATE_MAX_DEFERRAL AGENTOS_UPDATE_RESTART_INTERVAL; do
+  for _gk in AGENTOS_UPDATE_MAX_DEFERRAL AGENTOS_UPDATE_RESTART_INTERVAL AGENTOS_UPDATE_RUN_GRACE; do
     _gv="$(dotenv_val "$_gk")"
     case "$_gv" in
       ''|*[!0-9]*) : ;;
