@@ -2434,7 +2434,7 @@ install_autoupdate_timer() { # install_autoupdate_timer <profiles-dir>
     # so these are carried only when the operator set them for this run; a
     # non-integer value is dropped so the poller keeps the shared default rather
     # than being armed with a word.
-    for _gk in AGENTOS_UPDATE_MAX_DEFERRAL AGENTOS_UPDATE_RESTART_INTERVAL; do
+    for _gk in AGENTOS_UPDATE_MAX_DEFERRAL AGENTOS_UPDATE_RESTART_INTERVAL AGENTOS_UPDATE_RUN_GRACE; do
       _gv="$(printf '%s' "${!_gk-}")"
       case "$_gv" in
         ''|*[!0-9]*) : ;;
