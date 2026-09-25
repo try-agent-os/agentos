@@ -93,12 +93,83 @@ fetch_release_asset() { # fetch_release_asset <what> <url> [outfile]  — no out
   done
 }
 
-wait_healthz() {
-  for _ in $(seq 1 45); do
-    curl -fsS --max-time 3 "http://127.0.0.1:${AGENTOS_PORT:-8787}/healthz" >/dev/null 2>&1 && return 0
+# wait_healthz [unit] — 0 once /healthz answers, 1 when the budget is spent or
+# the unit is known dead.
+#
+# THE BUDGET IS A COLD START, NOT A FIXED POLL COUNT (ClickUp 12418agg32g). It
+# used to be 45 polls — about 90 s when the port refuses fast — and on
+# 2026-09-24 bailaspot's v4.41.0 needed 164 s from `systemctl start` to "Nest
+# application successfully started" on a loaded host (a neighbour's
+# daemon-reload was running at the same time). The gate declared a HEALTHY
+# release unhealthy 17 s before it came up, and the rollback that followed is
+# what failed. A wrong "unhealthy" is never cheap: it costs a second stop, a
+# restore and a second boot at best, and a lie in the chat at worst.
+#
+# So the wait is bounded by wall time — AGENTOS_HEALTH_TIMEOUT_SEC, default 420
+# s (2.5x the slowest cold start measured) — and, given the unit, it gives up
+# EARLY on a unit systemd has already marked `failed`: a release that crashes
+# on boot still rolls back in seconds, only a release that is still booting
+# gets the time it needs. An empty or unreadable ActiveState (a bus that is
+# busy reloading) is not "failed" and never cuts the wait short.
+#
+# The poll count bounds the loop as well as the clock: a `sleep` that returns
+# at once (the test suites stub it) must not turn this into a busy spin.
+wait_healthz() { # wait_healthz [unit]
+  local unit="${1:-}" budget="${AGENTOS_HEALTH_TIMEOUT_SEC:-420}" started now polls i state
+  case "$budget" in ''|*[!0-9]*) budget=420 ;; esac
+  started="$(date +%s)"; polls=$(( budget / 2 )); [ "$polls" -ge 1 ] || polls=1
+  for i in $(seq 1 "$polls"); do
+    curl -fsS --max-time 5 "http://127.0.0.1:${AGENTOS_PORT:-8787}/healthz" >/dev/null 2>&1 && return 0
+    if [ -n "$unit" ]; then
+      state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
+      if [ "$state" = failed ]; then
+        echo "  ! $unit is in state 'failed' — not waiting out the rest of the ${budget}s health budget" >&2
+        return 1
+      fi
+    fi
+    now="$(date +%s)"
+    [ $(( now - started )) -ge "$budget" ] && break
+    [ $(( i % 30 )) -eq 0 ] && echo "  … /healthz not answering yet after $(( now - started ))s (budget ${budget}s)" >&2
     sleep 2
   done
   return 1
+}
+
+# systemctl_bus <args…> — systemctl, retried while PID 1 is not serving its bus.
+#
+# During a daemon-reload PID 1 does not answer on its bus, and every systemctl
+# fails with "Transport endpoint is not connected" (ENOTCONN) or "Failed to
+# connect to bus". On a host that runs several nodes, a NEIGHBOUR's upgrade
+# reloads systemd too: on 2026-09-24 symoditi's unit reconciliation started a
+# reload that took 119 s, and bailaspot's rollback `systemctl stop` died inside
+# it — leaving the node on the release the gate had just rejected while the
+# chat was told it was rolled back (ClickUp 12418agg32g; the 2026-09-19 hub
+# reload took 113 s, 12418agfmgz). A reload ends; waiting it out is the fix.
+# Only those bus errors are retried, for AGENTOS_SYSTEMD_BUS_WAIT_SEC (default
+# 180 s); any other failure returns at once with systemctl's own exit code and
+# message, exactly as a bare call would.
+systemctl_bus() { # systemctl_bus <systemctl args…>
+  local budget="${AGENTOS_SYSTEMD_BUS_WAIT_SEC:-180}" started out rc n=0 polls
+  case "$budget" in ''|*[!0-9]*) budget=180 ;; esac
+  started="$(date +%s)"; polls=$(( budget / 5 + 1 ))
+  while :; do
+    rc=0; out="$(systemctl "$@" 2>&1)" || rc=$?
+    if [ "$rc" = 0 ]; then
+      [ -z "$out" ] || printf '%s\n' "$out"
+      return 0
+    fi
+    n=$((n + 1))
+    case "$out" in
+      *"Transport endpoint is not connected"*|*"Failed to connect to bus"*) ;;
+      *) printf '%s\n' "$out" >&2; return "$rc" ;;
+    esac
+    if [ "$n" -ge "$polls" ] || [ $(( $(date +%s) - started )) -ge "$budget" ]; then
+      printf '%s\n' "$out" >&2
+      return "$rc"
+    fi
+    echo "  ! systemctl $* — systemd is not serving its bus (a daemon-reload in progress?); retrying in 5s (${n}/${polls})" >&2
+    sleep 5
+  done
 }
 
 # Mirrors scripts/agentos-upgrade.sh's uses_managed_postgres(): DATABASE_URL in
@@ -511,6 +582,110 @@ reconcile_secret_reader_acls() {
     fi
     ok "secret reader ${u}: rX on ${secrets_dir} (+ traverse on ${AGENTOS_HOME})"
   done <<< "$readers"
+}
+
+# ─── the GitHub CLI on a systemd host ───────────────────────────────────────
+#
+# install.sh's ensure_gh gives a NEW contour a gh >= GH_MIN_VERSION (every gh
+# below 2.60 asks GitHub for the Projects (classic) field while editing a pull
+# request, and GitHub answers that with an error, so `gh pr edit` fails on EVERY
+# PR). A node installed before that rule never re-runs install.sh: its only
+# recurring root path is `agentos upgrade` (by hand, or from the auto-update
+# poller), so that path re-asserts the rule too — or the node keeps Ubuntu
+# 24.04's gh 2.45 forever (ClickUp 12418agfnx2).
+#
+# The version rule below — GH_MIN_VERSION, gh_version_of, gh_version_ge,
+# gh_decision, gh_installed_version — is install.sh's, copied VERBATIM: the two
+# files are separate by necessity (this CLI ships inside the release, install.sh
+# arrives by curl). Unlike the other hand-kept pairs in this file, this one is
+# held by a test: scripts/tests/agentos-gh.test.sh fails the moment the
+# threshold or any of these bodies drifts between the two files.
+GH_MIN_VERSION="2.60.0"
+
+# `gh version 2.45.0 (2024-03-04)` → `2.45.0`. Empty when the text is not gh's.
+gh_version_of() { # gh_version_of <`gh --version` output>
+  local all; all="$(sed -n 's/^gh version \([0-9][0-9.]*\).*/\1/p' <<<"${1:-}")"
+  printf '%s\n' "${all%%$'\n'*}"
+}
+
+# Field-by-field numeric compare — `sort -V` is not everywhere, and a string
+# compare gets 2.101.0 vs 2.60.0 backwards (which is this host's real pair).
+gh_version_ge() { # gh_version_ge <a> <b> → 0 when a >= b
+  local a="${1:-}" b="${2:-}" i av bv
+  [ -n "$a" ] || return 1
+  for i in 1 2 3; do
+    av="$(printf '%s' "$a" | cut -d. -f"$i")"; av="${av:-0}"
+    bv="$(printf '%s' "$b" | cut -d. -f"$i")"; bv="${bv:-0}"
+    case "$av$bv" in *[!0-9]*) return 1 ;; esac
+    [ "$av" -gt "$bv" ] && return 0
+    [ "$av" -lt "$bv" ] && return 1
+  done
+  return 0
+}
+
+gh_decision() { # gh_decision <installed-version> → ok <v> | upgrade <v> | install
+  local v="${1:-}"
+  [ -n "$v" ] || { printf 'install\n'; return 0; }
+  if gh_version_ge "$v" "$GH_MIN_VERSION"; then printf 'ok %s\n' "$v"; else printf 'upgrade %s\n' "$v"; fi
+}
+
+gh_installed_version() { # gh_installed_version → x.y.z, empty when gh is absent
+  gh_version_of "$(gh --version 2>/dev/null || true)"
+}
+
+# GitHub's own apt source (cli/cli) — install.sh's add_gh_apt_repo, minus $SUDO
+# (this CLI already runs as root) and with a bounded key fetch: an upgrade that
+# has just brought the node back must not hang on cli.github.com.
+gh_add_apt_repo() {
+  local keyring=/usr/share/keyrings/githubcli-archive-keyring.gpg
+  if ! curl -fsSL --max-time 30 https://cli.github.com/packages/githubcli-archive-keyring.gpg 2>/dev/null \
+       | tee "$keyring" >/dev/null 2>&1; then
+    warn "could not fetch the GitHub CLI signing key from cli.github.com"
+    return 1
+  fi
+  chmod go+r "$keyring" 2>/dev/null || true
+  if ! echo "deb [arch=$(dpkg --print-architecture) signed-by=$keyring] https://cli.github.com/packages stable main" \
+       | tee /etc/apt/sources.list.d/github-cli.list >/dev/null 2>&1; then
+    warn "could not declare the GitHub CLI apt source"
+    return 1
+  fi
+  apt-get -o DPkg::Lock::Timeout=120 update -qq >/dev/null 2>&1 || true
+  return 0
+}
+
+# Bring an EXISTING gh below GH_MIN_VERSION up to it. Same contract as every
+# other reconcile on the upgrade path: never fails the upgrade (always returns
+# 0), says what it did, and a warning names the version that stayed behind.
+#
+#   - gh already current → nothing at all: no apt, no network.
+#   - no gh on the host  → nothing: install.sh installs gh only for a contour
+#     that declared repos, and an upgrade cannot tell whether this node wants
+#     one. Installing is the installer's decision; healing is the upgrade's.
+#   - gh below minimum   → cli/cli apt repo, then `apt-get install gh`, which
+#     moves an installed package to the newest candidate.
+reconcile_gh() {
+  local have decision
+  have="$(gh_installed_version)"
+  decision="$(gh_decision "$have")"
+  case "$decision" in
+    upgrade\ *) ;;
+    *) return 0 ;;
+  esac
+  if ! command -v apt-get >/dev/null 2>&1; then
+    warn "gh ${have} is below ${GH_MIN_VERSION}: 'gh pr edit' fails on every PR (Projects classic), and this host has no apt-get — install a current gh from https://cli.github.com"
+    return 0
+  fi
+  info "gh ${have} is below ${GH_MIN_VERSION} — 'gh pr edit' fails on every PR with it; upgrading from cli.github.com"
+  if gh_add_apt_repo; then
+    apt-get -o DPkg::Lock::Timeout=120 install -y -qq gh >/dev/null 2>&1 || true
+    have="$(gh_installed_version)"
+    if gh_version_ge "$have" "$GH_MIN_VERSION"; then
+      ok "gh ${have} (cli.github.com)"
+      return 0
+    fi
+  fi
+  warn "gh ${have:-<none>} is still below ${GH_MIN_VERSION}: 'gh pr edit' will fail on every PR (Projects classic). Install a current gh from https://cli.github.com, or re-run \`agentos upgrade\`."
+  return 0
 }
 
 reconcile_units() { # reconcile_units <profiles-dir>
@@ -1486,7 +1661,36 @@ UPGRADE_ETA_HARD_CAP=86400
 # under contexts/ is agent-writable — root must not execute its config. A tree
 # git cannot be asked about (no git, no account, any error) is copied whole: the
 # optimisation may be lost, the data never.
-SNAPSHOT_REBUILDABLE_DIRS="node_modules .turbo .pnpm-store"
+SNAPSHOT_REBUILDABLE_DIRS="node_modules .turbo .pnpm-store __pycache__ .pytest_cache .mypy_cache .ruff_cache"
+# ── build output and abandoned checkouts (ClickUp 12418agfpnm) ─────────────
+#
+# After 12418agfvup the hub's snapshot was 5.4 GB / ~30k paths, 173 s of a
+# 187 s outage (4.39.0 -> 4.40.0, 2026-09-24). Two more classes were still in
+# it, and the owner chose to drop both (options A + D of the task; reflink /
+# hardlink snapshots were ruled out: the host is ext4, where --reflink=auto
+# silently copies in full and a hardlink shares the bytes a rollback needs).
+#
+# 3. Directories named in SNAPSHOT_BUILD_DIRS — build output (the hub had an
+#    apps/api/dist in every agent-os worktree). Unlike node_modules these names
+#    are also ordinary SOURCE directory names (a repo's `build/` of Dockerfiles,
+#    a published action's committed `dist/`), so a name alone is not enough: a
+#    candidate is left out only when git, asked as the service account, says
+#    the directory is IGNORED in its repository AND tracks nothing inside it.
+#    Any doubt (no repository, a git error, one tracked file) copies it.
+#
+# 4. Abandoned checkouts: contexts/<ctx>/orphan-* (a checkout set aside by hand
+#    during an incident — the hub carried orphan-86cbejbdm-20260906T065904, 789
+#    MB, through every upgrade for two weeks). They are left out of the
+#    snapshot, survive a rollback in place (systemd_restore_sqlite moves them
+#    aside and back instead of wiping them with contexts/), and are removed
+#    once older than AGENTOS_ORPHAN_KEEP_DAYS (default 14; 0 keeps them).
+SNAPSHOT_BUILD_DIRS="dist build out coverage .next .nuxt .svelte-kit"
+SNAPSHOT_ORPHAN_GLOB="contexts/*/orphan-*"
+# The same set as a find(1) predicate. `-path` lets `*` match `/`, so the glob
+# alone would also catch any orphan-* directory deeper down (a tracked
+# checkout/src/orphan-sweeper/, a worktree .worktrees/orphan-fix) — which the
+# rollback does NOT set aside, so it would be lost. Pin it to depth 2.
+SNAPSHOT_ORPHAN_FIND=( \( -path "$SNAPSHOT_ORPHAN_GLOB" ! -path 'contexts/*/*/*' \) )
 SNAPSHOT_ITEMS="messages.db messages.db-wal messages.db-shm search.db .aop contexts"
 # Inside a snapshot dir: the list of rehydratable trees and their deletions.
 # Never copied back into data/ (systemd_restore_sqlite removes it there).
@@ -1533,7 +1737,11 @@ snapshot_plan() {
   for name in $SNAPSHOT_REBUILDABLE_DIRS; do
     prune+=(-o -name "$name")
   done
-  prune=("${prune[@]:1}")
+  prune=("${prune[@]:1}" -o "${SNAPSHOT_ORPHAN_FIND[@]}")
+  # Ignored build output: exact paths, consumed by the finds below and by
+  # snapshot_tree_members (bash dynamic scope).
+  local -a built=()
+  snapshot_build_skips "$data" "${items[@]}"
 
   # Linked worktrees. Sorted, so a tree nested inside an accepted one is seen
   # after it and left alone: the outer tree's untracked listing already copies it.
@@ -1564,7 +1772,7 @@ snapshot_plan() {
   fi
 
   # Everything outside the linked trees, minus the rebuildable dirs.
-  local -a skip=()
+  local -a skip=("${built[@]+"${built[@]}"}")
   for rel in "${linked[@]+"${linked[@]}"}"; do
     skip+=(-o -path "$(snapshot_glob_quote "$rel")")
   done
@@ -1574,6 +1782,31 @@ snapshot_plan() {
     cat "$plan/tree.all" >> "$plan/list"
     rm -f "$plan/tree.all"
   fi
+  return 0
+}
+
+# snapshot_build_skips <data> <item...> — fills the caller's `built` array
+# with `-o -path <quoted>` pairs, one per SNAPSHOT_BUILD_DIRS directory under
+# the items that git reports ignored and holding no tracked file (3. above).
+# Never fails: a candidate git cannot vouch for is simply not added.
+snapshot_build_skips() {
+  local data="$1" name c parent base tracked
+  shift
+  command -v git >/dev/null 2>&1 || return 0
+  local -a cand=() rb=()
+  for name in $SNAPSHOT_BUILD_DIRS; do cand+=(-o -name "$name"); done
+  cand=("${cand[@]:1}")
+  for name in $SNAPSHOT_REBUILDABLE_DIRS; do rb+=(-o -name "$name"); done
+  rb=("${rb[@]:1}")
+  while IFS= read -r -d '' c; do
+    case "$c" in */*) ;; *) continue ;; esac
+    parent="${c%/*}"; base="${c##*/}"
+    snapshot_git "$data/$parent" check-ignore -q -- "$base/" 2>/dev/null || continue
+    tracked="$(snapshot_git "$data/$parent" ls-files -- "$base" 2>/dev/null)" || continue
+    [ -z "$tracked" ] || continue
+    built+=(-o -path "$(snapshot_glob_quote "$c")")
+  done < <(cd "$data" && find "$@" -type d \( "${rb[@]}" -o -name .git -o "${SNAPSHOT_ORPHAN_FIND[@]}" \) -prune \
+             -o -type d \( "${cand[@]}" \) -print0 -prune 2>/dev/null)
   return 0
 }
 
@@ -1611,7 +1844,7 @@ snapshot_tree_members() {
   (cd "$data" && for name in "${roots[@]}"; do
      # Deleted-tracked paths from -m and unpopulated gitlinks do not exist.
      { [ -e "$w/$name" ] || [ -L "$w/$name" ]; } || continue
-     find "$w/$name" \( -type d \( "${prune[@]}" \) \) -prune -o -print0
+     find "$w/$name" \( -type d \( "${prune[@]}" "${built[@]+"${built[@]}"}" \) \) -prune -o -print0
    done) >> "$out" || return 1
   return 0
 }
@@ -1868,6 +2101,7 @@ systemd_backup_sqlite() { # systemd_backup_sqlite <label> — <label> is the cod
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   dest="$BACKUP_DIR/${ts}-${label}"
   mkdir -p "$dest/$SNAPSHOT_MANIFEST"
+  systemd_prune_orphans
   # What is copied: the SQLite files; .aop/ — the agent run-state (in-flight
   # run dirs, cursors), which docker mode captures by tarring the whole /data
   # volume, so bare metal must snapshot it too or a rollback would strand the
@@ -1889,6 +2123,28 @@ systemd_backup_sqlite() { # systemd_backup_sqlite <label> — <label> is the cod
   ok "backup: $(basename "$dest")"
   systemd_prune_backups
   printf '%s' "$dest"
+}
+
+systemd_prune_orphans() { # AGENTOS_ORPHAN_KEEP_DAYS (default 14, 0 = never) — removes abandoned contexts/<ctx>/orphan-* checkouts older than that; names the ones it keeps. Never fails.
+  local days="${AGENTOS_ORPHAN_KEEP_DAYS:-14}" d kb
+  [ -d "$AGENTOS_HOME/data/contexts" ] || return 0
+  case "$days" in ''|*[!0-9]*) days=14 ;; esac
+  for d in "$AGENTOS_HOME"/data/$SNAPSHOT_ORPHAN_GLOB; do
+    [ -d "$d" ] && [ ! -L "$d" ] || continue
+    kb="$(du -sk "$d" 2>/dev/null | awk '{print $1}')"
+    # Age is the NEWEST entry anywhere in the tree, not the top dir's mtime:
+    # an edit deep inside does not touch the top dir. Any entry not older than
+    # the limit (or a find error) keeps the checkout.
+    if [ "$days" -gt 0 ] && find "$d" -maxdepth 0 -mtime +"$days" 2>/dev/null | grep -q . \
+       && [ -z "$(find "$d" ! -mtime +"$days" -print -quit 2>&1)" ]; then
+      if rm -rf "$d" 2>/dev/null; then
+        info "removed abandoned checkout ${d#"$AGENTOS_HOME/data/"} (${kb:-?} KB, older than ${days}d)" >&2
+        continue
+      fi
+    fi
+    info "abandoned checkout ${d#"$AGENTOS_HOME/data/"} (${kb:-?} KB) is not in the snapshot" >&2
+  done
+  return 0
 }
 
 systemd_prune_backups() { # AGENTOS_KEEP_BACKUPS (default 5) — never removes the dir $BACKUP_DIR/.last-upgrade points at, regardless of age, so routine backup churn can't strand a pending rollback
@@ -1921,8 +2177,29 @@ systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores 
   # snapshot lacks in place, mixing old and new state. This mirrors docker mode,
   # which `rm -rf /data/*` before untarring the snapshot. Restoring a snapshot
   # taken before .aop/ existed therefore correctly leaves no .aop/ behind.
+  # Abandoned checkouts are not in the snapshot (12418agfpnm): set them aside
+  # so wiping contexts/ does not destroy them, and put them back afterwards.
+  local keep="$AGENTOS_HOME/data/.agentos-restore-orphans" o rel
+  rm -rf "$keep"
+  for o in "$AGENTOS_HOME"/data/$SNAPSHOT_ORPHAN_GLOB; do
+    [ -e "$o" ] || [ -L "$o" ] || continue
+    rel="${o#"$AGENTOS_HOME/data/"}"
+    mkdir -p "$keep/$(dirname "$rel")" && mv "$o" "$keep/$rel"
+  done
   rm -rf "$AGENTOS_HOME/data/.aop" "$AGENTOS_HOME/data/contexts"
   cp -a "$src"/. "$AGENTOS_HOME/data/"
+  if [ -d "$keep/contexts" ]; then
+    for o in "$keep"/$SNAPSHOT_ORPHAN_GLOB; do
+      [ -e "$o" ] || [ -L "$o" ] || continue
+      rel="${o#"$keep/"}"
+      if [ -e "$AGENTOS_HOME/data/$rel" ]; then
+        warn "restore: $rel is in the snapshot too; the live copy is kept at ${o}"
+        continue
+      fi
+      mkdir -p "$AGENTOS_HOME/data/$(dirname "$rel")" && mv "$o" "$AGENTOS_HOME/data/$rel"
+    done
+  fi
+  [ -d "$keep" ] && find "$keep" -depth -type d -empty -delete 2>/dev/null || true
   # The snapshots are root-owned (this CLI runs as root), and `cp -a` of
   # "<dir>/." carries the snapshot dir's OWN ownership onto data/ itself — the
   # rolled-back User=agentos node would then hit SQLITE_READONLY_DIRECTORY and
@@ -2028,6 +2305,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     # much as any other. Idempotent: unchanged units mean no daemon-reload.
     reconcile_units "$AGENTOS_HOME/current/profiles" || warn "unit reconciliation hit a snag"
     reconcile_secret_reader_acls || warn "secret-reader ACL reconciliation hit a snag"
+    reconcile_gh || warn "gh reconciliation hit a snag"
     # Written, but the running core still has the environment it booted with, so
     # say what makes it count rather than restarting a healthy node unasked.
     if ensure_ctl_env; then
@@ -2089,7 +2367,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   # stops being able to reach the node, and it is the instant the next
   # upgrade's estimate has to be measured from.
   stop_epoch="$(date +%s)"
-  systemctl stop "$AGENTOS_SERVICE"
+  systemctl_bus stop "$AGENTOS_SERVICE"
   snap_started="$(date +%s)"
   snap="$(systemd_backup_sqlite "$prev" | tail -1)"   # consistent copy: the unit is stopped
   snap_seconds=$(( $(date +%s) - snap_started ))
@@ -2115,9 +2393,9 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   # rollback below as a failed healthz — a bare call here would abort under
   # set -e with the node down and no rollback.
   started=0
-  if systemctl start "$AGENTOS_SERVICE"; then started=1; fi
+  if systemctl_bus start "$AGENTOS_SERVICE"; then started=1; fi
 
-  if [ "$started" = 1 ] && wait_healthz; then
+  if [ "$started" = 1 ] && wait_healthz "$AGENTOS_SERVICE"; then
     ok "upgraded: $prev → $tag"
     # Measured at the first green healthz — the moment the owner can reach the
     # node again — and therefore BEFORE the best-effort reconciliation below,
@@ -2128,6 +2406,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     # undoes an upgrade that is already healthy.
     reconcile_units "$AGENTOS_HOME/current/profiles" || warn "unit reconciliation hit a snag"
     reconcile_secret_reader_acls || warn "secret-reader ACL reconciliation hit a snag"
+    reconcile_gh || warn "gh reconciliation hit a snag"
     prune_versions
   else
     if uses_managed_postgres; then
@@ -2136,12 +2415,20 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
       die "refusing an unsafe automatic rollback in managed-PostgreSQL mode; inspect: journalctl -u $AGENTOS_SERVICE"
     fi
     echo "unhealthy — rolling back to $prev (code + database)" >&2
-    systemctl stop "$AGENTOS_SERVICE"
+    # A rollback that cannot even stop the unit has changed NOTHING: `current`
+    # still points at $tag and whatever process systemd has is still running it.
+    # Say exactly that, in a line of its own the poller keys on, instead of
+    # dying on a bare systemctl error that reads like the tail of a rollback —
+    # on 2026-09-24 that is how a node left on the new release was announced in
+    # the chat as "rolled back" (ClickUp 12418agg32g).
+    if ! systemctl_bus stop "$AGENTOS_SERVICE"; then
+      die "rollback FAILED: could not stop $AGENTOS_SERVICE — nothing was restored, current still points at $tag"
+    fi
     systemd_restore_sqlite "$snap"
     ln -sfn "$AGENTOS_HOME/versions/$prev" "$AGENTOS_HOME/current"
     set_env_version "$prev"
-    systemctl start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
-    wait_healthz || die "rollback ALSO unhealthy — inspect: journalctl -u $AGENTOS_SERVICE"
+    systemctl_bus start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
+    wait_healthz "$AGENTOS_SERVICE" || die "rollback FAILED: $prev restored but ALSO unhealthy — inspect: journalctl -u $AGENTOS_SERVICE"
     # The node is back — on the OLD version, after the longest silence this path
     # can produce (stop, snapshot, a failed boot, a restore, a second boot).
     # That is precisely the window the owner must not have to guess about, so it
@@ -2162,12 +2449,12 @@ systemd_rollback() { # undo the last recorded upgrade — code + database togeth
   [ -n "$prev" ] || die "backup dir $src has no recorded version (corrupt snapshot)"
   [ -d "$AGENTOS_HOME/versions/$prev" ] || die "version dir gone: $AGENTOS_HOME/versions/$prev"
   step "Rolling back to $prev"
-  systemctl stop "$AGENTOS_SERVICE"
+  systemctl_bus stop "$AGENTOS_SERVICE"
   systemd_restore_sqlite "$src"
   ln -sfn "$AGENTOS_HOME/versions/$prev" "$AGENTOS_HOME/current"
   set_env_version "$prev"
-  systemctl start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
-  if wait_healthz; then
+  systemctl_bus start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
+  if wait_healthz "$AGENTOS_SERVICE"; then
     ok "rolled back to $prev and healthy"
   else
     journalctl -u "$AGENTOS_SERVICE" -n 30 --no-pager || true
@@ -3194,6 +3481,18 @@ agentos — operate an AgentOS Core node
   status | logs [n] | version
 EOF
 }
+
+# Test hook, the CLI half of install.sh's AGENTOS_PRINT_GH_PLAN: run the REAL
+# reconcile_gh against whatever `gh`/`apt-get`/`curl`/`dpkg`/`tee` the caller put
+# on $PATH, then print its exit code and the version it left behind. Driven by
+# scripts/tests/agentos-gh.test.sh — no root, apt or network.
+if [ -n "${AGENTOS_PRINT_GH_RECONCILE:-}" ]; then
+  _gh_rc=0
+  reconcile_gh || _gh_rc=$?
+  echo "rc=${_gh_rc}"
+  echo "gh=$(gh_installed_version)"
+  exit 0
+fi
 
 case "${1:-}" in
   install)    shift; exec bash <(curl -fsSL "https://raw.githubusercontent.com/${DIST_REPO}/main/install.sh") "$@" ;;
