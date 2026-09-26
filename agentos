@@ -374,7 +374,27 @@ ensure_ctl_env() {
       warn "could not write AGENTOS_NODE_KEY into $env_file — \`agentos ctl\` will be refused by this node"
     fi
   fi
+  ensure_internal_token && changed=0
   return "$changed"
+}
+
+# /internal/* answers 404 without INTERNAL_API_TOKEN since 12418agg7un, and
+# install.sh never wrote one before that — so a node installed earlier gets it
+# HERE, before the new core boots (both upgrade paths call this ahead of their
+# start). The core still running keeps accepting the tokenless calls it always
+# did; the one that starts reads the key. Additive, generated straight into the
+# 0600 .env, never printed. Returns 0 when .env changed.
+ensure_internal_token() {
+  local env_file="$AGENTOS_HOME/.env" key
+  [ -f "$env_file" ] || return 1
+  [ -z "$(dotenv_val INTERNAL_API_TOKEN)" ] || return 1
+  key="$(od -An -tx1 -N32 /dev/urandom 2>/dev/null | tr -d ' \n' || true)"
+  if [ "${#key}" -eq 64 ] && write_env_key INTERNAL_API_TOKEN "$key"; then
+    ok "INTERNAL_API_TOKEN generated into .env — root's going-down notice and the record-out hook authenticate with it"
+    return 0
+  fi
+  warn "could not write INTERNAL_API_TOKEN into $env_file — /internal/* will refuse root's going-down notice"
+  return 1
 }
 
 # The five words the policy may be — the same enum the core's env schema accepts
@@ -1405,6 +1425,7 @@ docker_upgrade() { # docker_upgrade [tag] [image-ref]  — empty tag = latest st
   to_label="$to"
   [ -n "$to_label" ] || to_label="$(printf '%s' "${manifest:-}" | jq -r '.version // empty' 2>/dev/null || true)"
   [ -n "$to_label" ] || to_label="${image##*[:@]}"
+  acquire_upgrade_host_lock
   announce_going_down "${from_label#v}" "${to_label#v}"
   # Managed PG: record the pre-flip restore point + shout that there is no
   # automatic rollback here, BEFORE anything changes. No-op on SQLite nodes.
@@ -1420,6 +1441,9 @@ docker_upgrade() { # docker_upgrade [tag] [image-ref]  — empty tag = latest st
   # it), and a mount source docker has to invent is one the core cannot write.
   # Unconditional and idempotent, so a run whose chown failed last time retries.
   ensure_signal_dirs docker
+  # Same moment for the /internal/* token: compose hands .env to the container
+  # it is about to create (12418agg7un).
+  ensure_internal_token || true
   ( cd "$AGENTOS_HOME" && docker compose -f "$COMPOSE_FILE" pull && docker compose -f "$COMPOSE_FILE" up -d )
   if ! wait_healthz; then
     if uses_managed_postgres; then
@@ -1434,6 +1458,7 @@ docker_upgrade() { # docker_upgrade [tag] [image-ref]  — empty tag = latest st
     die "upgrade failed; previous version restored"
   fi
   record_upgrade_downtime docker "${from_label#v}" "${to_label#v}" "$stop_epoch" "$snap_seconds"
+  release_upgrade_host_lock
   # The node is live and healthy on the new image; now pull the operator tooling
   # (the CLI itself, the auto-update poller, the compose file) forward too, so
   # `agentos upgrade` upgrades itself and not merely the container (issue #112).
@@ -1565,7 +1590,19 @@ UPGRADE_TIMING_FILE="$BACKUP_DIR/.last-upgrade-timing"
 # MAX rather than mean on purpose, and the file says why a line below: over-
 # promising silence ends early, under-promising it is the failure this whole
 # feature exists to prevent.
-UPGRADE_TIMING_WINDOW=3
+#
+# Widened from three to five (ClickUp 12418agg7yw). Once the snapshot was cut
+# down to ~5 GB (12418agfvup, 12418agfpnm) the hub's series became
+#
+#   236, 309, 187, 296, 130, 79, 217   (seconds, 2026-09-23..25)
+#
+# and a window of three that happened to hold the quiet end of it (130, 79,
+# 217) announced 217 s for an upgrade that then took 561 s. Most of that miss
+# was disk contention with five other nodes of the same host snapshotting at
+# once — the host lock below removes that cause — but the quiet samples alone
+# still spread 2.3x, and five samples reach back far enough to hold the loud
+# end of an ordinary series.
+UPGRADE_TIMING_WINDOW=5
 # What the FIRST upgrade assumes, when no downtime has ever been measured on
 # this node. TWO terms, because a `cp -a` pays for two different things and
 # pricing only one of them is what broke this the first time it ran for real.
@@ -1615,6 +1652,36 @@ SNAPSHOT_ENTRIES_PER_SEC=800
 UPGRADE_ETA_FLOOR=30
 UPGRADE_ETA_CEILING=1800
 UPGRADE_ETA_HARD_CAP=86400
+
+# ── one upgrade per host at a time (ClickUp 12418agg7yw) ───────────────────
+#
+# THE MEASUREMENT THIS EXISTS FOR (agentos-hub, 4.43.0 -> 4.44.0, 2026-09-25
+# 21:56): the release poke reached all six nodes of one host within the same
+# minute, and all six stopped and snapshotted onto the same worn NVMe at once.
+# The hub announced ~217 s (measured) and was dark for 561 s (snapshot 537 s);
+# its previous upgrade, run alone at 12:16, took 217 s (snapshot 204 s) for the
+# same 5.4 GB. Its own history spreads 72..952 s at a constant size: the spread
+# is the disk, not the tree. No estimate built from a node's own past can see
+# five neighbours copying beside it — so the neighbours are taken out of the
+# window instead of guessed at.
+#
+# Every upgrade takes a host-wide flock BEFORE it announces anything and holds
+# it through stop, snapshot, swap and the first green healthz. A node waiting
+# for it is still UP — the wait costs nobody any silence — and a node holding
+# it snapshots alone, which is the condition its own measurements were taken
+# under. The lock lives in /run/lock (tmpfs, shared by every install root on
+# the host) and is a plain fd: a run that dies for any reason releases it.
+#
+# The wait is bounded, because the auto-update unit has one budget for the
+# whole run (TimeoutStartSec=2700 in agentos-autoupdate.service) and a poller
+# killed between stop and start leaves the node down. 900 s is two hub-sized
+# upgrades plus the small nodes of the fleet; a run that still cannot get the
+# lock proceeds anyway and announces its window multiplied by
+# UPGRADE_CONTENDED_FACTOR — 2.6x is what the contended hub actually paid, so
+# the promise is rounded up from that, not guessed.
+UPGRADE_HOST_LOCK="${AGENTOS_UPGRADE_HOST_LOCK:-/run/lock/agentos-upgrade.lock}"
+UPGRADE_HOST_LOCK_WAIT="${AGENTOS_UPGRADE_HOST_LOCK_WAIT:-900}"
+UPGRADE_CONTENDED_FACTOR=3
 
 # ── what the pre-upgrade snapshot copies (ClickUp 12418agfvup) ──────────────
 #
@@ -1684,6 +1751,38 @@ SNAPSHOT_REBUILDABLE_DIRS="node_modules .turbo .pnpm-store __pycache__ .pytest_c
 #    snapshot, survive a rollback in place (systemd_restore_sqlite moves them
 #    aside and back instead of wiping them with contexts/), and are removed
 #    once older than AGENTOS_ORPHAN_KEEP_DAYS (default 14; 0 keeps them).
+#
+# ── submodule object stores the remote already holds (ClickUp 12418agg7zh) ──
+#
+# After 12418agfpnm the hub's snapshot was 4.9 GB, 4.1 GB of it checkout/.git —
+# and 3.4 GB of that the object stores of two submodules (competitors/openclaw
+# 2.8 GB, hermes) under .git/modules/. Every commit in them was a clone of a
+# public remote: the snapshot paid minutes of outage for bytes GitHub keeps.
+#
+# 5. The objects/ directory of a submodule git dir (<gitdir>/modules/<path>,
+#    <gitdir>/worktrees/<n>/modules/<path>) is left out when git, asked as the
+#    service account, vouches for ALL of it being on the remote:
+#      - exactly one remote, with an absolute url (a relative one resolves
+#        against a directory the restore does not run in);
+#      - no shallow file, no alternates, no partial-clone/promisor config
+#        (a store that is not self-contained cannot be refetched as one);
+#      - `rev-list --all --not --remotes=<r>` is empty: every ref, HEAD, stash
+#        and worktree HEAD is reachable from what was fetched from <r>;
+#      - the index stages nothing HEAD does not already hold (a staged blob
+#        exists only locally).
+#    Everything else of that git dir — config, HEAD, refs, packed-refs, index,
+#    reflogs, hooks, nested modules/ — is still copied: it is kilobytes, and it
+#    is what makes the restored submodule the one that was stopped. Its working
+#    tree is copied whole as part of the superproject checkout, as before.
+#    The manifest names each such git dir in `modules`; systemd_restore_sqlite
+#    refetches the objects from the remote (snapshot_refetch_module). Any doubt
+#    at snapshot time — git missing or failing, a second remote, an unpushed
+#    commit, a stash — copies the store whole, exactly as before.
+#    What is given up, deliberately: objects reachable from NOTHING (dangling
+#    commits, reflog-only history); the restore prunes those reflog entries.
+#    And the bet that the remote still serves what it served at snapshot time
+#    — a rollback runs minutes after the snapshot, and a commit the remote
+#    dropped meanwhile is asked for by id before the restore gives up on it.
 SNAPSHOT_BUILD_DIRS="dist build out coverage .next .nuxt .svelte-kit"
 SNAPSHOT_ORPHAN_GLOB="contexts/*/orphan-*"
 # The same set as a find(1) predicate. `-path` lets `*` match `/`, so the glob
@@ -1713,6 +1812,24 @@ snapshot_git() { # snapshot_git <tree> <git args...> — git in <tree> as the se
   GIT_OPTIONAL_LOCKS=0 snapshot_as_account git -c core.fsmonitor=false -C "$tree" "$@"
 }
 
+snapshot_net_git() { # snapshot_net_git <dir> <git args...> — git that talks to a remote, as the service account WITH its own HOME (its credential helpers and ssh keys), never prompting
+  local dir="$1" home limit; shift
+  local -a tmo=()
+  # Bounded: a rollback that hangs on a dead remote is a node that stays down.
+  limit="${AGENTOS_SNAPSHOT_REFETCH_TIMEOUT:-1800}"
+  case "$limit" in ''|*[!0-9]*) limit=1800 ;; esac
+  command -v timeout >/dev/null 2>&1 && [ "$limit" -gt 0 ] && tmo=(timeout "$limit")
+  if [ "${EUID:-$(id -u 2>/dev/null || echo 0)}" != 0 ]; then
+    GIT_TERMINAL_PROMPT=0 ${tmo[@]+"${tmo[@]}"} git -c core.fsmonitor=false -C "$dir" "$@"
+    return
+  fi
+  command -v runuser >/dev/null 2>&1 || return 1
+  home="$(getent passwd "$AGENTOS_ACCOUNT" 2>/dev/null | cut -d: -f6)"
+  [ -n "$home" ] && [ -d "$home" ] || home=/nonexistent
+  runuser -u "$AGENTOS_ACCOUNT" -- env HOME="$home" GIT_TERMINAL_PROMPT=0 \
+    ${tmo[@]+"${tmo[@]}"} git -c core.fsmonitor=false -C "$dir" "$@"
+}
+
 snapshot_glob_quote() { # snapshot_glob_quote <path> — escape find -path glob metacharacters
   printf '%s' "$1" | sed 's/[][*?\\]/\\&/g'
 }
@@ -1722,6 +1839,8 @@ snapshot_glob_quote() { # snapshot_glob_quote <path> — escape find -path glob 
 #            (directories included, the copy runs --no-recursion)
 #   trees    one linked worktree per line (relative), rehydrated on restore
 #   deleted/<n>  NUL list of tracked paths deleted in tree n (line n of trees)
+#   modules  one submodule git dir per line (relative) whose objects/ is left
+#            out and refetched from its remote on restore (12418agg7zh)
 # Empty list when <data-dir> is missing. Never fails on a git problem — that
 # tree is copied whole instead.
 snapshot_plan() {
@@ -1742,6 +1861,10 @@ snapshot_plan() {
   # snapshot_tree_members (bash dynamic scope).
   local -a built=()
   snapshot_build_skips "$data" "${items[@]}"
+  # Submodule object stores the remote holds (5.): appended to `built`, so the
+  # finds below prune them exactly like ignored build output; named in
+  # <plan>/modules for the restore to refetch.
+  snapshot_module_skips "$data" "$plan/modules"
 
   # Linked worktrees. Sorted, so a tree nested inside an accepted one is seen
   # after it and left alone: the outer tree's untracked listing already copies it.
@@ -1810,7 +1933,111 @@ snapshot_build_skips() {
   return 0
 }
 
-# snapshot_tree_members <data> <tree-rel> <members-out> <deleted-out> — the
+# snapshot_module_skips <data> <modules-out> — appends to the caller's `built`
+# array a `-o -path <quoted>` pair for the objects/ dir of every submodule git
+# dir under contexts/ whose whole history the remote holds (5. above), and
+# writes those git dirs (relative, one per line) to <modules-out>. Never fails:
+# a git dir git cannot vouch for is simply copied whole.
+snapshot_module_skips() {
+  local data="$1" out="$2" c d real
+  local -a rb=()
+  : > "$out"
+  [ -d "$data/contexts" ] || return 0
+  command -v git >/dev/null 2>&1 || return 0
+  for c in $SNAPSHOT_REBUILDABLE_DIRS; do rb+=(-o -name "$c"); done
+  rb=("${rb[@]:1}")
+  while IFS= read -r -d '' c; do
+    d="${c%/objects}"
+    case "$d" in *$'\n'*) continue ;; esac
+    real="$(cd "$data/$d" 2>/dev/null && pwd -P)" || continue
+    # It must BE a git dir, not a directory that happens to sit at that path.
+    [ "$(snapshot_git "$data/$d" rev-parse --absolute-git-dir 2>/dev/null)" = "$real" ] || continue
+    snapshot_module_pushed "$data/$d" || continue
+    built+=(-o -path "$(snapshot_glob_quote "$d/objects")")
+    printf '%s\n' "$d" >> "$out"
+  done < <(cd "$data" && find contexts \( -type d \( "${rb[@]}" -o "${SNAPSHOT_ORPHAN_FIND[@]}" \) -prune \) \
+             -o \( -type d -name objects \( -path '*/.git/modules/*/objects' \
+                   -o -path '*/.git/worktrees/*/modules/*/objects' \) -print0 -prune \) \
+             -o \( -type d -name objects -path '*/.git/*' -prune \) 2>/dev/null | LC_ALL=C sort -z)
+  return 0
+}
+
+# snapshot_module_pushed <gitdir> — zero when every object the git dir's refs
+# need can be fetched back from its one remote (the list in 5. above).
+snapshot_module_pushed() {
+  local g="$1" remote url out
+  [ ! -e "$g/shallow" ] && [ ! -e "$g/objects/info/alternates" ] || return 1
+  out="$(snapshot_git "$g" config --get-regexp '^(extensions\.partialclone|remote\..*\.promisor|remote\..*\.partialclonefilter)$' 2>/dev/null)"
+  [ -z "$out" ] || return 1
+  remote="$(snapshot_git "$g" remote 2>/dev/null)" || return 1
+  case "$remote" in ''|*$'\n'*) return 1 ;; esac
+  url="$(snapshot_git "$g" config --get "remote.$remote.url" 2>/dev/null)" || return 1
+  case "$url" in ''|.*) return 1 ;; esac
+  # Something must have been fetched: an empty --remotes makes every ref "unpushed"
+  # anyway, but say it explicitly.
+  out="$(snapshot_git "$g" for-each-ref --count=1 --format='%(refname)' "refs/remotes/$remote/" 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  out="$(snapshot_git "$g" rev-list -n 1 --all --not --remotes="$remote" 2>/dev/null)" || return 1
+  [ -z "$out" ] || return 1
+  snapshot_git "$g" diff-index --cached --quiet HEAD -- 2>/dev/null || return 1
+  return 0
+}
+
+# snapshot_refetch_module <data> <gitdir-rel> — rebuilds the objects/ of a
+# submodule git dir the snapshot left out (5. above) from its remote: fetches
+# the remote's branches and tags into a scratch store beside it, asks for any
+# commit a local ref still misses by id, then moves the store into place and
+# prunes reflog entries that point at nothing. Non-zero (with the git dir left
+# as the snapshot had it) when the fetch fails outright.
+snapshot_refetch_module() {
+  local data="$1" rel="$2" g tmp remote url sha
+  local -a need=() miss=()
+  g="$data/$rel"
+  tmp="$g.agentos-refetch"
+  # Without an objects/ dir git does not take <g> for a git dir at all and
+  # walks UP to the superproject — every question below would be answered by
+  # the wrong repository. Give it an empty store first, and check who answers.
+  # Every filesystem step runs as the service account too: the path is
+  # agent-writable, and root must neither follow a planted symlink nor leave a
+  # root-owned store the account cannot fetch into later.
+  snapshot_as_account mkdir -p "$g/objects/info" "$g/objects/pack" || return 1
+  [ "$(snapshot_git "$g" rev-parse --absolute-git-dir 2>/dev/null)" = "$(cd "$g" && pwd -P)" ] || return 1
+  remote="$(snapshot_git "$g" remote 2>/dev/null)" || return 1
+  case "$remote" in ''|*$'\n'*) return 1 ;; esac
+  url="$(snapshot_git "$g" config --get "remote.$remote.url" 2>/dev/null)" || return 1
+  [ -n "$url" ] || return 1
+  # Every object id the git dir's refs and HEADs name (reading a ref does not
+  # need its object).
+  while IFS= read -r sha; do
+    [ -n "$sha" ] && need+=("$sha")
+  done < <(snapshot_git "$g" for-each-ref --format='%(objectname)' 2>/dev/null
+           snapshot_git "$g" rev-parse --verify -q HEAD 2>/dev/null)
+  snapshot_as_account rm -rf "$tmp" || return 1
+  snapshot_as_account git init -q --bare "$tmp" >/dev/null 2>&1 || { snapshot_as_account rm -rf "$tmp"; return 1; }
+  if ! snapshot_net_git "$tmp" fetch -q --no-tags --no-write-fetch-head "$url" \
+         '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' >/dev/null 2>&1; then
+    snapshot_as_account rm -rf "$tmp"
+    return 1
+  fi
+  for sha in "${need[@]+"${need[@]}"}"; do
+    snapshot_git "$tmp" cat-file -e "$sha" 2>/dev/null || miss+=("$sha")
+  done
+  if [ "${#miss[@]}" -gt 0 ]; then
+    snapshot_net_git "$tmp" fetch -q --no-tags --no-write-fetch-head "$url" "${miss[@]}" >/dev/null 2>&1 || true
+    local -a still=()
+    for sha in "${miss[@]}"; do
+      snapshot_git "$tmp" cat-file -e "$sha" 2>/dev/null || still+=("$sha")
+    done
+    [ "${#still[@]}" -eq 0 ] || warn "restore: $rel: the remote no longer serves ${still[*]}; those refs point at nothing"
+  fi
+  if ! { snapshot_as_account rm -rf "$g/objects" && snapshot_as_account mv "$tmp/objects" "$g/objects"; }; then
+    snapshot_as_account rm -rf "$tmp"
+    return 1
+  fi
+  snapshot_as_account rm -rf "$tmp"
+  snapshot_git "$g" reflog expire --expire-unreachable=now --stale-fix --all >/dev/null 2>&1 || true
+  return 0
+}
 # entries of one linked worktree git cannot rebuild, expanded (NUL, relative
 # to <data>), plus its deleted-tracked list. Non-zero on any git failure.
 snapshot_tree_members() {
@@ -1856,6 +2083,19 @@ snapshot_tree_members() {
 # reported, not fatal.
 snapshot_rehydrate() {
   local data="$1" manifest="$2" w n=0
+  # Submodule object stores first (12418agg7zh): a linked worktree's submodule
+  # checkout is not rebuilt from them, but nothing below should see a git dir
+  # without objects either.
+  if [ -f "$manifest/modules" ]; then
+    while IFS= read -r w; do
+      [ -n "$w" ] && [ -d "$data/$w" ] || continue
+      [ -d "$data/$w/objects" ] && [ -n "$(ls -A "$data/$w/objects" 2>/dev/null)" ] && continue
+      info "restore: fetching the objects of $w back from its remote" >&2
+      if ! snapshot_refetch_module "$data" "$w"; then
+        warn "could not fetch the objects of submodule git dir $w from its remote; its refs, index and working tree are restored — run 'git fetch' in that submodule by hand"
+      fi
+    done < "$manifest/modules"
+  fi
   [ -f "$manifest/trees" ] || return 0
   while IFS= read -r w; do
     if [ -n "$w" ] && [ -e "$data/$w/.git" ]; then
@@ -1974,6 +2214,13 @@ upgrade_eta() {
     else
       UPGRADE_ETA_SECONDS="$UPGRADE_ETA_GUESS"
     fi
+    # Both sources above describe a node that snapshots ALONE. One that could
+    # not get the host lock shares the disk with another upgrade, and pays for
+    # it (see UPGRADE_HOST_LOCK). The operator's override is left as written:
+    # a human who measured their box is trusted to have measured this too.
+    if [ "${UPGRADE_HOST_CONTENDED:-0}" = 1 ]; then
+      UPGRADE_ETA_SECONDS=$(( UPGRADE_ETA_SECONDS * UPGRADE_CONTENDED_FACTOR ))
+    fi
   fi
   if [ "$UPGRADE_ETA_SECONDS" -lt "$UPGRADE_ETA_FLOOR" ]; then
     UPGRADE_ETA_SECONDS="$UPGRADE_ETA_FLOOR"
@@ -1981,6 +2228,56 @@ upgrade_eta() {
   if [ "$UPGRADE_ETA_SECONDS" -gt "$UPGRADE_ETA_HARD_CAP" ]; then
     UPGRADE_ETA_SECONDS="$UPGRADE_ETA_HARD_CAP"
   fi
+  return 0
+}
+
+# Set by acquire_upgrade_host_lock. The fd is held open until the node is
+# healthy again (release_upgrade_host_lock) or the process exits, whichever
+# comes first — exit covers every die() on the rollback paths.
+UPGRADE_HOST_LOCK_FD=""
+UPGRADE_HOST_CONTENDED=0
+
+# acquire_upgrade_host_lock — take the host-wide upgrade lock, waiting at most
+# UPGRADE_HOST_LOCK_WAIT seconds. NEVER fails the caller, for the same reason
+# await_quiet_moment never does: a guard that can cancel an upgrade is a guard
+# that can strand a node. A lock we cannot even open (no flock, an unwritable
+# /run/lock) proceeds as before and says so; only a lock that is HELD by
+# someone else past the wait marks this run as contended.
+acquire_upgrade_host_lock() {
+  local wait="$UPGRADE_HOST_LOCK_WAIT" fd="" started
+  UPGRADE_HOST_CONTENDED=0
+  UPGRADE_HOST_LOCK_FD=""
+  case "$wait" in ''|*[!0-9]*) wait=900 ;; esac
+  if ! command -v flock >/dev/null 2>&1; then
+    warn "no flock(1) on this host: upgrading without the host lock, a concurrent upgrade of another node would share the disk"
+    return 0
+  fi
+  if ! { exec {fd}>>"$UPGRADE_HOST_LOCK"; } 2>/dev/null || [ -z "$fd" ]; then
+    warn "could not open the host upgrade lock $UPGRADE_HOST_LOCK: upgrading without it"
+    return 0
+  fi
+  if flock -n "$fd"; then
+    UPGRADE_HOST_LOCK_FD="$fd"
+    return 0
+  fi
+  started="$(date +%s)"
+  info "another node on this host is upgrading; waiting up to ${wait}s for it (this node stays up meanwhile)"
+  if flock -w "$wait" "$fd"; then
+    UPGRADE_HOST_LOCK_FD="$fd"
+    info "host upgrade lock taken after $(( $(date +%s) - started ))s"
+    return 0
+  fi
+  exec {fd}>&-
+  UPGRADE_HOST_CONTENDED=1
+  warn "the host upgrade lock is still held after ${wait}s: upgrading beside another node, the announced window is multiplied by ${UPGRADE_CONTENDED_FACTOR}"
+  return 0
+}
+
+release_upgrade_host_lock() {
+  [ -n "$UPGRADE_HOST_LOCK_FD" ] || return 0
+  local fd="$UPGRADE_HOST_LOCK_FD"
+  UPGRADE_HOST_LOCK_FD=""
+  exec {fd}>&-
   return 0
 }
 
@@ -2359,6 +2656,10 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   # it returns only once the core has put the line in the chat (or given up), so
   # the message is in Telegram strictly before systemd logs "Stopping
   # <unit>.service". See "the update's silence" above (ClickUp 12418agfpq9).
+  # The host lock comes first: the wait for it happens while this node is still
+  # up, and the window announced next is then priced for a snapshot that runs
+  # alone (see UPGRADE_HOST_LOCK).
+  acquire_upgrade_host_lock
   announce_going_down "${prev#v}" "${tag#v}"
   # Managed PG: record the pre-flip restore point + shout that there is no
   # automatic rollback here, BEFORE the unit is even stopped. No-op on SQLite.
@@ -2401,6 +2702,8 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     # node again — and therefore BEFORE the best-effort reconciliation below,
     # which happens on a node that is already answering.
     record_upgrade_downtime systemd "${prev#v}" "${tag#v}" "$stop_epoch" "$snap_seconds"
+    # The disk-heavy part is over; the next node on this host may stop now.
+    release_upgrade_host_lock
     # Only now: the units belong to the release that is actually live, and the
     # branch below can still put $prev back. Best-effort — a snag here never
     # undoes an upgrade that is already healthy.
@@ -3239,8 +3542,8 @@ ctl_env_default() { # ctl_env_default KEY
 }
 
 # Node-control surface — `agentos ctl` (task 12418agf323).
-#   agentos ctl status | doctor | routine … | runs … | task … | settings … |
-#           harness … | secret set … | restart | logs [n]
+#   agentos ctl status | doctor | context doctor | routine … | runs … | task … |
+#           settings … | harness … | secret set … | restart | logs [n]
 # The sub-mode that operates a RUNNING node from an ordinary shell, with no
 # agent session and no LLM spend. Everything except `logs` goes through the
 # core's loopback tool surface (never the database: SQLite is single-writer, and
@@ -3461,8 +3764,8 @@ agentos — operate an AgentOS Core node
                               and run budget at runtime (no Git edit)
   import-history --from <path> --chat <id> [--dry-run]  import prior-transport
                               chat history into this node (messages.db | jsonl)
-  ctl status | doctor | routine … | runs … | task … | settings … | harness … |
-      secret set … | restart | logs [n]
+  ctl status | doctor | context doctor | routine … | runs … | task … |
+      settings … | harness … | secret set … | restart | logs [n]
                               operate the RUNNING node from this shell: no agent
                               session, no LLM spend, --json on every command.
                               `agentos ctl --help` lists them all. Note the pair:
