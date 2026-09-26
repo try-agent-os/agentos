@@ -1760,7 +1760,7 @@ write_env_systemd() {
     DEPS_ENABLED:AGENTOS_DEPS_ENABLED GITHUB_TOKEN:AGENTOS_GITHUB_TOKEN \
     AUTH_PTY:AGENTOS_AUTH_PTY STATE_MARKER:AGENTOS_STATE_MARKER \
     NODE_KEY:AGENTOS_NODE_KEY PEER_ENDPOINT_FILE:AGENTOS_PEER_ENDPOINT_FILE \
-    MCP_PORT:MCP_PORT; do
+    MCP_PORT:MCP_PORT INTERNAL_API_TOKEN:INTERNAL_API_TOKEN; do
     # The last three are what `agentos ctl` reaches the node with (ClickUp
     # 12418agfwfq). Carried across a re-run like the rest: a re-run that minted a
     # NEW node key would silently lock out every script that holds the old one.
@@ -1825,6 +1825,14 @@ EOF
   case "$preserved" in
     *AGENTOS_NODE_KEY=*) ;;
     *) { printf 'AGENTOS_NODE_KEY='; od -An -tx1 -N32 /dev/urandom | tr -d ' \n'; echo; } \
+         | $SUDO tee -a "$INSTALL_DIR/.env" >/dev/null ;;
+  esac
+  # The token /internal/* demands (12418agg7un): without it the core answers 404
+  # to root's going-down notice and to the record-out hook. Carried across a
+  # re-run like the node key above; generated once, never echoed.
+  case "$preserved" in
+    *INTERNAL_API_TOKEN=*) ;;
+    *) { printf 'INTERNAL_API_TOKEN='; od -An -tx1 -N32 /dev/urandom | tr -d ' \n'; echo; } \
          | $SUDO tee -a "$INSTALL_DIR/.env" >/dev/null ;;
   esac
   # The alert label (default_instance_label above): an operator's own value
@@ -3033,6 +3041,10 @@ adopt_legacy_agentos_key STATE_MARKER AGENTOS_STATE_MARKER
 # a later `docker compose up` — or a reboot — brings back the SAME bits, not
 # whatever the channel tag has moved on to since.
 set_env AGENTOS_IMAGE "$IMAGE_REF"
+# The token /internal/* demands (12418agg7un). Kept on a re-run, generated once.
+if ! grep -qE '^INTERNAL_API_TOKEN=.' .env 2>/dev/null; then
+  set_env INTERNAL_API_TOKEN "$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+fi
 set_env TELEGRAM_BOT_TOKEN "$BOT_TOKEN"
 set_env TELEGRAM_ADMIN_USER_IDS "${ADMIN_IDS:-}"
 # Written even when empty, exactly like the ids key above: an operator who moves
