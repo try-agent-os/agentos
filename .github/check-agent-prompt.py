@@ -46,6 +46,7 @@ FOREIGN_FLAGS = {
     "--template": "gh repo create",
     "--no-pager": "journalctl",
     "--to": "agentos upgrade --to <tag>",
+    "--file": "agentos ctl context doctor --file <path>",
 }
 
 # The only remote files an agent following this prompt may download. Anything

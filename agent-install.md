@@ -451,6 +451,39 @@ awk 'NR>1 && /^---$/ {exit} NR>1' memory/owner.md \
 test -s CLAUDE.md && echo "charter ok"
 ```
 
+Then lint the charter against what a node actually is. The node ships a
+deterministic check for exactly the mistakes a freshly written charter makes —
+no model, no network, it writes nothing:
+
+```bash
+agentos ctl context doctor --file /tmp/brain/CLAUDE.md
+echo "exit=$?"
+```
+
+`--file` hands the node your local draft instead of the file in its own context
+repository, so this works before anything is pushed. It still needs a node to
+answer, and on a clean box there is none yet — the `agentos` CLI does not even
+exist until Phase 4. So read the result like this:
+
+- **exit 0** — no warnings. Notes (`info`) may remain; they never block.
+- **exit 1** — at least one warning (or the node refused the call; the output
+  says which). Act on each `WARN` line, then run it again until it exits 0:
+  - `builtin_duplicate` — the paragraph retells the node's own ORCHESTRATOR
+    section (short turns, long work in the background, `session_spawn`,
+    `remind`, "I will come back"). Delete the retelling: the node already puts
+    that section into every chat, worded from its own facts.
+  - `unknown_tool` / `unknown_setting` — the charter names a tool or a setting
+    this node does not have. Replace it with the real name (the finding's fix
+    line and `agentos ctl status --json` help), or drop the sentence.
+  - `charter` — the owner, the working language or the boundary is missing.
+    Add it; that is the part of the charter this phase exists to write.
+  - Anything else — follow the fix line printed under the finding.
+- **exit 3, or `agentos: command not found`** — no node answers yet. That is
+  the normal case on a first install. The step is **moved, not skipped**: run
+  the same command right after Phase 4's five checks pass, and fix what it
+  finds there (see the end of Phase 4).
+- **exit 2** — you mistyped the command; fix it and run it again.
+
 Then commit and push — before Phase 4, because `--repo` clones whatever is on
 the remote at that moment, and a brain that reaches the node without these two
 files is exactly the adoption this part exists to prevent. For a local-only
@@ -555,6 +588,24 @@ Also read what the banner says about your own flags. If it printed
 `installed <old>; channel has <new> — keeping <old>`, you were refreshing an
 existing node and rule 5 applies. If it printed the UNCLAIMED warning, `--admin`
 did not take — tell the owner to DM the bot *now*, before anyone else does.
+
+**Finish the charter check Phase 3B moved here.** If `agentos ctl context
+doctor` could not run in Phase 3B (exit 3 or no CLI yet), run it now, while
+`/tmp/brain` is still in front of you:
+
+```bash
+agentos ctl context doctor --file /tmp/brain/CLAUDE.md
+echo "exit=$?"
+```
+
+Handle the findings exactly as Phase 3B says. Every fix goes into `/tmp/brain`,
+gets committed and pushed like the rest of the brain, and the command is run
+again until it exits 0. The node's own copy was cloned in Phase 4, before
+these fixes; once they are pushed, the same command without `--file` lints the
+node's copy and shows whether it has caught up. Exit 3 here is no longer "too early": the node that just
+passed its health checks does not answer its own CLI, and that is a failure to
+investigate (see "When a step fails"), not a step to drop. Tell the owner what
+the check changed in their charter, if anything.
 
 ## Phase 5 — Connect the owner
 
