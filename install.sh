@@ -2025,6 +2025,37 @@ if [ -n "${AGENTOS_PRINT_SIGNAL_DIRS:-}" ]; then
   exit 0
 fi
 
+# The exit journal's root hooks (fleet stability spec §8.1, ClickUp 12418agg8w8):
+# ROOT-OWNED copies of the two scripts agentos.service runs as ExecStartPre=-+ /
+# ExecStopPost=-+, under /usr/local/libexec/<unit>/, plus the shared exit watcher
+# template. Copies, never the release tree itself: that tree is chowned to the
+# service account below, and a `+` line pointing into it would run what that
+# account wrote there as root. Per unit, so two instances on different releases
+# never swap each other's hooks. Kept in step BY HAND with the CLI's
+# install_exit_hooks (scripts/agentos), which does the same on every upgrade.
+# Best-effort: the unit's `-` prefix tolerates a missing hook.
+install_exit_hooks() { # install_exit_hooks <profiles-dir>
+  local pdir="$1" f libexec="/usr/local/libexec/${SERVICE_NAME}"
+  # $SUDO on the reads: $INSTALL_DIR can be the account's 0700 $HOME.
+  $SUDO test -f "$pdir/agentos-record-exit" || return 0
+  plain_dir_ok "$libexec" "exit-journal hook directory" || return 0
+  $SUDO mkdir -p "$libexec" && $SUDO chmod 0755 "$libexec" || { warn "could not create $libexec — the exit journal stays off"; return 0; }
+  for f in agentos-record-exit agentos-stamp-version; do
+    $SUDO test -f "$pdir/$f" || continue
+    if $SUDO install -m 0755 "$pdir/$f" "$libexec/$f.tmp" && $SUDO mv -f "$libexec/$f.tmp" "$libexec/$f"; then
+      :
+    else
+      $SUDO rm -f "$libexec/$f.tmp" 2>/dev/null || true
+      warn "could not install $libexec/$f"
+    fi
+  done
+  if $SUDO test -f "$pdir/agentos-exit-watch@.service"; then
+    $SUDO install -m 0644 "$pdir/agentos-exit-watch@.service" /etc/systemd/system/agentos-exit-watch@.service \
+      || warn "could not install agentos-exit-watch@.service"
+  fi
+  ok "exit journal hooks → ${libexec}, journal → /var/lib/${SERVICE_NAME}/exits.jsonl"
+}
+
 install_systemd() {
   step "System packages"
   export DEBIAN_FRONTEND=noninteractive
@@ -2162,6 +2193,8 @@ install_systemd() {
   # rewrite: the account name is a substring of every install path, so a global
   # s|agentos|<user>| would corrupt them. Anchored ^User= can only ever hit the
   # two lines it is meant to.
+  # The hooks the unit runs as root, BEFORE the unit that runs them.
+  install_exit_hooks "$INSTALL_DIR/current/profiles"
   $SUDO sed -e "s|/opt/agentos|${INSTALL_DIR}|g" \
             -e "s|^User=agentos$|User=${SERVICE_USER}|" \
             -e "s|^Group=agentos$|Group=${SERVICE_USER}|" \
