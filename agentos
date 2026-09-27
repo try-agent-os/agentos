@@ -8,7 +8,9 @@
 #                                       tag); waits for a quiet moment unless --force.
 #                                       Crossing a major walks the intermediate
 #                                       majors one hop at a time unless --no-chain
-#   agentos rollback                    undo the last upgrade (code + database)
+#   agentos rollback [--force-over-lock] undo the last upgrade (code + database)
+#   agentos fleet-op claim|release|pin|unpin|list|log
+#                                       advisory lock + journal of operations on a node
 #   agentos backup                      take a manual backup without upgrading
 #   agentos status | logs [n] | version
 #
@@ -539,6 +541,29 @@ else
   AGENTOS_CHAIN_PLANNER=0
 fi
 
+# The advisory lock and journal of operations ON a node (ClickUp 12418agg8we):
+# `agentos fleet-op`, the claim check in `upgrade`/`rollback`, and the pin the
+# poller reads. Same relative lookup as the two libs above. Absence degrades to
+# "no lock, no journal" with a warning — the lock is coordination, not a gate a
+# missing file may turn into a node that cannot be upgraded.
+if [ -r "$_CLI_HERE/lib/fleet-op.sh" ]; then
+  # shellcheck source=lib/fleet-op.sh
+  . "$_CLI_HERE/lib/fleet-op.sh"
+fi
+
+# fleet_guard_or_die <op> <force-over-lock 0|1> — the claim check both hands-on
+# commands run before they touch anything. Exit 3 is the lock's own "held by
+# someone else" code (the same one `fleet-op claim` answers with).
+fleet_guard_or_die() {
+  if [ "${FLEET_OP_LIB:-0}" != 1 ]; then
+    warn "fleet-op lib missing next to this CLI: $1 runs without checking the node's claim"
+    return 0
+  fi
+  local rc=0
+  fleet_guard "$AGENTOS_SERVICE" "$1" "$2" || rc=$?
+  [ "$rc" = 0 ] || exit "$rc"
+}
+
 # await_quiet_moment <what> — block until no owner turn is in flight, then return.
 # NEVER fails the caller: worst case it prints why it could not wait and returns 0,
 # because a guard that can cancel an upgrade is a guard that can strand a node.
@@ -705,6 +730,63 @@ reconcile_gh() {
     fi
   fi
   warn "gh ${have:-<none>} is still below ${GH_MIN_VERSION}: 'gh pr edit' will fail on every PR (Projects classic). Install a current gh from https://cli.github.com, or re-run \`agentos upgrade\`."
+  return 0
+}
+
+install_exit_hooks() { # install_exit_hooks <profiles-dir> — root-owned copies of the exit-journal hooks
+  # The node's main unit runs two scripts AS ROOT around every run of the node
+  # (fleet stability spec §8.1, ClickUp 12418agg8w8):
+  #   ExecStartPre=-+/usr/local/libexec/<unit>/agentos-stamp-version
+  #   ExecStopPost=-+/usr/local/libexec/<unit>/agentos-record-exit
+  # They are COPIED out of the release tree, never referenced in place: the
+  # release tree belongs to the service account (an agent with a shell), and a
+  # `+` line pointing into it would run whatever that account wrote there as
+  # root. The copies are made by root, 0755, under a root-owned directory, per
+  # unit so two instances on one host on different releases never swap each
+  # other's hooks. The exit watcher template (agentos-exit-watch@.service) is
+  # shared: its instance name carries the unit.
+  #
+  # Also the state directory the hooks write into, /var/lib/<unit> (root, 0755):
+  # ensure_signal_dirs creates it too, but only as the outbox's parent and only
+  # on the systemd upgrade path — the hooks must not depend on that ordering.
+  # Everything here is best-effort: the unit's `-` prefix already tolerates a
+  # missing hook, so a snag costs the journal, never the node.
+  local pdir="$1" f src dst
+  local libexec="${AGENTOS_LIBEXEC_DIR:-/usr/local/libexec}/${AGENTOS_SERVICE}"
+  local units_dir="${AGENTOS_UNITS_DIR:-/etc/systemd/system}"
+  local state="${AGENTOS_STATE_ROOT:-/var/lib}/${AGENTOS_SERVICE}"
+  [ -f "$pdir/agentos-record-exit" ] || return 0
+  if plain_dir_ok "$libexec" "exit-journal hook directory"; then
+    mkdir -p "$libexec" && chmod 0755 "$libexec" || { warn "could not create $libexec — the exit journal stays off"; return 0; }
+  else
+    return 0
+  fi
+  for f in agentos-record-exit agentos-stamp-version; do
+    src="$pdir/$f"; dst="$libexec/$f"
+    [ -f "$src" ] || continue
+    cmp -s "$src" "$dst" 2>/dev/null && continue
+    # Temp + rename: the unit may fire the hook at any moment, and a half-copied
+    # script run as root is worse than the old one.
+    if install -m 0755 "$src" "$dst.tmp" 2>/dev/null && mv -f "$dst.tmp" "$dst"; then
+      ok "installed exit-journal hook $dst"
+    else
+      rm -f "$dst.tmp" 2>/dev/null || true
+      warn "could not install $dst — the exit journal keeps the previous hook"
+    fi
+  done
+  if [ -f "$pdir/agentos-exit-watch@.service" ] && [ -d "$units_dir" ]; then
+    if ! cmp -s "$pdir/agentos-exit-watch@.service" "$units_dir/agentos-exit-watch@.service" 2>/dev/null; then
+      if install -m 0644 "$pdir/agentos-exit-watch@.service" "$units_dir/agentos-exit-watch@.service" 2>/dev/null; then
+        EXIT_HOOKS_CHANGED=1
+      else
+        warn "could not install agentos-exit-watch@.service"
+      fi
+    fi
+  fi
+  if plain_dir_ok "$state" "exit-journal state directory"; then
+    mkdir -p "$state" 2>/dev/null && chmod 0755 "$state" 2>/dev/null ||
+      warn "could not create $state — the exit hooks will try again on the next exit"
+  fi
   return 0
 }
 
@@ -888,6 +970,13 @@ $3"
   # this write never touches — so an operator's override (e.g. Symoditi's manual
   # 21-stop-timeout.conf) survives the migration untouched.
   local main_unit="$units_dir/${AGENTOS_SERVICE}.service"
+  # The hooks the template calls as root, BEFORE the template that calls them —
+  # and only where a main unit exists (a docker node has none to hook).
+  if [ -f "$main_unit" ]; then
+    EXIT_HOOKS_CHANGED=0
+    install_exit_hooks "$pdir"
+    if [ "$EXIT_HOOKS_CHANGED" = 1 ]; then changed=1; fi
+  fi
   if [ -f "$main_unit" ] && [ -f "$pdir/agentos.service" ]; then
     # The template the node is being migrated ONTO appends stdout+stderr to
     # <root>/logs/node.log. install.sh creates that directory; no upgrade path
@@ -1057,7 +1146,7 @@ docker_refresh_profiles() { # docker_refresh_profiles <new-image> [prev-image]
   # scripts above source resolves as "<their own dir>/lib/node-activity.sh", so it
   # must land under $AGENTOS_HOME/lib/ — hence the mkdir. Leave it out and a node
   # refreshes a CLI that then cannot see owner activity at all.
-  for f in agentos agentos-autoupdate.sh lib/node-activity.sh lib/upgrade-chain.sh; do
+  for f in agentos agentos-autoupdate.sh lib/node-activity.sh lib/upgrade-chain.sh lib/fleet-op.sh; do
     [ -f "$stage/$f" ] || continue
     if [ -f "$AGENTOS_HOME/$f" ] && cmp -s "$stage/$f" "$AGENTOS_HOME/$f"; then
       continue   # already current — no needless churn
@@ -2974,6 +3063,8 @@ detach_upgrade_and_exit() { # detach_upgrade_and_exit <original upgrade argv...>
       --setenv=AGENTOS_SERVICE="$AGENTOS_SERVICE" \
       --setenv=AGENTOS_USER="$AGENTOS_ACCOUNT" \
       --setenv=AGENTOS_PORT="${AGENTOS_PORT:-8787}" \
+      --setenv=AGENTOS_FLEET_OP_BY="$(fleet_caller 2>/dev/null || true)" \
+      --setenv=AGENTOS_FLEET_OP_CALLER="${AGENTOS_FLEET_OP_CALLER:-}" \
       -- "$self" upgrade "$@"
   fi
   ok "detached: journalctl -u ${unit}.service -f to watch it; agentos status once it settles."
@@ -2987,7 +3078,7 @@ cmd_upgrade() {
   if [ "$(detect_mode)" = systemd ] && running_inside_own_unit; then
     detach_upgrade_and_exit "$@"
   fi
-  local to="" image_ref="" chain=1 cur plan hop hop_arg hop_img total n=0 from_latest=0
+  local to="" image_ref="" chain=1 cur plan hop hop_arg hop_img total n=0 from_latest=0 over_lock=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --to)    to="${2:?--to needs a value}"; shift 2 ;;
@@ -3004,9 +3095,16 @@ cmd_upgrade() {
       # default, and never reachable from the core (cmd_manual_upgrade does not
       # pass it).
       --no-chain) chain=0; shift ;;
+      # Go over another contour's live claim on this node (`agentos fleet-op
+      # claim`). Recorded in the fleet journal; the claim itself stays.
+      --force-over-lock) over_lock=1; shift ;;
       *)       die "unknown upgrade option: $1 (try --help)" ;;
     esac
   done
+
+  # The node's claim, before the quiet-moment wait and before any network: a
+  # refusal must cost nothing and change nothing (ClickUp 12418agg8we).
+  fleet_guard_or_die upgrade "$over_lock"
 
   # UNCHANGED position, and it has to stay here: an upgrade ends in a restart of
   # the node whichever mode we are in, so the guard runs ONCE up front — before
@@ -3346,7 +3444,7 @@ cmd_manual_upgrade() {
   # --force, and only --force: the quiet-moment wait is skipped because the
   # owner asked for this one directly and is watching the reply. Never
   # --no-chain — the chain is the point.
-  cmd_upgrade --to "$raw" --force
+  AGENTOS_FLEET_OP_CALLER=manual-upgrade cmd_upgrade --to "$raw" --force
   MANUAL_UPGRADE_TO=""          # reached: the trap has nothing left to report
   trap - EXIT TERM INT
   write_upgrade_result ok "$cur" "${raw#v}" ""
@@ -3394,6 +3492,11 @@ cmd_autoupdate() {
   # MAX_DEFERRAL). Without this flag cmd_upgrade would gate a SECOND time and a
   # core writing "busy" forever could hold root off past its own ceiling.
   export AGENTOS_AUTOUPDATE_APPLY_CMD="${AGENTOS_AUTOUPDATE_APPLY_CMD:-$self upgrade --force}"
+  # The apply is the POLLER's, which the node's claim does not gate (it is
+  # recorded when it goes over one); and the poller needs this node's name to
+  # find its auto-update pin (lib/fleet-op.sh).
+  export AGENTOS_FLEET_OP_CALLER=autoupdate
+  export AGENTOS_SERVICE
   exec "$poller" "$@"
 }
 
@@ -3482,6 +3585,7 @@ cmd_routines() {
       done
       [ -n "$cli" ] || die "routines CLI not found under $base (is the node installed?)"
       resolve_node_bin
+      db_env_default
       exec "$AGENTOS_NODE_BIN" "$cli" "$@" ;;
     none)
       die "no install found under $AGENTOS_HOME" ;;
@@ -3522,6 +3626,7 @@ cmd_state() {
       done
       [ -n "$cli" ] || die "state CLI not found under $base (is the node installed?)"
       resolve_node_bin
+      db_env_default
       exec "$AGENTOS_NODE_BIN" "$cli" "$@" ;;
     none)
       die "no install found under $AGENTOS_HOME" ;;
@@ -3538,6 +3643,29 @@ ctl_env_default() { # ctl_env_default KEY
   [ -n "${!key:+set}" ] && return 0
   found="$(dotenv_val "$key")"
   [ -n "$found" ] && export "$key=$found"
+  return 0
+}
+
+# The database the node's core runs on, carried into a sub-CLI that opens that
+# database ITSELF (`routines`, `state`). The core gets it from its unit
+# (`EnvironmentFile=<install>/.env`, `WorkingDirectory=<install>/current`); an
+# operator's `sudo agentos-<slot> routines ls` gets neither. Without this lift
+# the CLI saw no DATABASE_URL, fell back to SQLite at `$PWD/messages.db`, created
+# that file empty and died with `no such table: installations` — on a node that
+# lives on managed Postgres, where `ctl routine list` (which goes through the
+# running core) answered fine (ClickUp 12418agg59y).
+#
+# Same precedence as ctl_env_default: an explicit export wins, so a routine
+# step — which inherits the core's own environment — keeps the database it was
+# handed. The last resort mirrors the unit's working directory, which is where
+# the core's own relative fallback points.
+db_env_default() {
+  ctl_env_default DATABASE_URL
+  ctl_env_default DB_DRIVER
+  ctl_env_default TELEGRAM_MCP_DB_PATH
+  if [ -z "${DATABASE_URL:+set}" ] && [ -z "${TELEGRAM_MCP_DB_PATH:+set}" ]; then
+    export TELEGRAM_MCP_DB_PATH="$AGENTOS_HOME/current/messages.db"
+  fi
   return 0
 }
 
@@ -3709,6 +3837,14 @@ cmd_import_history() { # agentos import-history --from <path> --chat <id> [--dry
 }
 
 cmd_rollback() {
+  local over_lock=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force-over-lock) over_lock=1; shift ;;
+      *) die "unknown rollback option: $1 (try --help)" ;;
+    esac
+  done
+  fleet_guard_or_die rollback "$over_lock"
   case "$(detect_mode)" in
     systemd) systemd_rollback ;;
     docker)  docker_rollback ;;
@@ -3728,7 +3864,7 @@ usage() {
   cat <<'EOF'
 agentos — operate an AgentOS Core node
   install [installer flags]   fresh install (delegates to install.sh)
-  upgrade [--to <tag>|--image <ref>] [--force] [--no-chain]
+  upgrade [--to <tag>|--image <ref>] [--force] [--no-chain] [--force-over-lock]
                               upgrade to the stable channel, a pinned tag, or an
                               explicit (digest-pinned) image ref. Waits for a
                               quiet moment first (the node drains agent turns on
@@ -3740,7 +3876,9 @@ agentos — operate an AgentOS Core node
                               A target on a newer MAJOR is applied as a chain —
                               one health-gated hop per major boundary, because
                               migrations are forward-only; --no-chain takes the
-                              single jump instead (operator's call, not a default)
+                              single jump instead (operator's call, not a default).
+                              Refused while another contour holds the node
+                              (`agentos fleet-op claim`) unless --force-over-lock
   autoupdate [--check]        poll the update channel and apply per policy
                               (--check: report the verdict, change nothing)
   manual-upgrade              apply the forced upgrade the core requested in
@@ -3749,7 +3887,14 @@ agentos — operate an AgentOS Core node
                               not by hand — it is the unit's own cgroup that
                               lets a multi-hop chain outlive the node it
                               restarts
-  rollback                    undo the last upgrade (code + database)
+  rollback [--force-over-lock]
+                              undo the last upgrade (code + database)
+  fleet-op claim|release|pin|unpin|list|log ...
+                              advisory lock and journal of operations on a node
+                              (/var/lib/agentos-fleet): `upgrade` and `rollback`
+                              refuse to run over another contour's live claim
+                              without --force-over-lock; an auto-update pin to
+                              `off` always carries --until and lifts itself
   backup                      take a manual backup without upgrading
   plugin add|ls|rm|enable|disable|secret|update|slot ...  manage runtime plugins
   plugin new|validate|list ...  author, validate and scaffold plugin dirs
@@ -3772,6 +3917,12 @@ agentos — operate an AgentOS Core node
                               `agentos status` is the SERVICE view (is the unit
                               up), `agentos ctl status` is the NODE view
                               (version, uptime, harness, live runs).
+  stats [--since 24h] [--json]
+                              the node's own stability numbers over a window
+                              (crashes by version, failed/interrupted/empty-
+                              resume steps, chat turn durations, reply latency,
+                              delivery failures). The same answer as
+                              `agentos ctl stats`: read from the running node.
   sessions <verb> …           durable agent sessions over this node's job API
                               (create|ls|status|attach|steer|stop|resume|budget;
                               `session` is the singular alias). Receipts, event
@@ -3802,13 +3953,17 @@ case "${1:-}" in
   upgrade)    shift; cmd_upgrade "$@" ;;
   autoupdate) shift; cmd_autoupdate "$@" ;;
   manual-upgrade) shift; cmd_manual_upgrade "$@" ;;
-  rollback)   cmd_rollback ;;
+  rollback)   shift; cmd_rollback "$@" ;;
+  fleet-op)   shift
+              [ "${FLEET_OP_LIB:-0}" = 1 ] || die "fleet-op: lib/fleet-op.sh is missing next to this CLI"
+              rc=0; fleet_op_main "$@" || rc=$?; exit "$rc" ;;
   plugin)     shift; cmd_plugin "$@" ;;
   preset)     shift; cmd_preset "$@" ;;
   routines)   shift; cmd_routines "$@" ;;
   state)      shift; cmd_state "$@" ;;
   import-history) shift; cmd_import_history "$@" ;;
   ctl)        shift; cmd_ctl "$@" ;;
+  stats)      shift; cmd_ctl stats "$@" ;;
   sessions|session) shift; cmd_sessions "$@" ;;
   mcp)        shift; cmd_mcp "$@" ;;
   status)   cmd_status ;;
