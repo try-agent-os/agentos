@@ -1146,7 +1146,7 @@ docker_refresh_profiles() { # docker_refresh_profiles <new-image> [prev-image]
   # scripts above source resolves as "<their own dir>/lib/node-activity.sh", so it
   # must land under $AGENTOS_HOME/lib/ — hence the mkdir. Leave it out and a node
   # refreshes a CLI that then cannot see owner activity at all.
-  for f in agentos agentos-autoupdate.sh lib/node-activity.sh lib/upgrade-chain.sh lib/fleet-op.sh; do
+  for f in agentos agentos-autoupdate.sh lib/node-activity.sh lib/upgrade-chain.sh lib/fleet-op.sh lib/md2quill.mjs; do
     [ -f "$stage/$f" ] || continue
     if [ -f "$AGENTOS_HOME/$f" ] && cmp -s "$stage/$f" "$AGENTOS_HOME/$f"; then
       continue   # already current — no needless churn
@@ -3860,6 +3860,22 @@ cmd_backup() {
   esac
 }
 
+# `agentos md2quill` — Markdown on stdin to a ClickUp comment body on stdout
+# (ClickUp 12418agg0qw). ClickUp shows `comment_text` as plain text, so
+# `**bold**`, tables and fences reached the owner literally; it renders only the
+# `comment` array of Quill ops, and shows the body twice when both fields are
+# set. Every factory that writes ClickUp comments (python, bash, whatever) pipes
+# its Markdown through this one converter instead of keeping its own copy:
+#   printf '%s' "$md" | agentos md2quill --body     # POST it as the request body
+# The converter is lib/md2quill.mjs next to this CLI, run under the node's own
+# Node runtime; it needs no running node, no database and no network.
+cmd_md2quill() {
+  local lib="$_CLI_HERE/lib/md2quill.mjs"
+  [ -r "$lib" ] || die "md2quill: lib/md2quill.mjs is missing next to this CLI"
+  resolve_node_bin
+  exec "$AGENTOS_NODE_BIN" "$lib" "$@"
+}
+
 usage() {
   cat <<'EOF'
 agentos — operate an AgentOS Core node
@@ -3932,6 +3948,10 @@ agentos — operate an AgentOS Core node
                               server over stdio (mount it elsewhere as
                               {"command":"agentos","args":["mcp"]}). Read-only
                               unless the node arms AGENTOS_MCP_EXTERNAL_PROFILE
+  md2quill [--body] [--notify]
+                              Markdown on stdin -> ClickUp comment JSON on stdout:
+                              the Quill ops array, or with --body the whole
+                              request body (comment_text empty, comment = ops)
   status | logs [n] | version
 EOF
 }
@@ -3966,6 +3986,7 @@ case "${1:-}" in
   stats)      shift; cmd_ctl stats "$@" ;;
   sessions|session) shift; cmd_sessions "$@" ;;
   mcp)        shift; cmd_mcp "$@" ;;
+  md2quill)   shift; cmd_md2quill "$@" ;;
   status)   cmd_status ;;
   logs)     shift || true; cmd_logs "${1:-200}" ;;
   version)  cmd_version ;;
