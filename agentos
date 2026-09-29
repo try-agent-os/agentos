@@ -116,16 +116,44 @@ fetch_release_asset() { # fetch_release_asset <what> <url> [outfile]  — no out
 #
 # The poll count bounds the loop as well as the clock: a `sleep` that returns
 # at once (the test suites stub it) must not turn this into a busy spin.
-wait_healthz() { # wait_healthz [unit]
-  local unit="${1:-}" budget="${AGENTOS_HEALTH_TIMEOUT_SEC:-420}" started now polls i state
+#
+# It ALSO gives up early on a boot that has said it will never succeed
+# (ClickUp 12418agg9aw). A release whose migrations do not fit the schema on
+# disk dies in the core's boot guard (SchemaCompatError) on every attempt;
+# `Restart=always` restarts it, so the unit never reaches `failed`, and on
+# 2026-09-27 four nodes of one host each sat out the whole 420 s before rolling
+# back — then reported a nameless "health-gate". The guard now writes
+# `<data dir>/boot-failure.json` before it exits; see boot_failure_since for
+# when that file is believed. `since` (epoch seconds) is the moment of the
+# `systemctl start` this wait belongs to — default: the moment the wait began.
+# On such a file the wait ends at once with one machine line,
+#   boot-failure: schema-compat <divergent|ahead> <migration> [<migration>...]
+# which the poller turns into `reason=schema-compat` + `detail`, and
+# LAST_BOOT_FAILURE keeps "<kind> <migrations>" for the caller (systemd_upgrade
+# copies it for the manual path's report). The check needs the unit: without
+# one (docker) the data dir is a volume this CLI does not resolve, and the wait
+# keeps its old shape.
+LAST_BOOT_FAILURE=""
+UPGRADE_BOOT_FAILURE=""; UPGRADE_BOOT_FAILURE_TO=""
+wait_healthz() { # wait_healthz [unit] [since-epoch-seconds]
+  local unit="${1:-}" since="${2:-}" budget="${AGENTOS_HEALTH_TIMEOUT_SEC:-420}" started now polls i state bf
+  LAST_BOOT_FAILURE=""
   case "$budget" in ''|*[!0-9]*) budget=420 ;; esac
   started="$(date +%s)"; polls=$(( budget / 2 )); [ "$polls" -ge 1 ] || polls=1
+  case "$since" in ''|*[!0-9]*) since="$started" ;; esac
   for i in $(seq 1 "$polls"); do
     curl -fsS --max-time 5 "http://127.0.0.1:${AGENTOS_PORT:-8787}/healthz" >/dev/null 2>&1 && return 0
     if [ -n "$unit" ]; then
       state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)"
       if [ "$state" = failed ]; then
         echo "  ! $unit is in state 'failed' — not waiting out the rest of the ${budget}s health budget" >&2
+        return 1
+      fi
+      bf="$(boot_failure_since "$since")"
+      if [ -n "$bf" ]; then
+        LAST_BOOT_FAILURE="$bf"
+        echo "boot-failure: schema-compat $bf" >&2
+        echo "  ! $unit refused to start (schema-compat: the release's migrations do not fit the schema on disk) — a restart cannot change that, not waiting out the rest of the ${budget}s health budget" >&2
         return 1
       fi
     fi
@@ -135,6 +163,53 @@ wait_healthz() { # wait_healthz [unit]
     sleep 2
   done
   return 1
+}
+
+# node_data_dir — the directory the core resolves as its data dir
+# (resolveAgentosDataDir in apps/api/src/core/context/paths.ts): AGENTOS_DATA_DIR,
+# else the directory of TELEGRAM_MCP_DB_PATH, else <install>/data.
+node_data_dir() {
+  local dir db
+  dir="$(dotenv_val AGENTOS_DATA_DIR)"
+  if [ -z "$dir" ]; then
+    db="$(dotenv_val TELEGRAM_MCP_DB_PATH)"
+    [ -n "$db" ] && dir="$(dirname "$db")"
+  fi
+  printf '%s' "${dir:-$AGENTOS_HOME/data}"
+}
+
+# boot_failure_since <epoch-seconds> — "<kind> <migration>..." when the core
+# recorded a schema-compat refusal AT OR AFTER that moment, else nothing.
+#
+# The file is the service account's, so it is read as untrusted data and
+# believed only this far (spec 2026-09-27-migration-order-rollout-stop, threat
+# model): a missing, unreadable, oversized, malformed or foreign-class file is
+# no answer at all, and so is one whose `at` predates the start this wait
+# belongs to — a refusal left over from an earlier boot must never cut short
+# the wait for a release that is merely slow (bailaspot, 2026-09-24). What it
+# can decide is only what this node does with its OWN boot, and only while the
+# unit is also not answering /healthz: at worst a forged file rolls back a
+# release that was not coming up anyway. Names are reduced to the characters a
+# migration name has, so nothing the file says reaches a log line verbatim.
+boot_failure_since() { # boot_failure_since <epoch-seconds>
+  local since="${1:-0}" file raw out
+  command -v jq >/dev/null 2>&1 || return 0
+  file="$(node_data_dir)/boot-failure.json"
+  [ -f "$file" ] || return 0
+  raw="$(head -c 65536 "$file" 2>/dev/null || true)"
+  [ -n "$raw" ] || return 0
+  # `-n` + `input`: the FIRST JSON value only, without a pipe to a reader
+  # that exits early (a file of several values yields one answer, not many).
+  out="$(jq -rn --argjson since "$since" '
+      input
+      | select(type == "object" and .class == "schema-compat"
+             and (.kind == "divergent" or .kind == "ahead")
+             and (.at | type) == "number" and .at >= $since * 1000
+             and (.migrations | type) == "array")
+      | [.kind] + [.migrations[] | select(type == "string") | gsub("[^A-Za-z0-9_.-]"; "")
+                   | select(length > 0)][0:20]
+      | join(" ")' <<<"$raw" 2>/dev/null || true)"
+  printf '%s' "$out"
 }
 
 # systemctl_bus <args…> — systemctl, retried while PID 1 is not serving its bus.
@@ -2789,7 +2864,7 @@ schema_compat_preflight() { # schema_compat_preflight <prev-tag> <target-tag> �
 
 systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   local to="${1:-}" manifest tag tarball sha url prev tmp_dir snap started
-  local stop_epoch snap_started snap_seconds
+  local stop_epoch snap_started snap_seconds start_epoch
   if [ -n "$to" ]; then
     manifest="$(fetch_release_asset "stable.json for ${to}" \
       "https://github.com/${DIST_REPO}/releases/download/${to}/stable.json")" \
@@ -2908,9 +2983,11 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   # rollback below as a failed healthz — a bare call here would abort under
   # set -e with the node down and no rollback.
   started=0
+  # The moment the boot-failure record has to be newer than (wait_healthz).
+  start_epoch="$(date +%s)"
   if systemctl_bus start "$AGENTOS_SERVICE"; then started=1; fi
 
-  if [ "$started" = 1 ] && wait_healthz "$AGENTOS_SERVICE"; then
+  if [ "$started" = 1 ] && wait_healthz "$AGENTOS_SERVICE" "$start_epoch"; then
     ok "upgraded: $prev → $tag"
     # Measured at the first green healthz — the moment the owner can reach the
     # node again — and therefore BEFORE the best-effort reconciliation below,
@@ -2926,6 +3003,11 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     reconcile_gh || warn "gh reconciliation hit a snag"
     prune_versions
   else
+    # Why the new release did not come up, when its boot guard said so — kept
+    # before the rollback's own wait can overwrite it (12418agg9aw).
+    if [ -n "$LAST_BOOT_FAILURE" ]; then
+      UPGRADE_BOOT_FAILURE="$LAST_BOOT_FAILURE"; UPGRADE_BOOT_FAILURE_TO="${tag#v}"
+    fi
     if uses_managed_postgres; then
       echo "new version unhealthy" >&2
       docker_managed_postgres_warning "$prev"
@@ -3374,6 +3456,22 @@ upgrade_abort_report() { # upgrade_abort_report [exit-status]  — default: $? a
       # failed — saying so would send the owner looking for a bad release
       # (ClickUp 12418agfr7m). Same reason string as the unattended poller.
       write_upgrade_result failed-no-rollback "$MANUAL_UPGRADE_FROM" "$MANUAL_UPGRADE_TO" "fetch-failed"
+    elif [ -n "${UPGRADE_BOOT_FAILURE:-}" ]; then
+      # The release was installed and its boot guard refused the schema on
+      # disk (ClickUp 12418agg9aw): name the migrations instead of "a hop did
+      # not complete". Managed PostgreSQL gets no automatic rollback, which the
+      # result says. A release that cannot boot here is marked in failed.json,
+      # exactly as the poller marks a failed health gate.
+      local bf_kind="${UPGRADE_BOOT_FAILURE%% *}" bf_names=""
+      [ "$bf_kind" = "$UPGRADE_BOOT_FAILURE" ] || bf_names="${UPGRADE_BOOT_FAILURE#* }"
+      if uses_managed_postgres; then
+        write_upgrade_result failed-no-rollback "$MANUAL_UPGRADE_FROM" "$MANUAL_UPGRADE_TO" \
+          "schema-compat" "$bf_names" boot "$bf_kind"
+      else
+        write_upgrade_result rolled-back "$MANUAL_UPGRADE_FROM" "$MANUAL_UPGRADE_TO" \
+          "schema-compat" "$bf_names" boot "$bf_kind"
+      fi
+      write_failed_marker "${UPGRADE_BOOT_FAILURE_TO:-$MANUAL_UPGRADE_TO}"
     else
       write_upgrade_result rolled-back "$MANUAL_UPGRADE_FROM" "$MANUAL_UPGRADE_TO" \
         "a hop did not complete; see journalctl -u ${AGENTOS_SERVICE}"
@@ -3494,19 +3592,23 @@ UPGRADE_REQUEST=upgrade-target
 # write_outbox/write_result in scripts/agentos-autoupdate.sh, and the shape is
 # UpgradeResult in apps/api/src/core/updates/signal-channel.ts — the core has
 # exactly one reader for both producers.
-write_upgrade_result() { # write_upgrade_result <outcome> <from> <to> <reason> [detail]
+write_upgrade_result() { # write_upgrade_result <outcome> <from> <to> <reason> [detail] [stage] [kind]
   command -v jq >/dev/null 2>&1 || return 0
   local json
   # `detail` is optional and names WHAT the reason is about — for
   # `schema-compat`, the out-of-order migrations (ClickUp 12418agg9av). An
-  # older core ignores it.
+  # older core ignores it. `stage`/`kind` say that a schema-compat refusal came
+  # from the BOOT guard of an installed release, not from the preflight, and
+  # which way the schema disagreed (ClickUp 12418agg9aw).
   json="$(jq -nc --arg id "$(date -u +%s)-$3" --arg o "$1" --arg f "$2" --arg t "$3" --arg r "$4" \
-    --arg d "${5:-}" \
+    --arg d "${5:-}" --arg s "${6:-}" --arg k "${7:-}" \
     '{id: $id, outcome: $o,
       from:   (if $f == "" then null else $f end),
       to:     (if $t == "" then null else $t end),
       reason: (if $r == "" then null else $r end)}
-     + (if $d == "" then {} else {detail: $d} end)' 2>/dev/null || true)"
+     + (if $d == "" then {} else {detail: $d} end)
+     + (if $s == "" then {} else {stage: $s} end)
+     + (if $k == "" then {} else {kind: $k} end)' 2>/dev/null || true)"
   [ -n "$json" ] || return 0
   mkdir -p "$SIGNAL_OUTBOX" 2>/dev/null || true
   printf '%s\n' "$json" > "$SIGNAL_OUTBOX/result.json.tmp" 2>/dev/null \
