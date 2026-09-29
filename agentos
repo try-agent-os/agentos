@@ -1514,6 +1514,11 @@ docker_upgrade() { # docker_upgrade [tag] [image-ref]  — empty tag = latest st
   to_label="$to"
   [ -n "$to_label" ] || to_label="$(printf '%s' "${manifest:-}" | jq -r '.version // empty' 2>/dev/null || true)"
   [ -n "$to_label" ] || to_label="${image##*[:@]}"
+  # The schema-compat preflight (schema_compat_preflight) compares two unpacked,
+  # root-owned release trees; docker has no such trees on the host — the image
+  # is pulled, not unpacked — so the boot guard alone decides here. Said, not
+  # skipped silently (ClickUp 12418agg9av).
+  info "schema-compat preflight: not judged in docker mode — the boot guard decides"
   acquire_upgrade_host_lock
   announce_going_down "${from_label#v}" "${to_label#v}"
   # Managed PG: record the pre-flip restore point + shout that there is no
@@ -2667,6 +2672,121 @@ set_env_version() { # set_env_version <tag>
   rm -f "$tmp"
 }
 
+# ─── schema-compat preflight: the migration ORDER of two release images ──────
+#
+# v4.47.0 shipped `MonitorClaims1752800000369`, a migration OLDER than 370-374,
+# which every 4.46.0 node had already applied. The boot guard
+# (apps/api/src/core/db/schema-guard.ts) reads a pending migration older than
+# the newest applied one as a forked lineage and refuses to start — correctly,
+# and far too late: by then the node was stopped, snapshotted and swapped, and
+# on managed PostgreSQL there was no automatic way back. Six nodes were held
+# back by hand with AGENTOS_SCHEMA_COMPAT_OVERRIDE=1 (ClickUp 12418agg90x).
+#
+# That defect is a property of the PAIR of releases, not of any database, and
+# both halves of the pair are already on this host in root-owned trees: the
+# release `current` points at and the one just unpacked. So the engine judges
+# it here, BEFORE the host lock, the announcement and `systemctl stop` — a
+# refused release costs this node nothing, and every neighbour on the host
+# reaches the same refusal from the same two images, with no trust in anything
+# another node wrote (ClickUp 12418agg9av).
+#
+# THE RULE, per registry (primary, state, sidecar): every migration the target
+# adds — its timestamp is in the target's registry but not in the current one's,
+# and it is not in the target's RETIRED_MIGRATIONS — must be strictly NEWER than
+# the newest migration of the current image (the target's retired names
+# excluded, the same exclusion the boot guard makes).
+#
+# WHERE THE LISTS COME FROM: `dist/core/db/migrations.json`, which the build
+# writes from the compiled registry (apps/api/scripts/write-migrations-manifest.mjs).
+# A release that predates it (≤ v4.50.x) has none; then both sides are read from
+# the file names `dist/core/db/migrations/<timestamp>-<Name>.js` as ONE registry.
+# That is stricter, not looser: it can only refuse falsely when two registries
+# share a timestamp, which the CI order guard (ci-migration-order-guard.sh) does
+# not let into main.
+#
+# NOT A BYPASS: `--force` and a forced poke. They lift the quiet-moment wait and
+# failed.json, not the arithmetic of two images. The one way past is the same
+# switch the boot guard honours, set in THIS process's environment:
+# AGENTOS_SCHEMA_COMPAT_OVERRIDE=1 — and it is reported as a separate line in
+# the upgrade's result, never silently.
+#
+# Machine-readable lines for the callers (the poller reads the engine's output;
+# `manual-upgrade` reads the globals below from its EXIT trap):
+#   schema-compat detail: <name> [<name>...]            — refused
+#   schema-compat override detail: <name> [<name>...]   — overridden, installed
+UPGRADE_SCHEMA_COMPAT_DETAIL=""; UPGRADE_SCHEMA_COMPAT_TO=""; UPGRADE_SCHEMA_COMPAT_OVERRIDDEN=""
+
+schema_manifest_ok() { # schema_manifest_ok <release-dir> → 0 when it carries a readable migrations.json
+  local m="$1/dist/core/db/migrations.json"
+  [ -f "$m" ] && jq -e 'type == "object" and (.primary | type) == "array"' "$m" >/dev/null 2>&1
+}
+
+schema_migrations_of() { # schema_migrations_of <release-dir> <manifest|files> → "<registry> <timestamp> <name>" per line
+  local db="$1/dist/core/db" f base ts name
+  if [ "$2" = manifest ]; then
+    jq -r '
+      ["primary", "state", "sidecar"][] as $r
+      | (.[$r] // [])[]
+      | select(type == "string")
+      | "\($r) \([match("[0-9]+$").string][0] // "0") \(.)"' "$db/migrations.json"
+    return
+  fi
+  for f in "$db"/migrations/*.js; do
+    [ -e "$f" ] || continue
+    base="${f##*/}"
+    case "$base" in [0-9]*-*.js) ;; *) continue ;; esac
+    ts="${base%%-*}"
+    case "$ts" in *[!0-9]*) continue ;; esac
+    name="${base#*-}"; name="${name%.js}"
+    case "$name" in *.*) continue ;; esac   # a `.spec`/`.d` leftover is not a migration
+    printf 'all %s %s%s\n' "$ts" "$name" "$ts"
+  done
+}
+
+schema_compat_judge() { # schema_compat_judge <current-dir> <target-dir> → offending names on stdout; 0 ok, 1 refused, 2 not judgeable
+  local cur="$1" tgt="$2" mode=files cur_list tgt_list retired=""
+  local d
+  for d in "$cur" "$tgt"; do
+    [ -n "$d" ] && { [ -d "$d/dist/core/db/migrations" ] || schema_manifest_ok "$d"; } || return 2
+  done
+  if schema_manifest_ok "$cur" && schema_manifest_ok "$tgt"; then mode=manifest; fi
+  cur_list="$(schema_migrations_of "$cur" "$mode")" || return 2
+  tgt_list="$(schema_migrations_of "$tgt" "$mode")" || return 2
+  [ -n "$tgt_list" ] || return 2
+  if schema_manifest_ok "$tgt"; then
+    retired="$(jq -r '(.retired // [])[] | select(type == "string")' "$tgt/dist/core/db/migrations.json" 2>/dev/null || true)"
+  fi
+  { printf '%s\n' "$cur_list" | sed 's/^/C /'; printf '%s\n' "$tgt_list" | sed 's/^/T /'; } \
+    | awk -v retired="$retired" '
+        BEGIN { n = split(retired, r, "\n"); for (i = 1; i <= n; i++) if (r[i] != "") gone[r[i]] = 1 }
+        NF < 4 || ($4 in gone) { next }
+        $1 == "C" { seen[$2 " " $3] = 1; if (!($2 in max) || $3 + 0 > max[$2] + 0) max[$2] = $3; next }
+        $1 == "T" && !(($2 " " $3) in seen) && ($2 in max) && $3 + 0 <= max[$2] + 0 && !($4 in dup) {
+          dup[$4] = 1; bad[++nb] = $4
+        }
+        END { for (i = 1; i <= nb; i++) printf "%s%s", (i > 1 ? " " : ""), bad[i]; if (nb) { print ""; exit 1 } }'
+}
+
+schema_compat_preflight() { # schema_compat_preflight <prev-tag> <target-tag> — dies (node untouched) on an out-of-order release
+  local prev="$1" tag="$2" cur_dir offenders rc=0
+  cur_dir="$(readlink -f "$AGENTOS_HOME/current" 2>/dev/null || true)"
+  offenders="$(schema_compat_judge "$cur_dir" "$AGENTOS_HOME/versions/$tag")" || rc=$?
+  case "$rc" in
+    0) info "schema-compat preflight: every migration $tag adds is newer than what $prev has applied"; return 0 ;;
+    1) ;;
+    *) warn "schema-compat preflight: not judged — $prev or $tag carries no migration list (dist/core/db); the boot guard still decides"; return 0 ;;
+  esac
+  if [ "${AGENTOS_SCHEMA_COMPAT_OVERRIDE:-}" = 1 ]; then
+    UPGRADE_SCHEMA_COMPAT_OVERRIDDEN="$offenders"
+    echo "schema-compat override detail: $offenders"
+    warn "schema-compat preflight OVERRIDDEN (AGENTOS_SCHEMA_COMPAT_OVERRIDE=1): installing $tag although migration(s) $offenders are older than the newest one $prev has applied"
+    return 0
+  fi
+  UPGRADE_SCHEMA_COMPAT_DETAIL="$offenders"; UPGRADE_SCHEMA_COMPAT_TO="${tag#v}"
+  echo "schema-compat detail: $offenders" >&2
+  die "schema-compat: refusing $tag before install — migration(s) $offenders are older than the newest migration $prev has already applied, so $tag would not boot here (SchemaCompatError). Nothing was stopped or replaced; the node stays on $prev. Not bypassed by --force; operator override: AGENTOS_SCHEMA_COMPAT_OVERRIDE=1 agentos upgrade --to $tag"
+}
+
 systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   local to="${1:-}" manifest tag tarball sha url prev tmp_dir snap started
   local stop_epoch snap_started snap_seconds
@@ -2738,6 +2858,11 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   # materializes, BEFORE `current` ever points at it. Unconditional on
   # purpose: it also repairs a pre-existing root-owned dir from an older CLI.
   chown -R "$AGENTOS_ACCOUNT:$AGENTOS_ACCOUNT" "$AGENTOS_HOME/versions/$tag"
+
+  # Before the host lock, the announcement and the stop: a release that cannot
+  # boot here because of its migration ORDER is refused while the node still
+  # runs, untouched (ClickUp 12418agg9av — see schema_compat_preflight).
+  schema_compat_preflight "$prev" "$tag"
 
   step "Upgrading $prev → $tag"
   # The LAST moment anything on this node can speak to the owner: after this the
@@ -3235,7 +3360,15 @@ upgrade_abort_report() { # upgrade_abort_report [exit-status]  — default: $? a
     warn "hop ${UPGRADE_CHAIN_N}/${UPGRADE_CHAIN_TOTAL} (${UPGRADE_CHAIN_HOP}) did not complete — the chain stops here. The node is on the last release that came up healthy; nothing after ${UPGRADE_CHAIN_HOP} was attempted."
   fi
   if [ -n "${MANUAL_UPGRADE_TO:-}" ]; then
-    if [ "${UPGRADE_FETCH_FAILED:-0}" = 1 ]; then
+    if [ -n "${UPGRADE_SCHEMA_COMPAT_DETAIL:-}" ]; then
+      # Refused by the schema-compat preflight BEFORE anything was stopped: the
+      # node is untouched on its old release. The refused release is marked in
+      # failed.json exactly as the poller marks one, so the next unattended
+      # tick does not walk into the same refusal and report it again.
+      write_upgrade_result failed-no-rollback "$MANUAL_UPGRADE_FROM" "$MANUAL_UPGRADE_TO" \
+        "schema-compat" "$UPGRADE_SCHEMA_COMPAT_DETAIL"
+      write_failed_marker "${UPGRADE_SCHEMA_COMPAT_TO:-$MANUAL_UPGRADE_TO}"
+    elif [ "${UPGRADE_FETCH_FAILED:-0}" = 1 ]; then
       # The release could not be downloaded: the engine died before it stopped
       # anything, so there is no rollback to report and no health gate that
       # failed — saying so would send the owner looking for a bad release
@@ -3361,18 +3494,38 @@ UPGRADE_REQUEST=upgrade-target
 # write_outbox/write_result in scripts/agentos-autoupdate.sh, and the shape is
 # UpgradeResult in apps/api/src/core/updates/signal-channel.ts — the core has
 # exactly one reader for both producers.
-write_upgrade_result() { # write_upgrade_result <outcome> <from> <to> <reason>
+write_upgrade_result() { # write_upgrade_result <outcome> <from> <to> <reason> [detail]
   command -v jq >/dev/null 2>&1 || return 0
   local json
+  # `detail` is optional and names WHAT the reason is about — for
+  # `schema-compat`, the out-of-order migrations (ClickUp 12418agg9av). An
+  # older core ignores it.
   json="$(jq -nc --arg id "$(date -u +%s)-$3" --arg o "$1" --arg f "$2" --arg t "$3" --arg r "$4" \
+    --arg d "${5:-}" \
     '{id: $id, outcome: $o,
       from:   (if $f == "" then null else $f end),
       to:     (if $t == "" then null else $t end),
-      reason: (if $r == "" then null else $r end)}' 2>/dev/null || true)"
+      reason: (if $r == "" then null else $r end)}
+     + (if $d == "" then {} else {detail: $d} end)' 2>/dev/null || true)"
   [ -n "$json" ] || return 0
   mkdir -p "$SIGNAL_OUTBOX" 2>/dev/null || true
   printf '%s\n' "$json" > "$SIGNAL_OUTBOX/result.json.tmp" 2>/dev/null \
     && mv -f "$SIGNAL_OUTBOX/result.json.tmp" "$SIGNAL_OUTBOX/result.json" 2>/dev/null || true
+  return 0
+}
+
+# The same marker the poller writes (write_failed in agentos-autoupdate.sh):
+# the unattended path does not retry a release named here until a newer one
+# appears or the owner forces it. Best-effort, temp + rename.
+write_failed_marker() { # write_failed_marker <bare-version>
+  command -v jq >/dev/null 2>&1 || return 0
+  [ -n "${SIGNAL_OUTBOX:-}" ] || return 0
+  local json
+  json="$(jq -nc --arg v "$1" '{version: $v, digest: null}' 2>/dev/null || true)"
+  [ -n "$json" ] || return 0
+  mkdir -p "$SIGNAL_OUTBOX" 2>/dev/null || true
+  printf '%s\n' "$json" > "$SIGNAL_OUTBOX/failed.json.tmp" 2>/dev/null \
+    && mv -f "$SIGNAL_OUTBOX/failed.json.tmp" "$SIGNAL_OUTBOX/failed.json" 2>/dev/null || true
   return 0
 }
 
@@ -3447,7 +3600,12 @@ cmd_manual_upgrade() {
   AGENTOS_FLEET_OP_CALLER=manual-upgrade cmd_upgrade --to "$raw" --force
   MANUAL_UPGRADE_TO=""          # reached: the trap has nothing left to report
   trap - EXIT TERM INT
-  write_upgrade_result ok "$cur" "${raw#v}" ""
+  if [ -n "$UPGRADE_SCHEMA_COMPAT_OVERRIDDEN" ]; then
+    # Installed past a refusing preflight: said in the result, never silently.
+    write_upgrade_result ok "$cur" "${raw#v}" "schema-compat-override" "$UPGRADE_SCHEMA_COMPAT_OVERRIDDEN"
+  else
+    write_upgrade_result ok "$cur" "${raw#v}" ""
+  fi
 }
 
 # Unattended manifest-driven updater — the policy layer that decides WHETHER to
