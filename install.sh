@@ -2040,7 +2040,7 @@ install_exit_hooks() { # install_exit_hooks <profiles-dir>
   $SUDO test -f "$pdir/agentos-record-exit" || return 0
   plain_dir_ok "$libexec" "exit-journal hook directory" || return 0
   $SUDO mkdir -p "$libexec" && $SUDO chmod 0755 "$libexec" || { warn "could not create $libexec — the exit journal stays off"; return 0; }
-  for f in agentos-record-exit agentos-stamp-version; do
+  for f in agentos-record-exit agentos-stamp-version agentos-exit-watch; do
     $SUDO test -f "$pdir/$f" || continue
     if $SUDO install -m 0755 "$pdir/$f" "$libexec/$f.tmp" && $SUDO mv -f "$libexec/$f.tmp" "$libexec/$f"; then
       :
