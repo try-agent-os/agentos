@@ -836,7 +836,7 @@ install_exit_hooks() { # install_exit_hooks <profiles-dir> — root-owned copies
   else
     return 0
   fi
-  for f in agentos-record-exit agentos-stamp-version; do
+  for f in agentos-record-exit agentos-stamp-version agentos-exit-watch; do
     src="$pdir/$f"; dst="$libexec/$f"
     [ -f "$src" ] || continue
     cmp -s "$src" "$dst" 2>/dev/null && continue
@@ -1835,7 +1835,12 @@ UPGRADE_ETA_HARD_CAP=86400
 # window instead of guessed at.
 #
 # Every upgrade takes a host-wide flock BEFORE it announces anything and holds
-# it through stop, snapshot, swap and the first green healthz. A node waiting
+# it through stop, snapshot, swap and the first green healthz. In systemd mode
+# it is taken earlier still, before the release is downloaded and unpacked
+# (ClickUp 12418aggf0b): five neighbours unpacking a ~2 GB release tree each
+# while the hub was dark stretched its 5.6 GB snapshot from 34 s to 139 s — a
+# lock around the stop alone left exactly that staging traffic on the disk
+# during another node's snapshot. A node waiting
 # for it is still UP — the wait costs nobody any silence — and a node holding
 # it snapshots alone, which is the condition its own measurements were taken
 # under. The lock lives in /run/lock (tmpfs, shared by every install root on
@@ -1933,8 +1938,12 @@ SNAPSHOT_REBUILDABLE_DIRS="node_modules .turbo .pnpm-store __pycache__ .pytest_c
 #    service account, vouches for ALL of it being on the remote:
 #      - exactly one remote, with an absolute url (a relative one resolves
 #        against a directory the restore does not run in);
-#      - no shallow file, no alternates, no partial-clone/promisor config
-#        (a store that is not self-contained cannot be refetched as one);
+#      - no alternates, no partial-clone/promisor config (a store that is not
+#        self-contained cannot be refetched as one). A shallow store IS
+#        accepted since 12418aggf0b and comes back shallow, one level below
+#        each ref: the hub's context repo clones nearly every submodule
+#        shallow, so the refusal had left 3.4 GB of competitors/ in the
+#        snapshot that took 139 s;
 #      - `rev-list --all --not --remotes=<r>` is empty: every ref, HEAD, stash
 #        and worktree HEAD is reachable from what was fetched from <r>;
 #      - the index stages nothing HEAD does not already hold (a staged blob
@@ -2135,7 +2144,12 @@ snapshot_module_skips() {
 # need can be fetched back from its one remote (the list in 5. above).
 snapshot_module_pushed() {
   local g="$1" remote url out
-  [ ! -e "$g/shallow" ] && [ ! -e "$g/objects/info/alternates" ] || return 1
+  # A SHALLOW store is accepted (ClickUp 12418aggf0b): it is how the context
+  # repo clones nearly every submodule, so refusing it left 3.4 GB of the hub's
+  # 4.1 GB checkout/.git in every snapshot. The restore refetches it shallow
+  # (snapshot_refetch_module). Alternates still refuse: that store is not
+  # self-contained, and what it borrows lives outside the snapshot.
+  [ ! -e "$g/objects/info/alternates" ] || return 1
   out="$(snapshot_git "$g" config --get-regexp '^(extensions\.partialclone|remote\..*\.promisor|remote\..*\.partialclonefilter)$' 2>/dev/null)"
   [ -z "$out" ] || return 1
   remote="$(snapshot_git "$g" remote 2>/dev/null)" || return 1
@@ -2183,21 +2197,63 @@ snapshot_refetch_module() {
            snapshot_git "$g" rev-parse --verify -q HEAD 2>/dev/null)
   snapshot_as_account rm -rf "$tmp" || return 1
   snapshot_as_account git init -q --bare "$tmp" >/dev/null 2>&1 || { snapshot_as_account rm -rf "$tmp"; return 1; }
-  if ! snapshot_net_git "$tmp" fetch -q --no-tags --no-write-fetch-head "$url" \
-         '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' >/dev/null 2>&1; then
-    snapshot_as_account rm -rf "$tmp"
-    return 1
-  fi
-  for sha in "${need[@]+"${need[@]}"}"; do
-    snapshot_git "$tmp" cat-file -e "$sha" 2>/dev/null || miss+=("$sha")
-  done
-  if [ "${#miss[@]}" -gt 0 ]; then
-    snapshot_net_git "$tmp" fetch -q --no-tags --no-write-fetch-head "$url" "${miss[@]}" >/dev/null 2>&1 || true
+  if [ -e "$g/shallow" ]; then
+    # A shallow store comes back shallow (12418aggf0b): each commit its refs
+    # name, one level deep — the tips, their trees and blobs, which is what the
+    # refs, the index and the checkout need. History below the tips that the
+    # stopped store happened to hold is given up, like the dangling objects of
+    # a full store; it was a partial clone of a public remote to begin with.
+    # One fetch per id: a single want the remote refuses must not void the
+    # others. Branch tips are the fallback for a remote that serves no ids.
+    local -a seen=()
+    local got=0 seen_str=" "
+    for sha in "${need[@]+"${need[@]}"}"; do
+      case "$seen_str" in *" $sha "*) continue ;; esac
+      seen_str="$seen_str$sha "
+      seen+=("$sha")
+      snapshot_net_git "$tmp" fetch -q --no-tags --no-write-fetch-head --depth=1 "$url" "$sha" >/dev/null 2>&1 || true
+      snapshot_git "$tmp" cat-file -e "$sha" 2>/dev/null || miss+=("$sha")
+    done
+    if [ "${#miss[@]}" -gt 0 ]; then
+      snapshot_net_git "$tmp" fetch -q --no-tags --no-write-fetch-head --depth=1 "$url" \
+        '+refs/heads/*:refs/heads/*' >/dev/null 2>&1 || true
+    fi
     local -a still=()
-    for sha in "${miss[@]}"; do
+    for sha in "${miss[@]+"${miss[@]}"}"; do
       snapshot_git "$tmp" cat-file -e "$sha" 2>/dev/null || still+=("$sha")
     done
+    for sha in "${seen[@]+"${seen[@]}"}"; do
+      snapshot_git "$tmp" cat-file -e "$sha" 2>/dev/null && got=1
+    done
+    if [ "${#seen[@]}" -gt 0 ] && [ "$got" = 0 ]; then
+      snapshot_as_account rm -rf "$tmp"
+      return 1
+    fi
     [ "${#still[@]}" -eq 0 ] || warn "restore: $rel: the remote no longer serves ${still[*]}; those refs point at nothing"
+    # The boundary the stopped store recorded names commits the new one may
+    # not hold; the new store's own boundary replaces it (none: not shallow).
+    if [ -e "$tmp/shallow" ]; then
+      snapshot_as_account cp "$tmp/shallow" "$g/shallow" || { snapshot_as_account rm -rf "$tmp"; return 1; }
+    else
+      snapshot_as_account rm -f "$g/shallow" || true
+    fi
+  else
+    if ! snapshot_net_git "$tmp" fetch -q --no-tags --no-write-fetch-head "$url" \
+           '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' >/dev/null 2>&1; then
+      snapshot_as_account rm -rf "$tmp"
+      return 1
+    fi
+    for sha in "${need[@]+"${need[@]}"}"; do
+      snapshot_git "$tmp" cat-file -e "$sha" 2>/dev/null || miss+=("$sha")
+    done
+    if [ "${#miss[@]}" -gt 0 ]; then
+      snapshot_net_git "$tmp" fetch -q --no-tags --no-write-fetch-head "$url" "${miss[@]}" >/dev/null 2>&1 || true
+      local -a still=()
+      for sha in "${miss[@]}"; do
+        snapshot_git "$tmp" cat-file -e "$sha" 2>/dev/null || still+=("$sha")
+      done
+      [ "${#still[@]}" -eq 0 ] || warn "restore: $rel: the remote no longer serves ${still[*]}; those refs point at nothing"
+    fi
   fi
   if ! { snapshot_as_account rm -rf "$g/objects" && snapshot_as_account mv "$tmp/objects" "$g/objects"; }; then
     snapshot_as_account rm -rf "$tmp"
@@ -2303,11 +2359,19 @@ snapshot_input() {
 }
 
 UPGRADE_ETA_GUESS=0
+# What this upgrade's snapshot is about to copy, as priced by upgrade_eta_guess —
+# empty when it could not be sized. Recorded beside the measured downtime
+# (record_upgrade_downtime) so a later upgrade can rescale that measurement to
+# ITS snapshot (12418aggf0b).
+UPGRADE_SNAPSHOT_KB=""
+UPGRADE_SNAPSHOT_ENTRIES=""
 # Sets UPGRADE_ETA_GUESS: the size AND path count of the snapshot list over pessimistic copy
 # rates, capped at UPGRADE_ETA_CEILING. 0 when data/ cannot be sized.
 upgrade_eta_guess() {
   local sized kb entries
   UPGRADE_ETA_GUESS=0
+  UPGRADE_SNAPSHOT_KB=""
+  UPGRADE_SNAPSHOT_ENTRIES=""
   sized="$(snapshot_input)"
   kb="${sized%% *}"
   # Split only on a reading that actually HAS both fields: with one token
@@ -2320,11 +2384,59 @@ upgrade_eta_guess() {
   case "$entries" in ''|*[!0-9]*) entries=0 ;; esac
   if [ -n "$kb" ] && [ "$kb" -gt 0 ]; then
     UPGRADE_ETA_GUESS=$(( kb / SNAPSHOT_KB_PER_SEC + entries / SNAPSHOT_ENTRIES_PER_SEC ))
+    UPGRADE_SNAPSHOT_KB="$kb"
+    UPGRADE_SNAPSHOT_ENTRIES="$entries"
   fi
   if [ "$UPGRADE_ETA_GUESS" -gt "$UPGRADE_ETA_CEILING" ]; then
     UPGRADE_ETA_GUESS="$UPGRADE_ETA_CEILING"
   fi
   return 0
+}
+
+# A snapshot shorter than this is timed at one-second resolution against a
+# stop/start of comparable size: rescaling it by the size ratio would multiply
+# rounding noise (a 1 s copy of a near-empty tree priced against a 60 s tree
+# says 60x, not anything true). Such a sample counts as its raw downtime, and
+# the guess (a floor under every measurement) prices the tree instead.
+UPGRADE_SCALE_MIN_SNAPSHOT=10
+
+# upgrade_eta_measured — prints the high-water mark of the recorded window,
+# each sized sample rescaled to the current snapshot (UPGRADE_SNAPSHOT_KB /
+# _ENTRIES, set by upgrade_eta_guess); nothing when nothing was ever measured.
+#
+# File shape (record_upgrade_downtime): `recent` — the last downtimes, oldest
+# first, as plain numbers (what every older CLI reads); `samples` — the same
+# upgrades' {downtime_seconds, snapshot_seconds, snapshot_kb,
+# snapshot_entries}, for the newest of them only, since it started being
+# written. `samples` therefore lines up with the TAIL of `recent`; the head of
+# `recent` that has no sample is taken raw.
+upgrade_eta_measured() {
+  local ckb="${UPGRADE_SNAPSHOT_KB:-}" cen="${UPGRADE_SNAPSHOT_ENTRIES:-}"
+  case "$ckb" in ''|*[!0-9]*) ckb=0 ;; esac
+  case "$cen" in ''|*[!0-9]*) cen=0 ;; esac
+  jq -r --argjson ckb "$ckb" --argjson cen "$cen" \
+        --argjson kbr "$SNAPSHOT_KB_PER_SEC" --argjson enr "$SNAPSHOT_ENTRIES_PER_SEC" \
+        --argjson minsnap "$UPGRADE_SCALE_MIN_SNAPSHOT" '
+      def num: type == "number" and . >= 0;
+      def cost($kb; $en): ($kb / $kbr) + ($en / $enr);
+      cost($ckb; $cen) as $cur
+      | ((.recent // []) | map(select(num))) as $h0
+      | (if ($h0 | length) > 0 then $h0
+         elif (.downtime_seconds | num) then [.downtime_seconds]
+         else [] end) as $h
+      | ((.samples // []) | map(select(type == "object" and (.downtime_seconds | num)))
+         | if length > ($h | length) then .[length - ($h | length):] else . end) as $s
+      | ($h[0:(($h | length) - ($s | length))]) as $raw
+      | ($s | map(
+          .downtime_seconds as $d
+          | ((.snapshot_seconds // 0) | if num then ([., $d] | min) else 0 end) as $sn
+          | (if (.snapshot_kb | num) and (.snapshot_entries | num)
+             then cost(.snapshot_kb; .snapshot_entries) else 0 end) as $was
+          | if $cur > 0 and $was > 0 and $sn >= $minsnap
+            then (($d - $sn) + ($sn * $cur / $was) | ceil)
+            else $d end)) as $scaled
+      | ($raw + $scaled) | if length > 0 then (max | floor) else empty end' \
+    "$UPGRADE_TIMING_FILE" 2>/dev/null || true
 }
 
 UPGRADE_ETA_SECONDS=""
@@ -2359,11 +2471,18 @@ upgrade_eta() {
     # a file written before that existed carries only the scalar, and a node
     # upgrading from such a file still gets its one measurement rather than
     # falling back to the guess.
-    prev="$(jq -r '
-        ((.recent // []) | map(select(type == "number" and . >= 0))) as $h
-        | if ($h | length) > 0 then ($h | max)
-          else (.downtime_seconds // empty) end' \
-      "$UPGRADE_TIMING_FILE" 2>/dev/null || true)"
+    #
+    # Each sample is RESCALED to the snapshot this upgrade is about to take when
+    # it recorded what its own snapshot copied (12418aggf0b): the stop/start
+    # share of it stands as measured, the snapshot share is multiplied by how
+    # much more (or less) this snapshot costs than that one did, priced by the
+    # same two-term model as the guess. A node whose tree was cut from 5.6 GB
+    # to 2 GB stops announcing the 5.6 GB window, and one whose tree doubled
+    # stops announcing half of what it will pay. A sample with no size (written
+    # before this, or in docker mode) and one whose snapshot was too short to
+    # time meaningfully (UPGRADE_SCALE_MIN_SNAPSHOT) count as measured.
+    upgrade_eta_guess
+    prev="$(upgrade_eta_measured)"
     case "$prev" in ''|*[!0-9]*) prev="" ;; esac
     # The guess is ALSO the lower bound of a measurement (self-heal
     # ad8ff93fac13762f, third cycle, 2026-09-23). The window above only absorbs
@@ -2375,8 +2494,8 @@ upgrade_eta() {
     # 14776848/51200 + 380706/400 = 1239 s. A measurement is a fact about the
     # PAST upgrade; the tree about to be copied is a fact about THIS one, so
     # the announcement is whichever is larger. Labelled by the winner, so the
-    # notice never calls a guess a measurement.
-    upgrade_eta_guess
+    # notice never calls a guess a measurement. (upgrade_eta_guess ran above:
+    # the rescaling needs the current snapshot's size too.)
     if [ -n "$prev" ] && [ "$prev" -ge "$UPGRADE_ETA_GUESS" ]; then
       UPGRADE_ETA_SECONDS="$prev"
       UPGRADE_ETA_BASIS=measured
@@ -2520,13 +2639,25 @@ record_upgrade_downtime() { # record_upgrade_downtime <docker|systemd> <from> <t
   if jq -nc --argjson at "$now" --arg from "$from" --arg to "$to" \
        --argjson snapshot_seconds "$snap_s" --argjson downtime_seconds "$downtime" \
        --argjson window "$UPGRADE_TIMING_WINDOW" --argjson prev "$prev_json" \
+       --arg kb "${UPGRADE_SNAPSHOT_KB:-}" --arg entries "${UPGRADE_SNAPSHOT_ENTRIES:-}" \
        '(($prev.recent // (if ($prev.downtime_seconds | type) == "number"
                            then [$prev.downtime_seconds] else [] end))
          | map(select(type == "number" and . >= 0))) as $h
         | (($h + [$downtime_seconds])
            | if length > $window then .[length - $window:] else . end) as $next
+        # `samples` must stay aligned with the tail of `recent`: a previous
+        # file whose `recent` was filtered or rebuilt from a scalar keeps only
+        # as many samples as it has downtimes.
+        | (($prev.samples // []) | map(select(type == "object"))
+           | if length > ($h | length) then .[length - ($h | length):] else . end) as $ps
+        | ({downtime_seconds:$downtime_seconds,snapshot_seconds:$snapshot_seconds}
+           + (if ($kb | test("^[0-9]+$")) and ($entries | test("^[0-9]+$"))
+              then {snapshot_kb:($kb | tonumber),snapshot_entries:($entries | tonumber)}
+              else {} end)) as $sample
+        | (($ps + [$sample])
+           | if length > ($next | length) then .[length - ($next | length):] else . end) as $samples
         | {at:$at,from:$from,to:$to,snapshot_seconds:$snapshot_seconds,
-           downtime_seconds:$downtime_seconds,recent:$next}' \
+           downtime_seconds:$downtime_seconds,recent:$next,samples:$samples}' \
        > "$tmp" 2>/dev/null; then
     mv -f "$tmp" "$UPGRADE_TIMING_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
   else
@@ -2898,6 +3029,20 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   sha="$(jq -r .tarball_sha256 <<<"$manifest")"
   url="https://github.com/${DIST_REPO}/releases/download/${tag}/${tarball}"
 
+  # The host lock is taken HERE, before the release is even downloaded, not
+  # just around the stop (ClickUp 12418aggf0b). Staging a release — download,
+  # unpack of a ~2 GB / ~57k-file tree, chown -R, the schema preflight — is the
+  # heaviest disk work this command does while the node is still up, and on a
+  # shared host it used to run beside a NEIGHBOUR's dark window: the hub,
+  # 4.51.1 -> 4.52.0 on 2026-09-29 21:46, snapshotted 5.6 GB in 139 s while
+  # five other nodes unpacked their 4.52.0 trees onto the same disk; the same
+  # 5.6 GB had taken 34 s alone at 14:55 the same day. Holding the lock through
+  # staging keeps every other node's staging out of this node's snapshot and
+  # this node's staging out of theirs. The wait still happens while the node is
+  # up (see UPGRADE_HOST_LOCK), and a die() anywhere below releases the lock
+  # with the process.
+  acquire_upgrade_host_lock
+
   if [ ! -d "$AGENTOS_HOME/versions/$tag" ]; then
     step "Fetching $tag"
     tmp_dir="$AGENTOS_HOME/versions/.tmp-$tag"
@@ -2945,10 +3090,9 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   # it returns only once the core has put the line in the chat (or given up), so
   # the message is in Telegram strictly before systemd logs "Stopping
   # <unit>.service". See "the update's silence" above (ClickUp 12418agfpq9).
-  # The host lock comes first: the wait for it happens while this node is still
-  # up, and the window announced next is then priced for a snapshot that runs
-  # alone (see UPGRADE_HOST_LOCK).
-  acquire_upgrade_host_lock
+  # The host lock is already held (taken before staging, above): the window
+  # announced next is priced for a snapshot that runs alone (see
+  # UPGRADE_HOST_LOCK).
   announce_going_down "${prev#v}" "${tag#v}"
   # Managed PG: record the pre-flip restore point + shout that there is no
   # automatic rollback here, BEFORE the unit is even stopped. No-op on SQLite.
@@ -4199,6 +4343,11 @@ agentos — operate an AgentOS Core node
                               resume steps, chat turn durations, reply latency,
                               delivery failures). The same answer as
                               `agentos ctl stats`: read from the running node.
+  marks list [<series>] | stats <series> | delete <id> | delete --series <s> --yes
+                              the habit-tracker journal routine remind steps
+                              write: marks newest first, days by the day rule
+                              and the streak; delete is the only way a mark is
+                              ever erased. The same answer as `agentos ctl marks`
   sessions <verb> …           durable agent sessions over this node's job API
                               (create|ls|status|attach|steer|stop|resume|budget;
                               `session` is the singular alias). Receipts, event
@@ -4244,6 +4393,7 @@ case "${1:-}" in
   import-history) shift; cmd_import_history "$@" ;;
   ctl)        shift; cmd_ctl "$@" ;;
   stats)      shift; cmd_ctl stats "$@" ;;
+  marks)      shift; cmd_ctl marks "$@" ;;
   sessions|session) shift; cmd_sessions "$@" ;;
   mcp)        shift; cmd_mcp "$@" ;;
   md2quill)   shift; cmd_md2quill "$@" ;;
