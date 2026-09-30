@@ -18,9 +18,12 @@
 #      /opt/agentos-bootstrap/install.sh so you can read it before you run it.
 #   3. Prints the one remaining command to /etc/motd.
 #
-# WHAT YOU DO (one SSH command, once):
+# WHAT YOU DO (one SSH login, two lines, once):
 #   ssh root@<droplet-ip>
-#   bash /opt/agentos-bootstrap/install.sh --no-https --token <BOT_TOKEN> --admin <YOUR_TELEGRAM_ID>
+#   read -rsp 'Bot token: ' TELEGRAM_BOT_TOKEN && echo && export TELEGRAM_BOT_TOKEN
+#   bash /opt/agentos-bootstrap/install.sh --no-https --admin <YOUR_TELEGRAM_ID>
+#   The token goes through the environment, never argv: argv shows up in ps
+#   and in your shell history.
 #   Then DM your bot and send /login to connect Claude. That is it.
 #
 # WHY TWO STAGES (and not a fully hands-off boot): the deploy URL is fetched by
@@ -61,12 +64,15 @@ write_files:
     content: |
 
       =============================================================
-       AgentOS node provisioned. One command finishes setup:
+       AgentOS node provisioned. Two lines finish setup:
 
-         bash /opt/agentos-bootstrap/install.sh --no-https --token <BOT_TOKEN> --admin <YOUR_TELEGRAM_ID>
+         read -rsp 'Bot token: ' TELEGRAM_BOT_TOKEN && echo && export TELEGRAM_BOT_TOKEN
+         bash /opt/agentos-bootstrap/install.sh --no-https --admin <YOUR_TELEGRAM_ID>
 
        Fill in:
-         <BOT_TOKEN>         from @BotFather -> /newbot
+         Bot token           from @BotFather -> /newbot, typed at the
+                             silent prompt (never on the command line:
+                             argv is visible in ps and shell history)
          <YOUR_TELEGRAM_ID>  from @userinfobot (this auto-approves you as admin)
 
        Prefer to read the installer first? It is already on disk:
@@ -96,7 +102,8 @@ write_files:
       # "done" signal.
       if [ ! -f /opt/agentos/.env ] && [ -f /opt/agentos-bootstrap/install.sh ]; then
         echo "AgentOS: finish setup ->"
-        echo "  bash /opt/agentos-bootstrap/install.sh --no-https --token <BOT_TOKEN> --admin <YOUR_TELEGRAM_ID>"
+        echo "  read -rsp 'Bot token: ' TELEGRAM_BOT_TOKEN && echo && export TELEGRAM_BOT_TOKEN"
+        echo "  bash /opt/agentos-bootstrap/install.sh --no-https --admin <YOUR_TELEGRAM_ID>"
       fi
 
 runcmd:
