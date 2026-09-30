@@ -15,12 +15,19 @@ Two things to have ready: a bot token from
 from [@userinfobot](https://t.me/userinfobot) — the id auto-approves you as the
 node's admin.
 
-Then, on a clean Linux x64 box (Ubuntu 24.04 / Debian 12), one command:
+Then, on a clean Linux x64 box (Ubuntu 24.04 / Debian 12), as root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/try-agent-os/agentos/main/install.sh \
-  | bash -s -- --no-https --token <BOT_TOKEN> --admin <YOUR_TELEGRAM_ID>
+curl -fsSL https://raw.githubusercontent.com/try-agent-os/agentos/main/install.sh -o install.sh
+read -rsp 'Bot token: ' TELEGRAM_BOT_TOKEN && echo && export TELEGRAM_BOT_TOKEN
+bash install.sh --no-https --admin <YOUR_TELEGRAM_ID>
 ```
+
+The installer is downloaded first, so you can read what you are about to run
+(`less install.sh`, `bash install.sh --help`). The bot token is typed at a
+silent prompt and reaches the installer through its environment
+(`$TELEGRAM_BOT_TOKEN`), never through the command line: a token in argv is
+visible to every user of the box in `ps`, and it stays in your shell history.
 
 That is the whole install, and it involves **no Docker daemon**: a
 checksum-verified release tarball unpacked onto disk, its own vendored Node
@@ -78,8 +85,7 @@ Point an A record at the box, open ports 80 and 443, and use `--domain` instead
 of `--no-https` — Caddy gets a Let's Encrypt certificate and renews it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/try-agent-os/agentos/main/install.sh \
-  | bash -s -- --domain agent.example.com --token <BOT_TOKEN> --admin <YOUR_TELEGRAM_ID>
+bash install.sh --domain agent.example.com --admin <YOUR_TELEGRAM_ID>
 ```
 
 You can add it later: re-run the installer with `--domain` and your data and
@@ -87,9 +93,11 @@ config are preserved.
 
 ### As a Docker container instead
 
+With the installer downloaded as above (the bot token again from
+`$TELEGRAM_BOT_TOKEN`, or typed when it asks):
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/try-agent-os/agentos/main/install.sh \
-  | bash -s -- --docker --domain agent.example.com
+bash install.sh --docker --domain agent.example.com
 ```
 
 `--docker` pulls a release image pinned by `sha256` digest and runs it under
@@ -101,7 +109,10 @@ own, so an existing command line keeps working unchanged.
 
 Re-running the installer is safe, and it never moves a node between profiles on
 its own — an existing Docker install stays Docker. Every prompt has a flag; see
-`install.sh --help` (`--token`, `--admin`, `--dir`, `-y`).
+`install.sh --help` (`--admin`, `--dir`, `-y`). Secrets are the exception: pass
+the bot token through `$TELEGRAM_BOT_TOKEN` and everything else through a
+mode-0600 env file given to `--secrets`, not through flags. `--token` works,
+but it puts the token in `ps` and in your shell history.
 
 ### Other providers: cloud-init
 
