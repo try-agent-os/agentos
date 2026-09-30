@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # AgentOS Core on-prem profile — clean VM → working bot + Mini App.
 #
-#   curl -fsSL https://raw.githubusercontent.com/try-agent-os/agentos/main/install.sh | bash -s -- --domain agent.example.com
+#   curl -fsSL https://raw.githubusercontent.com/try-agent-os/agentos/main/install.sh -o install.sh
+#   less install.sh                              # download first, read, then run it
+#   bash install.sh --domain agent.example.com
+#
+# Do not pipe it into bash: a truncated download then runs half a script, and
+# you never see what you ran with root rights.
 #
 # Non-interactive (a client install, CI, or a re-run) — every answer has a flag:
 #
-#   --token <bot-token>        @BotFather token           (else: prompt, or $TELEGRAM_BOT_TOKEN)
+#   --token <bot-token>        @BotFather token. Prefer `read -rs TELEGRAM_BOT_TOKEN; export
+#                              TELEGRAM_BOT_TOKEN` (keep it across sudo with -E) or the prompt, which
+#                              does not echo: a value in argv shows in `ps` and stays in shell history.
 #   --create-bot               No BotFather: the AgentOS manager bot creates YOUR bot. The script
 #                              prints a t.me link (+ QR), you confirm in Telegram, and the new bot's
 #                              token arrives sealed to a key this run generated — never in your hands,
@@ -280,7 +287,7 @@ while [ $# -gt 0 ]; do
     -y|--yes)       ASSUME_YES=1; shift ;;
     # Line range = the whole header block above (ends one line before
     # `set -euo pipefail`). Grow the header, grow this range, or --help truncates.
-    -h|--help)      sed -n '2,110p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,117p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              die "unknown option: $1 (try --help)" ;;
   esac
 done
@@ -1176,14 +1183,20 @@ if [ -n "${AGENTOS_PRINT_SECRET_READERS:-}" ]; then
   exit 0
 fi
 
-ask() { # ask <prompt> <var-value> ; echoes the answer
-  local prompt="$1" current="$2"
+ask() { # ask <prompt> <var-value> [secret] ; echoes the answer
+  local prompt="$1" current="$2" secret="${3:-}"
   if [ -n "$current" ]; then echo "$current"; return; fi
   if [ "$ASSUME_YES" = "1" ] || [ ! -t 0 ]; then
     die "$prompt is required and there is no terminal to ask on — pass the flag (--help)."
   fi
   local answer=""
-  read -r -p "$(echo -e "  ${BOLD}${prompt}${NC}: ")" answer </dev/tty
+  if [ "$secret" = "secret" ]; then
+    # A secret is not echoed to the terminal (or to a screen recording of it).
+    read -rs -p "$(echo -e "  ${BOLD}${prompt}${NC}: ")" answer </dev/tty
+    echo >&2
+  else
+    read -r -p "$(echo -e "  ${BOLD}${prompt}${NC}: ")" answer </dev/tty
+  fi
   echo "$answer"
 }
 
@@ -1583,7 +1596,7 @@ obtain_bot_token() {
     fi
   fi
   info "Get one from @BotFather → /newbot. Looks like 123456:ABC-..."
-  BOT_TOKEN="$(ask 'Telegram bot token' '')"
+  BOT_TOKEN="$(ask 'Telegram bot token' '' secret)"
 }
 
 # --admin defaults to the account that created the bot. Only when no admin was
@@ -2162,7 +2175,7 @@ install_systemd() {
   # its bin dir on PATH for any child `node` processes npm spawns.
   $SUDO env PATH="$INSTALL_DIR/node/bin:$PATH" \
     "$INSTALL_DIR/node/bin/node" "$INSTALL_DIR/node/bin/npm" \
-    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.280"
+    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.285"
 
   step "Config + unit"
   # Snapshot what a RUNNING node booted with, before this run rewrites any of
@@ -2961,7 +2974,7 @@ if [ -z "$HTTPS_MODE" ]; then
     choice="$(read -r -p "$(echo -e "  ${BOLD}Choice${NC} ${DIM}(1-4)${NC}: ")" c </dev/tty; echo "${c:-4}")"
     case "$choice" in
       1) HTTPS_MODE="caddy";       DOMAIN="$(ask 'Domain (e.g. agent.example.com)' '')" ;;
-      2) HTTPS_MODE="cloudflared"; TUNNEL_TOKEN="$(ask 'Cloudflare tunnel token' '')" ;;
+      2) HTTPS_MODE="cloudflared"; TUNNEL_TOKEN="$(ask 'Cloudflare tunnel token' '' secret)" ;;
       3) HTTPS_MODE="quick" ;;
       *) HTTPS_MODE="none" ;;
     esac

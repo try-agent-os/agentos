@@ -3966,6 +3966,39 @@ cmd_preset() {
   esac
 }
 
+# Agent surface — shared agent packages (task 12418agg00r).
+#   agentos agent add <git-url|dir> [--ref r] [--path sub] [--name n] [--repo dir]
+#                     [--force] [--dry-run]
+#               | check <dir> [--name n] | ls [--repo dir]
+# Installs a portable agent package (a folder: <name>.md with a `version`, no
+# secrets, parameters as {{ env.X }}) into the context repo's
+# .agentos/agents/<name>/, where `agent: { name: <name> }` in a routine step
+# finds it. Refuses a package that carries a secret or widens the node, and
+# writes nothing then. Delegates to the compiled Node CLI
+# (core/agents/cli.js), exactly like `agentos preset`; the context repo is
+# --repo, $AGENTOS_CONTEXT_REPO, or the nearest .agentos/ above the cwd.
+cmd_agent() {
+  case "$(detect_mode)" in
+    docker)
+      ( cd "$AGENTOS_HOME" && exec docker compose -f "$COMPOSE_FILE" exec -T \
+          -e AGENTOS_CONTEXT_REPO \
+          node node dist/core/agents/cli.js "$@" ) ;;
+    systemd)
+      local base="$AGENTOS_HOME/current" cli=""
+      for c in \
+        "$base/dist/core/agents/cli.js" \
+        "$base/apps/api/dist/core/agents/cli.js" \
+        "$base/node_modules/@agent-os/api/dist/core/agents/cli.js"; do
+        [ -f "$c" ] && { cli="$c"; break; }
+      done
+      [ -n "$cli" ] || die "agent CLI not found under $base (is the node installed?)"
+      resolve_node_bin
+      exec "$AGENTOS_NODE_BIN" "$cli" "$@" ;;
+    none)
+      die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
 # Routines surface — the runtime lifecycle overlay (task 86cban9hh).
 #   agentos routines ls | activate <routine> --from <ts> [--until <ts>] [--runs n]
 #                       | reset-budget <routine>
@@ -4319,6 +4352,10 @@ agentos — operate an AgentOS Core node
   plugin add|ls|rm|enable|disable|secret|update|slot ...  manage runtime plugins
   plugin new|validate|list ...  author, validate and scaffold plugin dirs
   preset ls | show <id> | add <id> [key=value ...]  browse + install routine presets
+  agent add <git-url|dir> [--ref r] [--path sub] [--name n] [--force] [--dry-run]
+      | check <dir> | ls      install a shared agent package into the context
+                              repo's .agentos/agents/<name>/ (refused when it
+                              carries a secret, has no version, or widens the node)
   state ls | get <scope.key> | set <scope.key> <v> | incr <scope.key> [--by N]
         | cas <scope.key> <v> --expect <old> | history [<scope.key>]
                               shared state between routines and runs; incr and
@@ -4388,6 +4425,7 @@ case "${1:-}" in
               rc=0; fleet_op_main "$@" || rc=$?; exit "$rc" ;;
   plugin)     shift; cmd_plugin "$@" ;;
   preset)     shift; cmd_preset "$@" ;;
+  agent)      shift; cmd_agent "$@" ;;
   routines)   shift; cmd_routines "$@" ;;
   state)      shift; cmd_state "$@" ;;
   import-history) shift; cmd_import_history "$@" ;;
