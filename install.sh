@@ -1409,18 +1409,23 @@ def main(argv):
         priv = os.urandom(32)
         write_private(argv[2], priv)
         print(base64.b64encode(x25519(priv, (9).to_bytes(32, 'little'))).decode())
-    elif cmd == 'claim':  # claim <response> <header-file> -> id, link; poll secret -> header file
+    elif cmd == 'claim':  # claim <response> <header-file> -> id, link, app link (may be empty); poll secret -> header file
         r = load(argv[2])
-        cid, secret, link = r.get('id'), r.get('poll_secret'), r.get('link')
+        cid, secret, link, app = r.get('id'), r.get('poll_secret'), r.get('link'), r.get('app_link')
         if not (isinstance(cid, str) and re.fullmatch(r'[A-Za-z0-9_-]{8,128}', cid)):
             raise ValueError('bad claim id')
         if not (isinstance(secret, str) and re.fullmatch(r'[A-Za-z0-9_-]{8,256}', secret)):
             raise ValueError('bad poll secret')
         if not (isinstance(link, str) and re.fullmatch(r'https://t\.me/[A-Za-z0-9_]+\?start=[A-Za-z0-9_-]+', link)):
             raise ValueError('bad link')
+        # The Mini App link is optional (a manager without a registered Mini App
+        # sends none); a malformed one is dropped, never fatal: the chat link works.
+        if not (isinstance(app, str) and re.fullmatch(r'https://t\.me/[A-Za-z0-9_]+/[A-Za-z0-9_]{3,30}\?startapp=claim_[A-Za-z0-9_-]+', app)):
+            app = ''
         write_private(argv[3], ('X-Poll-Secret: ' + secret + '\n').encode())
         print(cid)
         print(link)
+        print(app)
     elif cmd == 'status':  # status <response> -> status, claimer id/username, bot id/username
         r = load(argv[2])
         st = r.get('status') if r.get('status') in ('pending', 'fulfilled') else ''
@@ -1481,7 +1486,7 @@ ensure_python3_for_create_bot() {
 }
 
 create_bot_via_manager() { # sets BOT_TOKEN, CREATED_BOT_USERNAME, CLAIMER_ID, CLAIMER_USERNAME
-  local url="${MANAGER_URL%/}" code pub claim claim_id link status lines
+  local url="${MANAGER_URL%/}" code pub claim claim_id link app_link status lines
   local timeout="${AGENTOS_CREATE_BOT_TIMEOUT_S:-900}" interval="${AGENTOS_CREATE_BOT_POLL_S:-3}"
   [ -n "$url" ] || die "--create-bot needs the manager's URL: pass --manager-url <https://…> (or set \$AGENTOS_MANAGER_URL). Without one, create the bot in @BotFather and pass --token."
   manager_url_ok "$url" || die "--manager-url must be an https:// URL (plain http only for 127.0.0.1/localhost), got '${url}'"
@@ -1513,12 +1518,19 @@ create_bot_via_manager() { # sets BOT_TOKEN, CREATED_BOT_USERNAME, CLAIMER_ID, C
     || die "the manager answered the claim with something this installer cannot read"
   claim_id="$(sed -n 1p <<<"$claim")"
   link="$(sed -n 2p <<<"$claim")"
+  app_link="$(sed -n 3p <<<"$claim")"
 
   echo
   echo -e "  ${BOLD}Open this link in Telegram and tap \"Create my bot\":${NC}"
   echo
   echo -e "    ${CYAN}${link}${NC}"
   echo
+  if [ -n "$app_link" ]; then
+    echo -e "  ${BOLD}Or open the manager's Mini App and create the bot there:${NC}"
+    echo
+    echo -e "    ${CYAN}${app_link}${NC}"
+    echo
+  fi
   if command -v qrencode >/dev/null 2>&1; then
     qrencode -t ANSIUTF8 -m 2 "$link" 2>/dev/null || true
   else
