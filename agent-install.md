@@ -63,7 +63,7 @@ bash /tmp/agentos-install.sh --help
 ```
 
 Two reasons. You get to read the same bytes you are about to run, and `--help`
-only works this way: it prints its own header with `sed -n '2,97p' "$0"`, and in
+only works this way: it prints its own header by reading `"$0"` with `sed`, and in
 a pipeline `$0` is the shell, not the script, so the help you most want is the
 one thing the pipe cannot give you.
 
