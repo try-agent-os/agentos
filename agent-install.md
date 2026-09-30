@@ -40,7 +40,9 @@ Done means all four of these, not three:
 **1. `install.sh` is the installer. You are not.** Exactly one thing puts
 AgentOS on this box: `install.sh` from this repository. Do not download release
 tarballs, do not unpack anything by hand, do not write a systemd unit, do not
-start the image yourself. It verifies a SHA256 over the release tarball,
+start the image yourself. On the default bare-metal profile it verifies a
+SHA256 over the release tarball (the `--docker` profile has no tarball: it
+resolves the channel to an image digest and runs the image by that digest),
 validates its sudoers drop-in with `visudo -cf`, checks the directories it
 creates against planted symlinks, and declines to move the version of an
 existing install. (It does not yet close every link: the step that writes the
@@ -75,7 +77,10 @@ GitHub token and a Claude setup token are all secrets. Put them in a
 `KEY=VALUE` env file with mode 0600 and hand that file to `--secrets`; the
 script merges it into the node's `.env` without any value ever reaching `ps`, a
 journal, or your own command line. The bot token may also come from
-`$TELEGRAM_BOT_TOKEN` in your environment — the script reads it there. Never
+`$TELEGRAM_BOT_TOKEN` in your environment — the script reads it there. The
+admin has environment equivalents too: `$TELEGRAM_ADMIN_USER_IDS` and
+`$TELEGRAM_ADMIN_USERNAMES` are read as the default when no `--admin` is
+passed (an admin id is not a secret; this is just the other way in). Never
 echo a secret back, never write one into a file you are about to commit.
 
 **The default is that a secret never enters your context at all.** Do not ask
@@ -122,7 +127,7 @@ disappear once you know the box.
 uname -m                                  # x86_64 or not
 . /etc/os-release && echo "$PRETTY_NAME"  # Debian 12 / Ubuntu 24.04 wanted
 id -u                                     # 0, or sudo must work
-command -v apt-get systemctl curl
+for c in apt-get systemctl curl; do command -v "$c" >/dev/null && echo "have $c" || echo "NO   $c"; done
 command -v visudo || ls /usr/sbin/visudo /sbin/visudo 2>/dev/null  # none → install.sh must install sudo
 systemctl list-units 'agentos*'           # an install already here? (any instance)
 ls -d /opt/agentos* 2>/dev/null
@@ -131,6 +136,15 @@ df -h / | tail -1
 findmnt -no SOURCE,FSTYPE,OPTIONS /       # will the root filesystem survive a reboot?
 hostname
 ```
+
+This block is a list of questions, not a script that must come out clean. Some
+of its lines exit non-zero on a perfectly good clean box, and that non-zero is
+the answer: `ls -d /opt/agentos*` exits 2 when there is no install yet, and if
+you probe the unit directly, `systemctl is-active agentos` prints `inactive`
+and exits 3 for a unit that does not exist. (`command -v` given several names
+reports the status of the last lookup only, which is why the block above asks
+for each tool separately.) Read the output, not the exit status, and do not
+stop the preflight at the first non-zero line.
 
 Read it like this:
 
@@ -175,13 +189,24 @@ these probes print anything, and a `--secrets` file that does not exist yet
 (you write it in Phase 2) ends the probe with `✗ --secrets: no such file`. The
 flags that decide profile and identity are the other ones anyway.
 
+Not every argument is checked that early, though: `--admin` is parsed *after*
+both probes have printed and exited, so a malformed `--admin` passes them
+silently and first fails on the real run (`--admin: … is neither of the two
+accepted forms`, before anything is touched). Check its shape yourself: a
+numeric id, or a username of 5-32 letters, digits and underscores starting with
+a letter (`@` optional), several of them comma-separated if the owner names
+more than one admin.
+
 If `AGENTOS_PRINT_MODE` says `docker` when you expected `systemd`, either you
 passed a container-only flag (`--tunnel-token`, `--quick`, `--image`, or a
 `--channel` other than `stable`) — they switch profiles silently — or this box
 already carries a Docker install, which pins the profile on its own and says so
 (`existing Docker install in <install-dir>`). To go from that Docker install
 back to bare metal, pass `--no-docker` explicitly — it is the only thing that
-migrates the profile; without it a re-run stays on the container.
+migrates the profile; without it a re-run stays on the container. The switch is
+silent only when you leave the profile open: `--tunnel-token` or `--quick`
+together with an explicit `--no-docker` does not switch anything — the real run
+aborts with `--tunnel-token/--quick: not yet supported in --no-docker mode`.
 
 **Capture the identity once, and use only these values from here on.** The
 install root defaults to `/opt/<user>`, not to `/opt/agentos`; the unit, the
@@ -217,8 +242,10 @@ There is a third probe, `AGENTOS_PRINT_VERSION_DECISION`, and it is easy to
 misread. It evaluates the keep-or-move rule as a pure function of
 (channel tag, installed tag, `--upgrade`) — fed by `AGENTOS_TEST_CHANNEL_TAG`
 and `AGENTOS_TEST_INSTALLED_TAG`, not by looking at this machine. Run it with
-neither set and it prints `install` on a box that already runs a node. Use it
-only to confirm what the rule does with tags you have already read yourself:
+neither set and it prints `install ` followed by an empty tag — on a clean box
+and on a box that already runs a node alike; that output says nothing about
+this machine. Use it only to confirm what the rule does with tags you have
+already read yourself:
 
 ```bash
 AGENTOS_TEST_INSTALLED_TAG="$(sudo readlink <install-dir>/current | xargs -r basename)" \
@@ -226,6 +253,18 @@ AGENTOS_TEST_CHANNEL_TAG="<the tag the channel offers>" \
 AGENTOS_PRINT_VERSION_DECISION=1 bash /tmp/agentos-install.sh <your flags>
 # install <tag> | keep <installed> | upgrade <installed> <tag>
 ```
+
+It has four outcomes, and two of them print the same word:
+
+| Installed tag | Channel tag | `--upgrade` | Prints |
+|---|---|---|---|
+| empty (nothing installed) | any | any | `install <channel>` |
+| equal to the channel tag | same | any | `install <channel>` — already current; a re-run refreshes configuration in place |
+| different | different | not passed | `keep <installed>` |
+| different | different | passed | `upgrade <installed> <channel>` |
+
+So `install` alone does not mean "no node here": with an installed tag equal to
+the channel's it means the node is already on that version.
 
 The authoritative answer on a real run is the installer's own banner in Phase 4
 (`installed <old>; channel has <new> — keeping <old>`), which it prints from the
@@ -242,14 +281,17 @@ do not invent an answer to a question in group A.
 | Ask | Why it cannot be derived |
 |---|---|
 | That they have a bot token from [@BotFather](https://t.me/BotFather) (`/newbot`), and that it runs nowhere else | It is created by a human in Telegram. The installer never validates it against Telegram — a wrong but well-formed token installs "fine" and the bot stays silent. Ask them to *have* it, not to paste it here: it goes into the secrets file by the path in Phase 2 (rule 4). A token already live on another box or script is two pollers (rule 7). |
-| Their numeric Telegram id from [@userinfobot](https://t.me/userinfobot), or their username | It becomes `--admin`. **Always pass it.** With no admin the node is UNCLAIMED and the first stranger who DMs it becomes its owner, once, with no time limit. |
+| Their numeric Telegram id from [@userinfobot](https://t.me/userinfobot), or their username | It becomes `--admin` (a comma-separated list if more than one person should be admin, ids and usernames mixed). **Always pass it.** With no admin the node is UNCLAIMED and the first stranger who DMs it becomes its owner, once, with no time limit. |
 | Mini App, or bot only? | `--domain <host>` needs an A record already pointing at this box and ports 80+443 open; Caddy then gets a Let's Encrypt certificate. `--no-https` is a complete install — the bot long-polls Telegram and works behind NAT — it only costs the Mini App, which Telegram opens on a public `https` origin or not at all. Ask which they have, do not guess, and pass exactly one of the two. The script does not reject both, and the result is not clean either way round: `--no-https` switches Caddy off but leaves the domain set, so `MINIAPP_URL=https://<domain>/app` still lands in `.env` — no certificate, and a Mini App button that points nowhere. |
 | May the node have passwordless root on this box? | The default install grants the service account exactly that, because administering the box is the job. It is the one consent in this flow that cannot be taken back quietly. If the box hosts anything else, offer `--scoped-sudo`, which narrows the grant to restart/status/journal on its own unit. |
 
 **B. The brain**
 
 The node keeps its context in a git repository — charter, memory, skills,
-routines. Offer three, in this order:
+routines. (A repo fresh from the template has the charter and the memory
+layout, but its `skills/` and `.agentos/routines/` hold only a README; the
+ready-made skills and a sample routine sit under `examples/` and do nothing
+until copied — Phase 3B says how.) Offer three, in this order:
 
 1. **A new repo from the template** —
    [`try-agent-os/claude-code-template`](https://github.com/try-agent-os/claude-code-template),
@@ -350,8 +392,10 @@ is why Phase 4 lifts it from this file into the installer's environment.
 `GH_TOKEN` is what the installer authenticates git with (`gh auth setup-git`)
 before cloning anything you passed to `--repo`. If the token has to live under
 another key, `--gh-token-key <KEY>` names it (default: `GH_TOKEN`, then
-`GITHUB_TOKEN`). `CLAUDE_CODE_OAUTH_TOKEN` is the
-supported way to give a node its Claude credentials without a browser.
+`GITHUB_TOKEN`). `CLAUDE_CODE_OAUTH_TOKEN` is not something the installer
+knows about: it rides through `--secrets` as one more opaque `KEY=VALUE` line
+into `.env`, where the Claude CLI picks it up — a way to give the node Claude
+credentials without a browser, not a flag or a check of the installer's.
 `AGENTOS_REPO_DIR` is how the node learns which checkout is its brain: on a boot
 where its context registry is still empty, it adopts that directory — in place,
 read-only, nothing scaffolded — as its active context. The installer preserves
@@ -360,7 +404,9 @@ the key across every re-run but never sets it, so this file is where it belongs.
 Set `AGENTOS_REPO_DIR` to `<install-dir>/repos/<name>`, where `<name>` is the
 repository name from Phase 1B with no `.git` — that is exactly where `--repo`
 clones. For a plain install and a repo called `my-agent` that comes out as
-`/opt/agentos/repos/my-agent`, but take `<install-dir>` from the probe.
+`/opt/agentos/repos/my-agent`, but take `<install-dir>` from the probe. Never
+point it at `/tmp/brain`: that is the scratch working copy Phase 3 edits and
+pushes from, not the node's checkout, and it does not survive a reboot.
 
 For the **local-only** brain, create the checkout yourself before installing —
 `git init`, the template's layout, a first commit — and point `AGENTOS_REPO_DIR`
@@ -394,6 +440,12 @@ guess the owner from `gh api user` when the owner said an organisation.
 - **Local for now:** the checkout you created in Phase 2 *is* the brain. Work in
   it directly wherever 3B says `/tmp/brain`.
 
+`/tmp/brain` is a scratch copy: you edit, commit and push there, and the node
+gets its own clone of the remote in `<install-dir>/repos/<name>` when Phase 4
+runs `--repo`. `AGENTOS_REPO_DIR` stays pointed at that path, never at
+`/tmp/brain`. (The local-only brain is the one exception: there the Phase 2
+checkout is both.)
+
 ### 3B. Fill the required files (never skip)
 
 First look at what is there — do not assume the template's layout, and do not
@@ -409,17 +461,23 @@ done
 Two files are required, and what you do with each depends on that listing. An
 existing file is the owner's: complete it, never replace it.
 
-- **`memory/owner.md`** — missing: copy `memory/owner._template.md` if the repo
-  has one, or create `memory/` and the file yourself with the frontmatter shown
+- **`memory/owner.md`** — a repo fresh from the template does **not** have this
+  file; it ships only `memory/owner._template.md`, and the node reads
+  `owner.md`, not the template. So on the template path the listing above
+  always says `NO   memory/owner.md`, and this step starts with a copy:
+  `cp memory/owner._template.md memory/owner.md`. Missing in any other repo:
+  copy `memory/owner._template.md` if the repo has one, or create `memory/` and the file yourself with the frontmatter shown
   below. Present: keep its body and fill only what is empty. Either way, write
   the real answers from Phase 1C into it: name, preferred name, timezone, role,
   how they want updates delivered, what they are working on now, the people who
   matter. Short and true beats long and padded.
 
   **Fill the YAML frontmatter, not only the prose below it.** The template opens
-  with a fence of empty strings, and the node reads exactly three keys out of
-  it — `name`, `preferred_name`, `timezone` — to decide whether this owner has
-  been onboarded. Prose in the body, however good, does not count:
+  with a fence of four empty strings — `name`, `role`, `timezone`,
+  `preferred_name` — and the node checks three of them — `name`,
+  `preferred_name`, `timezone` — to decide whether this owner has been
+  onboarded. `role` is not part of that check, but fill it too: it is part of
+  the owner's profile. Prose in the body, however good, does not count:
 
   ```
   ---
@@ -441,6 +499,23 @@ existing file is the owner's: complete it, never replace it.
   outward-facing"). Missing: write it. Present — the owner's own repo often has
   one written for other work: leave what is there, add what is not (language,
   jobs, consent) as a section of its own, and tell the owner what you added.
+  The template's charter carries a placeholder in its Identity section,
+  `- **Owner:** <your name>`; replace `<your name>` with the owner's name.
+  Nothing else rewrites it, and a charter that still says `<your name>` is
+  what the node reads on every turn:
+
+  ```bash
+  grep -n '<your name>' CLAUDE.md   # must print nothing
+  ```
+- **Skills and routines — optional, the owner's choice.** On the template path
+  `skills/` and `.agentos/routines/` hold only a README. Ready-made skills live
+  under `examples/skills/` and a sample routine under `examples/routines/`;
+  nothing loads them from there. Show the owner the list in
+  `examples/skills/README.md`, and copy only what matches the jobs from
+  Phase 1C — `cp -R examples/skills/<skill> skills/` — then adapt it (that
+  README says what each one assumes). Do not copy all of them by default: most
+  expect connectors the owner may not have. The first routine is better added
+  from the node's own catalog in Phase 6 than copied from `examples/routines/`.
 
 Check the result before you commit, not after the node has greeted anyone:
 
@@ -725,13 +800,14 @@ command's own status and message. Read the message — it usually names the fix.
 | What you see | What it is | What you do |
 |---|---|---|
 | `unknown option`, `--user: expected…`, `--port: expected…`, `--secrets: no such file`, `--admin: … is neither of the two accepted forms` | Your own argv. Nothing was touched. | Fix and re-run. Never ask the owner to re-answer something you mangled. |
+| `--tunnel-token/--quick: not yet supported in --no-docker mode, use --domain or --no-https` | `--tunnel-token` or `--quick` combined with an explicit `--no-docker`. These flags switch to the container profile only when the profile is left open; with `--no-docker` they abort instead. | Pick one: drop `--no-docker` (container profile, the tunnel works), or keep bare metal and use `--domain` or `--no-https`. Ask the owner if the choice changes what they get. |
 | `run as root, or install sudo.` / `sudo failed` | No privileges. Nothing was touched. | Get root, or say you cannot. |
 | Exit 3, `AgentOS Node is up, but WITHOUT HOST AUTHORITY`, `!! NO HOST AUTHORITY` | The node is installed and running, but its sudoers drop-in was NOT installed, so it has no root. The `Why:` line of the banner names the cause. | Tell the owner exactly that, with the cause. Fix it (usually `apt-get install sudo`) and re-run with the same flags. |
 | `the bare-metal node needs x86_64…` / `needs an apt-based distro…` | Wrong host for this profile. Nothing was touched. | Re-run with `--docker`, and tell the owner what that changes. |
 | `cannot resolve the stable channel`, a curl failure on the tarball or the Node runtime | Network or GitHub. Packages may be installed; nothing else is. | Retry once. Still failing: report it as an outage, do not hand-download anything. |
 | `tarball checksum mismatch` | **Stop.** A release tarball that does not match its SHA256 is not a thing to work around. | Nothing was unpacked: the version directory is created only after the check passes, so the box is untouched apart from a partial download in `/tmp` that the next attempt overwrites. Retry once in case the download was truncated. If it repeats, report it and stop; never disable the check. |
 | A `tar`/`unzstd` failure right after the checksum passed | The download was good, the extraction was not. **This one does leave a trap**: `<install-dir>/versions/<tag>` now exists but is empty or partial, and the installer skips the whole download-and-unpack block when that directory is present — so a naive re-run points `current` at an empty tree and the node never starts. | Delete `<install-dir>/versions/<tag>` (and the tarball in `/tmp`) before retrying. Then re-run the installer. |
-| `node did not become healthy` (the last 50 journal lines were printed above it) | The unit is installed and enabled; the node did not answer `/healthz` in 45 attempts (~1.5-2 min). | Read that dump first. Then `journalctl -u <unit> -n 200 --no-pager` and `sudo tail -200 <install-dir>/logs/node.log` — note that `/usr/local/bin/agentos` is not created until after the health gate, so the CLI is not there yet (and on a named instance it is `/usr/local/bin/agentos-<user>`, a wrapper, not a symlink). A wrong value in `.env` and a port already taken are the common causes. Fix the cause and re-run the installer; it is cheap the second time. |
+| `node did not become healthy` (the last 50 journal lines were printed above it) | The unit is installed and enabled; the node did not answer `/healthz` in 45 attempts (~1.5-2 min). | Read that dump first. Then `journalctl -u <unit> -n 200 --no-pager` and `sudo tail -200 <install-dir>/logs/node.log` — note that on the bare-metal profile `/usr/local/bin/agentos` is not created until after the health gate, so the CLI is not there yet (the `--docker` profile links it before its health wait, so there it exists even when the node never came up) (and on a named instance it is `/usr/local/bin/agentos-<user>`, a wrapper, not a symlink). A wrong value in `.env` and a port already taken are the common causes. Fix the cause and re-run the installer; it is cheap the second time. |
 | `docker install failed`, `docker daemon is not reachable` | Docker, not AgentOS. | Follow the message, or drop `--docker` if the box can take the bare-metal profile. |
 | `install did not finish cleanly… your .env and data are kept` (container profile) | Same class as the health timeout. | Read the container's last log lines, fix, re-run. |
 | `! git clone <name> failed`, `! gh auth setup-git failed` | **Warnings, not failures.** The install succeeded; the brain did not arrive. | Check the token scope (`repo`, `read:org`) and the URL, then re-run the installer — `--repo` is re-run safe and fetches when the checkout is already there. |
