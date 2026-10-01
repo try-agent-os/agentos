@@ -643,6 +643,18 @@ else
   AGENTOS_FAILED_LIST=0
 fi
 
+# Update RINGS and the fail-closed PROMOTION gate (fleet stability spec §8.5,
+# ClickUp 12418agg8wc): `agentos ctl ring`, and the /update button's refusal of
+# a release the node's ring may not install yet. Same relative lookup; absent,
+# `ctl ring` refuses by name and the button path behaves as before the rings.
+if [ -r "$_CLI_HERE/lib/rollout.sh" ]; then
+  # shellcheck source=lib/rollout.sh
+  . "$_CLI_HERE/lib/rollout.sh"
+  AGENTOS_ROLLOUT=1
+else
+  AGENTOS_ROLLOUT=0
+fi
+
 # stability_dir_init — where root keeps what it decides on: the parent of the
 # signal outbox, /var/lib/<unit> (the exit journal, the crash-loop episodes,
 # `.last-upgrade`, `failed.json`, `notices.jsonl`). The core reads the same
@@ -658,6 +670,7 @@ stability_dir_init() {
   STABILITY_DIR="$(dirname "$SIGNAL_OUTBOX")"
   FAILED_STATE_DIR="$STABILITY_DIR"
   FAILED_LEGACY_OUTBOX="$SIGNAL_OUTBOX"
+  ROLLOUT_STATE_DIR="$STABILITY_DIR"
   return 0
 }
 
@@ -1324,7 +1337,7 @@ docker_refresh_profiles() { # docker_refresh_profiles <new-image> [prev-image]
   # scripts above source resolves as "<their own dir>/lib/node-activity.sh", so it
   # must land under $AGENTOS_HOME/lib/ — hence the mkdir. Leave it out and a node
   # refreshes a CLI that then cannot see owner activity at all.
-  for f in agentos agentos-autoupdate.sh lib/node-activity.sh lib/upgrade-chain.sh lib/fleet-op.sh lib/failed-list.sh lib/md2quill.mjs; do
+  for f in agentos agentos-autoupdate.sh lib/node-activity.sh lib/upgrade-chain.sh lib/fleet-op.sh lib/failed-list.sh lib/rollout.sh lib/md2quill.mjs; do
     [ -f "$stage/$f" ] || continue
     if [ -f "$AGENTOS_HOME/$f" ] && cmp -s "$stage/$f" "$AGENTOS_HOME/$f"; then
       continue   # already current — no needless churn
@@ -4107,6 +4120,25 @@ cmd_manual_upgrade() {
     die "refusing upgrade request ${raw}: it is $(failed_list_describe "$blocked"). Lift it on the machine first: agentos rollback --clear-failed ${raw}"
   fi
 
+  # Nor is a release this node's RING may not install yet (spec §8.5, ClickUp
+  # 12418agg8wc). The request comes from the core, and the core is not trusted
+  # with the rollout: on the `fleet` ring a release is installed only once it
+  # is promoted, and a halted one on no ring at all. The button is the owner's
+  # word on POLICY; the way to put a release on fleet nodes NOW is to promote
+  # it (promote.yml in the dist repo), never to press past the gate per node.
+  if [ "$AGENTOS_ROLLOUT" = 1 ] && command -v jq >/dev/null 2>&1; then
+    stability_dir_init
+    rollout_check "https://github.com/${DIST_REPO}/releases/latest/download/stable.json" "$DIST_REPO" "$raw"
+    case "$ROLLOUT_GATE" in
+      halted)
+        write_upgrade_result failed-no-rollback "$cur" "${raw#v}" "halted" "${ROLLOUT_REASON:-}"
+        die "refusing upgrade request ${raw}: its rollout is HALTED (${ROLLOUT_REASON:-no reason given}; by ${ROLLOUT_BY:-?} at ${ROLLOUT_AT:-?}). No ring installs it." ;;
+      awaiting-promotion)
+        write_upgrade_result failed-no-rollback "$cur" "${raw#v}" "awaiting-promotion"
+        die "refusing upgrade request ${raw}: this node is on the fleet ring and ${raw} is not promoted yet (${ROLLOUT_WHY}). It installs by itself once the canaries vouch for it; to put it everywhere now, promote it: gh workflow run promote.yml -R ${DIST_REPO} -f tag=${raw} -f action=promote" ;;
+    esac
+  fi
+
   step "Forced upgrade requested by the owner: v${cur} → ${raw}"
   # The outcome is reported from an EXIT trap, not from around the call. The
   # engine ends a failed hop with `die` — an `exit` — so there is no `else`
@@ -4388,9 +4420,46 @@ db_env_default() {
   return 0
 }
 
+# `agentos ctl ring [canary|fleet]` — the node's update ring (fleet stability
+# spec §8.5, ClickUp 12418agg8wc). Like `ctl logs` it stays HERE instead of
+# going through the core: the ring lives in ROOT's policy file
+# (/var/lib/<unit>/policy.json, scripts/lib/rollout.sh), which the core reads
+# and may never write — a core that could move itself to `canary` could
+# install releases nobody has vouched for yet. Without an argument it prints
+# the ring (anyone may read it); with one it sets it (root only).
+cmd_ctl_ring() {
+  [ "$AGENTOS_ROLLOUT" = 1 ] || die "ctl ring needs lib/rollout.sh next to this CLI — refresh the install first"
+  command -v jq >/dev/null 2>&1 || die "ctl ring needs jq"
+  stability_dir_init
+  local want="${1:-}" path rc=0
+  path="$(rollout_policy_path)"
+  if [ -z "$want" ]; then
+    printf 'ring=%s policy=%s\n' "$(rollout_ring)" "$path"
+    return 0
+  fi
+  case "$want" in
+    canary|fleet) ;;
+    -h|--help) echo "usage: agentos ctl ring [canary|fleet]"; return 0 ;;
+    *) die "unknown ring '$want' — canary (installs a release at once) or fleet (only once it is promoted)" ;;
+  esac
+  rollout_set_ring "$want" || rc=$?
+  case "$rc" in
+    0) ;;
+    3) die "$path is not a JSON object — fix it by hand first (it also carries the exit watcher's thresholds)" ;;
+    *) die "could not write $path (run as root: sudo $(basename "$0") ctl ring $want)" ;;
+  esac
+  ok "update ring of $AGENTOS_SERVICE is now $want ($path)"
+  # A trace in the fleet operations journal, like every other operation on a
+  # node (ClickUp 12418agg8we) — best-effort, never a reason to fail.
+  if [ "$(type -t fleet_ops_append 2>/dev/null)" = function ]; then
+    fleet_ops_append ring "$AGENTOS_SERVICE" "$(failed_actor 2>/dev/null || id -un)" ring "$want" 2>/dev/null || true
+  fi
+  return 0
+}
+
 # Node-control surface — `agentos ctl` (task 12418agf323).
 #   agentos ctl status | doctor | context doctor | routine … | runs … | task … |
-#           settings … | harness … | secret set … | restart | logs [n]
+#           settings … | harness … | secret set … | restart | logs [n] | ring
 # The sub-mode that operates a RUNNING node from an ordinary shell, with no
 # agent session and no LLM spend. Everything except `logs` goes through the
 # core's loopback tool surface (never the database: SQLite is single-writer, and
@@ -4403,6 +4472,11 @@ db_env_default() {
 # exactly the case that matters — a core too sick to answer. It is the same
 # reader `agentos logs` already is.
 cmd_ctl() {
+  if [ "${1:-}" = "ring" ]; then
+    shift
+    cmd_ctl_ring "$@"
+    return
+  fi
   if [ "${1:-}" = "logs" ]; then
     shift
     # `ctl logs tail 200` and `ctl logs 200` mean the same thing; the word is
@@ -4684,7 +4758,7 @@ agentos — operate an AgentOS Core node
   import-history --from <path> --chat <id> [--dry-run]  import prior-transport
                               chat history into this node (messages.db | jsonl)
   ctl status | doctor | context doctor | routine … | runs … | task … |
-      settings … | harness … | secret set … | restart | logs [n]
+      settings … | harness … | secret set … | restart | logs [n] | ring [canary|fleet]
                               operate the RUNNING node from this shell: no agent
                               session, no LLM spend, --json on every command.
                               `agentos ctl --help` lists them all. Note the pair:
