@@ -1,0 +1,153 @@
+# promote.yml — the dist repo's PROMOTION workflow (fleet stability spec
+# §8.5-§8.6, ClickUp 12418agg8wc).
+#
+# THIS FILE IS THE SOURCE; the copy that runs lives in the public dist repo
+# (try-agent-os/agentos) at .github/workflows/promote.yml. Install or refresh it
+# there with scripts/dist-repo/install-promote-workflow.sh — it is not synced by
+# release.yml, whose token may not write workflow files (and should not).
+#
+# WHAT IT DOES — AND ALL IT CAN DO
+#   It uploads (or replaces) ONE asset, `promotion.json`, on ONE release that
+#   already exists and is published:
+#     promote → {"version":"vX.Y.Z","promoted_at":"…Z","by":"…","canaries":[…]}
+#     halt    → {"version":"vX.Y.Z","halted_at":"…Z","by":"…","reason":"…"}
+#   A node on the `fleet` ring installs a release only once this asset says
+#   promoted; a halted release is installed on no ring (scripts/lib/rollout.sh).
+#
+#   It never creates, edits, publishes or deletes a release, never touches
+#   stable.json, the tarball or SHA256SUMS, never pushes a commit or a tag.
+#   Arming a release — creating it, flipping `autoupdate` in its manifest —
+#   stays with the release workflow of the private repo and the owner. The
+#   mechanism behind "can only" is threefold: the job's GITHUB_TOKEN is granted
+#   `contents: write` and nothing else; the one write call names the file
+#   `promotion.json` built in a fresh temp dir; and
+#   scripts/tests/promote-workflow.test.sh runs this exact script against a
+#   recording `gh` and fails on any other mutating call.
+#
+# WHO RUNS IT
+#   The contour's fleet watcher (015-fleet-watch) with a fine-grained token
+#   whose ONLY permission on this repo is `Actions: write` — enough to dispatch
+#   this workflow, not enough to write a file, a tag or a release. And the
+#   owner: `gh workflow run promote.yml -R try-agent-os/agentos -f tag=vX.Y.Z
+#   -f action=promote` ("promote X now"), or `-f action=halt -f reason=…`.
+#   Residual risk, named in the spec's threat model: a token with
+#   `Actions: write` can also disable or re-run this repo's workflows.
+name: Promote release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, vX.Y.Z — the release must already be published'
+        required: true
+        type: string
+      action:
+        description: 'promote (the fleet ring may install it) or halt (no ring installs it)'
+        required: true
+        type: choice
+        options:
+          - promote
+          - halt
+      reason:
+        description: 'Why — required for halt, recorded for promote'
+        required: false
+        type: string
+        default: ''
+      canaries:
+        description: 'Promote only: JSON array of the canaries that vouched, [{"slug":"aos","since":"…Z","crashes":0}]'
+        required: false
+        type: string
+        default: '[]'
+
+# The job's token may write release assets and nothing else.
+permissions:
+  contents: write
+
+# One decision per release at a time; a promote and a halt racing for the same
+# tag are applied in the order they were dispatched, never interleaved.
+concurrency:
+  group: promote-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Write promotion.json
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write promotion.json
+        # Every input reaches the shell as an environment variable, never as
+        # interpolated script text: a tag or a reason is data.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          ACTION: ${{ inputs.action }}
+          REASON: ${{ inputs.reason }}
+          CANARIES: ${{ inputs.canaries }}
+          ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          die() { echo "::error::$*"; exit 1; }
+
+          # A stable release tag and nothing else: no prerelease (it never
+          # reaches the stable channel), no path, no flag.
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "tag '$TAG' is not vX.Y.Z"
+          case "$ACTION" in promote|halt) ;; *) die "action '$ACTION' is neither promote nor halt" ;; esac
+
+          # Free text is one printable line of at most 500 characters.
+          reason="$(printf '%s' "$REASON" | tr -d '\000-\037\177' | cut -c1-500)"
+          [ "$ACTION" != halt ] || [ -n "$reason" ] || die "halt needs a reason"
+          actor="$(printf '%s' "${ACTOR:-unknown}" | tr -cd 'A-Za-z0-9._[]-' | cut -c1-80)"
+
+          # The release must exist, be published, and be a real release of
+          # the stable channel (it carries stable.json). Nothing here creates
+          # one: an unknown tag is refused, not invented.
+          info="$(gh release view "$TAG" --repo "$REPO" --json tagName,isDraft,isPrerelease,assets)" \
+            || die "release $TAG does not exist in $REPO"
+          [ "$(jq -r '.isDraft' <<<"$info")" = false ] || die "release $TAG is still a draft (being published)"
+          [ "$(jq -r '.isPrerelease' <<<"$info")" = false ] || die "release $TAG is a prerelease"
+          jq -e 'any(.assets[]; .name == "stable.json")' >/dev/null <<<"$info" \
+            || die "release $TAG carries no stable.json — not a channel release"
+          prev="$(jq -r '[.assets[] | select(.name == "promotion.json")] | if length > 0 then "replaced" else "new" end' <<<"$info")"
+
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if [ "$ACTION" = promote ]; then
+            canaries="$(jq -c '
+              if type != "array" then error("not an array") else . end
+              | .[0:20]
+              | map(if type == "object" then
+                      {slug: ((.slug // "") | tostring | .[0:64]),
+                       since: (if (.since | type) == "string" then .since[0:40] else null end),
+                       crashes: (if (.crashes | type) == "number" then .crashes else null end)}
+                    else error("not an object") end)' <<<"${CANARIES:-[]}" 2>/dev/null)" \
+              || die "canaries is not a JSON array of objects"
+            doc="$(jq -n --arg v "$TAG" --arg at "$now" --arg by "$actor" --arg r "$reason" \
+              --argjson c "$canaries" \
+              '{version: $v, promoted_at: $at, by: $by, canaries: $c}
+               + (if $r == "" then {} else {reason: $r} end)')"
+          else
+            doc="$(jq -n --arg v "$TAG" --arg at "$now" --arg by "$actor" --arg r "$reason" \
+              '{version: $v, halted_at: $at, by: $by, reason: $r}')"
+          fi
+
+          # The asset's name IS the file's name, so the file is built in a
+          # directory of its own under exactly that name.
+          out="$(mktemp -d "${RUNNER_TEMP:-/tmp}/promotion.XXXXXX")"
+          printf '%s\n' "$doc" > "$out/promotion.json"
+          gh release upload "$TAG" "$out/promotion.json" --repo "$REPO" --clobber
+
+          # Read it back: what the fleet will read is what was meant.
+          mkdir -p "$out/check"
+          gh release download "$TAG" --repo "$REPO" --pattern promotion.json --dir "$out/check"
+          cmp -s "$out/promotion.json" "$out/check/promotion.json" \
+            || die "promotion.json read back from $TAG differs from what was uploaded"
+          echo "$TAG: $ACTION by $actor ($prev promotion.json)"
+          cat "$out/promotion.json"
+          {
+            echo "### $TAG — $ACTION"
+            echo
+            echo '```json'
+            cat "$out/promotion.json"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
