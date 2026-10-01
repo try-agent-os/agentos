@@ -9,6 +9,11 @@
 #                                       Crossing a major walks the intermediate
 #                                       majors one hop at a time unless --no-chain
 #   agentos rollback [--force-over-lock] undo the last upgrade (code + database)
+#   agentos rollback --code-only [--to <tag>]
+#                                       move `current` back only, data/ untouched
+#                                       (refused unless the migrations allow it)
+#   agentos rollback --clear-failed <tag> | --list-failed
+#                                       lift / list this node's release blacklist
 #   agentos fleet-op claim|release|pin|unpin|list|log
 #                                       advisory lock + journal of operations on a node
 #   agentos backup                      take a manual backup without upgrading
@@ -626,6 +631,104 @@ if [ -r "$_CLI_HERE/lib/fleet-op.sh" ]; then
   . "$_CLI_HERE/lib/fleet-op.sh"
 fi
 
+# The release BLACKLIST and the code-only crash rollback (fleet stability spec
+# §8.3-§8.4, ClickUp 12418agg8wa). Same relative lookup. Absent, the CLI falls
+# back to the single outbox marker it always wrote, and `rollback --code-only` /
+# `--clear-failed` refuse by name.
+if [ -r "$_CLI_HERE/lib/failed-list.sh" ]; then
+  # shellcheck source=lib/failed-list.sh
+  . "$_CLI_HERE/lib/failed-list.sh"
+  AGENTOS_FAILED_LIST=1
+else
+  AGENTOS_FAILED_LIST=0
+fi
+
+# stability_dir_init — where root keeps what it decides on: the parent of the
+# signal outbox, /var/lib/<unit> (the exit journal, the crash-loop episodes,
+# `.last-upgrade`, `failed.json`, `notices.jsonl`). The core reads the same
+# directory as "the parent of the outbox", so the two can never disagree.
+STABILITY_DIR=""
+stability_dir_init() {
+  [ -n "$STABILITY_DIR" ] && return 0
+  if [ -z "$SIGNAL_OUTBOX" ]; then
+    local mode; mode="$(detect_mode)"
+    [ "$mode" = none ] && mode=systemd
+    resolve_signal_paths "$mode"
+  fi
+  STABILITY_DIR="$(dirname "$SIGNAL_OUTBOX")"
+  FAILED_STATE_DIR="$STABILITY_DIR"
+  FAILED_LEGACY_OUTBOX="$SIGNAL_OUTBOX"
+  return 0
+}
+
+# blocked_entry <version> → the blacklist entry naming it, 0 when blocked.
+blocked_entry() {
+  [ "$AGENTOS_FAILED_LIST" = 1 ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  stability_dir_init
+  failed_list_find "$1"
+}
+
+# refuse_if_blocked <tag> — dies, with the one way out, when <tag> is listed.
+# Sets UPGRADE_BLOCKED for the EXIT trap of `manual-upgrade`.
+UPGRADE_BLOCKED=""
+refuse_if_blocked() {
+  local tag="$1" entry
+  [ -n "$tag" ] || return 0
+  entry="$(blocked_entry "$tag")" || return 0
+  UPGRADE_BLOCKED="$(failed_list_describe "$entry")"
+  echo "blocked-target: v${tag#v} $UPGRADE_BLOCKED" >&2
+  die "v${tag#v} is $UPGRADE_BLOCKED — it is on this node's blacklist ($STABILITY_DIR/failed.json) and is not installed by any path, forced or not. Lift it first: agentos rollback --clear-failed v${tag#v}"
+}
+
+# stability_notice <json-object> — one line for the OWNER, which the node sends
+# at its next start (core/stability: the same strict path as the crash-loop
+# alarm, deduplicated by `id` in the node's own database). Root writes it here,
+# not into the core's queue: after a rollback the queue belongs to a release
+# that is gone (spec §8.3). Kept to the newest 50 lines.
+stability_notice() {
+  command -v jq >/dev/null 2>&1 || return 0
+  stability_dir_init
+  local file="$STABILITY_DIR/notices.jsonl" line tmp
+  line="$(jq -c --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg unit "$AGENTOS_SERVICE" \
+    '{v: 1, at: $at, unit: $unit} + .' <<<"$1" 2>/dev/null)" || return 0
+  [ -L "$STABILITY_DIR" ] && return 0
+  mkdir -p "$STABILITY_DIR" 2>/dev/null || return 0
+  [ -L "$file" ] && rm -f "$file"
+  tmp="$file.tmp.$$"
+  { tail -n 49 "$file" 2>/dev/null || true; printf '%s\n' "$line"; } > "$tmp" 2>/dev/null \
+    && chmod 0644 "$tmp" && mv -f "$tmp" "$file" || { rm -f "$tmp"; warn "could not write $file"; }
+  return 0
+}
+
+# record_last_upgrade <from-tag> <to-tag> <manifest-json> — the pair root's exit
+# watcher reads to decide a crash rollback (spec §8.3): when, from where, to
+# where, and the oldest release `to` can be rolled back to by CODE ALONE
+# (`db_reversible_from` in its manifest; absent = irreversible). Written after a
+# healthy switch only. A DOWNGRADE writes no pair — there is nothing to roll
+# back to that is not the release just left — and lists the release it left.
+record_last_upgrade() {
+  command -v jq >/dev/null 2>&1 || return 0
+  [ "$AGENTOS_FAILED_LIST" = 1 ] || return 0
+  stability_dir_init
+  local from="$1" to="$2" manifest="${3:-}" drf="" json
+  if [ "$(failed_ver_cmp "$to" "$from")" = -1 ]; then
+    rm -f "$STABILITY_DIR/.last-upgrade" 2>/dev/null || true
+    if failed_list_add "$from" "" downgrade "$(failed_actor)"; then
+      warn "v${from#v} is now on this node's blacklist (moved back to v${to#v}); lift it with: agentos rollback --clear-failed v${from#v}"
+    fi
+    return 0
+  fi
+  drf="$(jq -r '.db_reversible_from // empty' <<<"$manifest" 2>/dev/null || true)"
+  failed_version_ok "$drf" || drf=""
+  json="$(jq -nc --arg f "v${from#v}" --arg t "v${to#v}" --arg d "$drf" \
+    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson e "$(date -u +%s)" \
+    '{v: 1, from: $f, to: $t, at: $at, epoch: $e,
+      db_reversible_from: (if $d == "" then null else ("v" + ($d | ltrimstr("v"))) end)}' 2>/dev/null)" || return 0
+  failed_write_json "$STABILITY_DIR/.last-upgrade" "$json" || warn "could not write $STABILITY_DIR/.last-upgrade — no crash rollback for this upgrade"
+  return 0
+}
+
 # fleet_guard_or_die <op> <force-over-lock 0|1> — the claim check both hands-on
 # commands run before they touch anything. Exit 3 is the lock's own "held by
 # someone else" code (the same one `fleet-op claim` answers with).
@@ -1221,7 +1324,7 @@ docker_refresh_profiles() { # docker_refresh_profiles <new-image> [prev-image]
   # scripts above source resolves as "<their own dir>/lib/node-activity.sh", so it
   # must land under $AGENTOS_HOME/lib/ — hence the mkdir. Leave it out and a node
   # refreshes a CLI that then cannot see owner activity at all.
-  for f in agentos agentos-autoupdate.sh lib/node-activity.sh lib/upgrade-chain.sh lib/fleet-op.sh lib/md2quill.mjs; do
+  for f in agentos agentos-autoupdate.sh lib/node-activity.sh lib/upgrade-chain.sh lib/fleet-op.sh lib/failed-list.sh lib/md2quill.mjs; do
     [ -f "$stage/$f" ] || continue
     if [ -f "$AGENTOS_HOME/$f" ] && cmp -s "$stage/$f" "$AGENTOS_HOME/$f"; then
       continue   # already current — no needless churn
@@ -3005,6 +3108,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   fi
   tag="$(jq -r .version <<<"$manifest")"
   prev="$(basename "$(readlink "$AGENTOS_HOME/current")")"
+  [ "$tag" = "$prev" ] || refuse_if_blocked "$tag"
   if [ "$tag" = "$prev" ]; then
     echo "already at $tag"
     # Not a no-op run: the unit set is reconciled here too. The auto-update
@@ -3137,6 +3241,9 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     # node again — and therefore BEFORE the best-effort reconciliation below,
     # which happens on a node that is already answering.
     record_upgrade_downtime systemd "${prev#v}" "${tag#v}" "$stop_epoch" "$snap_seconds"
+    # The pair the exit watcher's crash rollback reads — or, for a downgrade,
+    # the release it left on the blacklist (ClickUp 12418agg8wa).
+    record_last_upgrade "$prev" "$tag" "$manifest"
     # The disk-heavy part is over; the next node on this host may stop now.
     release_upgrade_host_lock
     # Only now: the units belong to the release that is actually live, and the
@@ -3191,11 +3298,17 @@ systemd_rollback() { # undo the last recorded upgrade — code + database togeth
   prev="$(cat "$src/version" 2>/dev/null || true)"
   [ -n "$prev" ] || die "backup dir $src has no recorded version (corrupt snapshot)"
   [ -d "$AGENTOS_HOME/versions/$prev" ] || die "version dir gone: $AGENTOS_HOME/versions/$prev"
+  local left; left="$(basename "$(readlink "$AGENTOS_HOME/current")")"
   step "Rolling back to $prev"
   systemctl_bus stop "$AGENTOS_SERVICE"
   systemd_restore_sqlite "$src"
   ln -sfn "$AGENTOS_HOME/versions/$prev" "$AGENTOS_HOME/current"
   set_env_version "$prev"
+  # The release left behind goes on the blacklist (spec §8.4, ClickUp
+  # 12418agg8wa): without it the next poller tick reinstalls exactly what was
+  # just thrown out — the v4.41.0 return on hub and symoditi, 24.09.
+  blacklist_left "$left" "$prev" rollback
+  rm -f "$STABILITY_DIR/.last-upgrade" 2>/dev/null || true
   systemctl_bus start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
   if wait_healthz "$AGENTOS_SERVICE"; then
     ok "rolled back to $prev and healthy"
@@ -3203,6 +3316,151 @@ systemd_rollback() { # undo the last recorded upgrade — code + database togeth
     journalctl -u "$AGENTOS_SERVICE" -n 30 --no-pager || true
     die "still unhealthy after rollback — the pre-upgrade snapshot is at $src."
   fi
+}
+
+# blacklist_left <left-tag> <now-tag> <reason> — list the release a rollback
+# moved away from, when it is newer than where the node now is.
+blacklist_left() {
+  local left="$1" now="$2" reason="$3"
+  [ "$AGENTOS_FAILED_LIST" = 1 ] && command -v jq >/dev/null 2>&1 || return 0
+  stability_dir_init
+  failed_version_ok "$left" || return 0
+  [ "$left" != "$now" ] || return 0
+  [ "$(failed_ver_cmp "$left" "$now")" = 1 ] || return 0
+  if failed_list_add "$left" "" "$reason" "${BLACKLIST_BY:-$(failed_actor)}"; then
+    info "v${left#v} is now on this node's blacklist — no auto-update, /update or forced poke installs it again; lift with: agentos rollback --clear-failed v${left#v}"
+  else
+    warn "could not record v${left#v} in $STABILITY_DIR/failed.json — the poller may offer it again"
+  fi
+}
+
+# ─── code-only rollback (fleet stability spec §8.3, ClickUp 12418agg8wa) ─────
+#
+# `agentos rollback --code-only` moves `current` back to the release the last
+# upgrade came from and restarts — and touches NOTHING else: no data/ restore,
+# no snapshot, so nothing the node did since the upgrade is lost and nothing is
+# replayed (the scheduler's catch-up finds the same database it left). That is
+# only safe when the database the newer release left behind still boots under
+# the older code, i.e. the newer release added no migration the older one does
+# not know. Two independent checks, either one refuses:
+#   * the release's own word: `db_reversible_from` from its manifest, recorded
+#     in <state>/.last-upgrade at upgrade time — the oldest release it can be
+#     rolled back to by code; no field = irreversible;
+#   * this host's facts: every migration of the running release must be known
+#     to the target release (the same migration lists the schema-compat
+#     preflight reads). A refusal here is a refusal whatever the manifest said.
+#
+# The automatic caller is root's exit watcher (agentos-exit-watch), after the
+# second crash of a fresh release (`--reason crash-loop`); it passes the target
+# and the release it expects to find running, so a decision that went stale
+# (someone moved the node meanwhile) does nothing. The release it leaves is
+# blacklisted, and a line for the owner goes to <state>/notices.jsonl.
+code_rollback_judge() { # code_rollback_judge <running-dir> <target-dir> → unknown migrations on stdout; 0 ok, 1 refused, 2 not judgeable
+  local run="$1" tgt="$2" mode=files run_list tgt_list
+  [ -d "$run/dist/core/db/migrations" ] || schema_manifest_ok "$run" || return 2
+  [ -d "$tgt/dist/core/db/migrations" ] || schema_manifest_ok "$tgt" || return 2
+  if schema_manifest_ok "$run" && schema_manifest_ok "$tgt"; then mode=manifest; fi
+  run_list="$(schema_migrations_of "$run" "$mode")" || return 2
+  tgt_list="$(schema_migrations_of "$tgt" "$mode")" || return 2
+  [ -n "$tgt_list" ] || return 2
+  { printf '%s\n' "$tgt_list" | sed 's/^/T /'; printf '%s\n' "$run_list" | sed 's/^/R /'; } \
+    | awk 'NF < 4 { next }
+           $1 == "T" { known[$2 " " $3] = 1; next }
+           $1 == "R" && !(($2 " " $3) in known) && !($4 in dup) { dup[$4] = 1; bad[++nb] = $4 }
+           END { for (i = 1; i <= nb; i++) printf "%s%s", (i > 1 ? " " : ""), bad[i]; if (nb) { print ""; exit 1 } }'
+}
+
+systemd_rollback_code_only() { # systemd_rollback_code_only <to-tag|""> <expect-current|""> <reason> <episode|""> <crashes|"">
+  local want_to="$1" expect="$2" reason="$3" episode="$4" crashes="$5"
+  local lu="" cur to drf="" unknown rc=0 auto=0
+  [ "$reason" = crash-loop ] && auto=1
+  [ "$AGENTOS_FAILED_LIST" = 1 ] || die "rollback --code-only needs lib/failed-list.sh next to this CLI — refresh the install first"
+  command -v jq >/dev/null 2>&1 || die "jq is required for rollback --code-only"
+  stability_dir_init
+  cur="$(basename "$(readlink "$AGENTOS_HOME/current" 2>/dev/null)" 2>/dev/null || true)"
+  failed_version_ok "$cur" || die "cannot tell which release runs here (current -> '${cur}')"
+  if [ -f "$STABILITY_DIR/.last-upgrade" ] && [ ! -L "$STABILITY_DIR/.last-upgrade" ]; then
+    lu="$(head -c 4096 "$STABILITY_DIR/.last-upgrade" | jq -c 'select(type == "object")' 2>/dev/null || true)"
+  fi
+  to="$want_to"
+  [ -n "$to" ] || to="$(jq -r '.from // empty' <<<"${lu:-null}" 2>/dev/null || true)"
+  [ -n "$to" ] || die "no upgrade recorded to roll back ($STABILITY_DIR/.last-upgrade); name the target: agentos rollback --code-only --to vX.Y.Z"
+  failed_version_ok "$to" || die "'$to' is not a release tag"
+  case "$to" in v*) ;; *) to="v$to" ;; esac
+  if [ -n "$expect" ] && [ "${expect#v}" != "${cur#v}" ]; then
+    die "rollback --code-only: expected $expect to be running, found $cur — the decision is stale, nothing done"
+  fi
+  [ "${to#v}" != "${cur#v}" ] || die "rollback --code-only: $to is already running"
+  [ "$(failed_ver_cmp "$to" "$cur")" = -1 ] || die "rollback --code-only goes to an OLDER release; $to is not older than $cur"
+  [ -d "$AGENTOS_HOME/versions/$to" ] || die "version dir gone: $AGENTOS_HOME/versions/$to — a code-only rollback needs it on disk"
+  # The release's own word, when the pair on record is this very upgrade.
+  if [ -n "$lu" ] && [ "$(jq -r '.to // empty' <<<"$lu" | sed 's/^v//')" = "${cur#v}" ]; then
+    drf="$(jq -r '.db_reversible_from // empty' <<<"$lu" 2>/dev/null || true)"
+    failed_version_ok "$drf" || drf=""
+    if [ -z "$drf" ] || [ "$(failed_ver_cmp "$to" "$drf")" = -1 ]; then
+      die "rollback --code-only refused: $cur's migrations are not reversible to $to (db_reversible_from: ${drf:-none}) — the code alone would not boot on this database. A full rollback restores code AND data: agentos rollback"
+    fi
+  fi
+  # This host's facts.
+  unknown="$(code_rollback_judge "$(readlink -f "$AGENTOS_HOME/current")" "$AGENTOS_HOME/versions/$to")" || rc=$?
+  case "$rc" in
+    0) info "code-only rollback: every migration of $cur is known to $to" ;;
+    1) die "rollback --code-only refused: $cur applied migration(s) $unknown that $to does not know — it would not boot on this database. A full rollback restores code AND data: agentos rollback" ;;
+    *) [ -n "$drf" ] || die "rollback --code-only refused: neither the release (no db_reversible_from on record) nor this host (no migration lists) can say the database is safe for $to"
+       warn "code-only rollback: no migration lists to compare; relying on the release's db_reversible_from ($drf)" ;;
+  esac
+
+  step "Rolling back $cur → $to (code only — data/ is not touched)"
+  if ! systemctl_bus stop "$AGENTOS_SERVICE"; then
+    [ "$auto" = 1 ] && stability_notice "$(jq -nc --arg f "${cur#v}" --arg t "${to#v}" --arg e "$episode" --arg c "$crashes" --arg d "could not stop $AGENTOS_SERVICE" \
+      '{id: "rollback-failed-\($f)-\(now | floor)", kind: "rollback-failed", from: $f, to: $t, detail: $d,
+        episode: (if $e == "" then null else $e end), crashes: ($c | tonumber? // null)}')"
+    die "rollback FAILED: could not stop $AGENTOS_SERVICE — nothing was changed, current still points at $cur"
+  fi
+  ln -sfn "$AGENTOS_HOME/versions/$to" "$AGENTOS_HOME/current"
+  set_env_version "$to"
+  # Listed BEFORE the start: from this moment on no path may bring $cur back.
+  BLACKLIST_BY="${BLACKLIST_BY:-$( [ "$auto" = 1 ] && echo agentos-exit-watch || failed_actor)}" \
+    blacklist_left "$cur" "$to" "$( [ "$auto" = 1 ] && echo crash-loop || echo rollback)"
+  rm -f "$STABILITY_DIR/.last-upgrade" 2>/dev/null || true
+  systemctl_bus start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
+  if wait_healthz "$AGENTOS_SERVICE"; then
+    ok "rolled back $cur → $to (code only) and healthy"
+    [ "$auto" = 1 ] && stability_notice "$(jq -nc --arg f "${cur#v}" --arg t "${to#v}" --arg e "$episode" --arg c "$crashes" \
+      '{id: "rollback-\($f)-\(now | floor)", kind: "rollback", from: $f, to: $t,
+        episode: (if $e == "" then null else $e end), crashes: ($c | tonumber? // null)}')"
+    return 0
+  fi
+  journalctl -u "$AGENTOS_SERVICE" -n 30 --no-pager || true
+  [ "$auto" = 1 ] && stability_notice "$(jq -nc --arg f "${cur#v}" --arg t "${to#v}" --arg e "$episode" --arg c "$crashes" --arg d "$to is not answering /healthz either" \
+    '{id: "rollback-failed-\($f)-\(now | floor)", kind: "rollback-failed", from: $f, to: $t, detail: $d,
+      episode: (if $e == "" then null else $e end), crashes: ($c | tonumber? // null)}')"
+  die "rolled back $cur → $to (code only), but $to is unhealthy too — inspect: journalctl -u $AGENTOS_SERVICE"
+}
+
+# `agentos rollback --clear-failed <tag>` — the ONE way a blacklisted release
+# becomes installable again (spec §8.4). Root only: the file is root's, and a
+# lift is a decision about what root will install.
+cmd_clear_failed() { # cmd_clear_failed <tag>
+  local tag="$1"
+  [ "$AGENTOS_FAILED_LIST" = 1 ] || die "--clear-failed needs lib/failed-list.sh next to this CLI — refresh the install first"
+  command -v jq >/dev/null 2>&1 || die "jq is required for --clear-failed"
+  failed_version_ok "$tag" || die "'$tag' is not a release tag (expected vX.Y.Z)"
+  stability_dir_init
+  if failed_list_remove "$tag"; then
+    ok "v${tag#v} lifted from this node's blacklist ($STABILITY_DIR/failed.json) by $(failed_actor)"
+  else
+    info "v${tag#v} is not on this node's blacklist — nothing to lift"
+  fi
+}
+
+cmd_list_failed() {
+  [ "$AGENTOS_FAILED_LIST" = 1 ] || die "--list-failed needs lib/failed-list.sh next to this CLI"
+  command -v jq >/dev/null 2>&1 || die "jq is required for --list-failed"
+  stability_dir_init
+  local entries; entries="$(failed_list_entries)"
+  if [ "$(jq 'length' <<<"$entries")" = 0 ]; then echo "no blocked releases"; return 0; fi
+  jq -r '.[] | "v\(.version)  \(.reason // "unknown")  \(.at // "-")  \(.by // "-")"' <<<"$entries"
 }
 
 systemd_backup() { # manual, standalone backup — leaves the unit running afterward; NEVER touches .last-upgrade
@@ -3340,6 +3598,10 @@ channel_release_tags() { # → v-tags, one per line (possibly none)
 # restarting anything. Never set in production — a chain is only as trustworthy
 # as the order it is applied in, and that order has to be testable.
 upgrade_hop() { # upgrade_hop <tag> <image-ref>
+  # A blacklisted release is refused by every path (spec §8.4): the poller, the
+  # /update button and an operator's `agentos upgrade --to` alike. An empty tag
+  # (latest) is checked once the engine has resolved it.
+  refuse_if_blocked "$1"
   if [ -n "${AGENTOS_UPGRADE_HOP_CMD:-}" ]; then
     # BOTH args, not just the tag: which hop carries the digest pin is itself a
     # property under test (it belongs to the target release alone).
@@ -3586,14 +3848,19 @@ upgrade_abort_report() { # upgrade_abort_report [exit-status]  — default: $? a
     warn "hop ${UPGRADE_CHAIN_N}/${UPGRADE_CHAIN_TOTAL} (${UPGRADE_CHAIN_HOP}) did not complete — the chain stops here. The node is on the last release that came up healthy; nothing after ${UPGRADE_CHAIN_HOP} was attempted."
   fi
   if [ -n "${MANUAL_UPGRADE_TO:-}" ]; then
-    if [ -n "${UPGRADE_SCHEMA_COMPAT_DETAIL:-}" ]; then
+    if [ -n "${UPGRADE_BLOCKED:-}" ]; then
+      # Refused before anything was touched: the target is on this node's
+      # blacklist (ClickUp 12418agg8wa). `detail` says since when and by whom.
+      write_upgrade_result failed-no-rollback "$MANUAL_UPGRADE_FROM" "$MANUAL_UPGRADE_TO" \
+        "blocked" "$UPGRADE_BLOCKED"
+    elif [ -n "${UPGRADE_SCHEMA_COMPAT_DETAIL:-}" ]; then
       # Refused by the schema-compat preflight BEFORE anything was stopped: the
       # node is untouched on its old release. The refused release is marked in
       # failed.json exactly as the poller marks one, so the next unattended
       # tick does not walk into the same refusal and report it again.
       write_upgrade_result failed-no-rollback "$MANUAL_UPGRADE_FROM" "$MANUAL_UPGRADE_TO" \
         "schema-compat" "$UPGRADE_SCHEMA_COMPAT_DETAIL"
-      write_failed_marker "${UPGRADE_SCHEMA_COMPAT_TO:-$MANUAL_UPGRADE_TO}"
+      write_failed_marker "${UPGRADE_SCHEMA_COMPAT_TO:-$MANUAL_UPGRADE_TO}" schema-compat
     elif [ "${UPGRADE_FETCH_FAILED:-0}" = 1 ]; then
       # The release could not be downloaded: the engine died before it stopped
       # anything, so there is no rollback to report and no health gate that
@@ -3763,9 +4030,14 @@ write_upgrade_result() { # write_upgrade_result <outcome> <from> <to> <reason> [
 # The same marker the poller writes (write_failed in agentos-autoupdate.sh):
 # the unattended path does not retry a release named here until a newer one
 # appears or the owner forces it. Best-effort, temp + rename.
-write_failed_marker() { # write_failed_marker <bare-version>
+write_failed_marker() { # write_failed_marker <bare-version> [reason]
   command -v jq >/dev/null 2>&1 || return 0
   [ -n "${SIGNAL_OUTBOX:-}" ] || return 0
+  if [ "$AGENTOS_FAILED_LIST" = 1 ]; then
+    stability_dir_init
+    failed_list_add "$1" "" "${2:-health-gate}" "$(failed_actor)" || true
+    return 0
+  fi
   local json
   json="$(jq -nc --arg v "$1" '{version: $v, digest: null}' 2>/dev/null || true)"
   [ -n "$json" ] || return 0
@@ -3825,6 +4097,14 @@ cmd_manual_upgrade() {
   if [ "$AGENTOS_CHAIN_PLANNER" = 1 ] && [ "$(upgrade_chain_cmp "${raw#v}" "$cur" 2>/dev/null || echo -1)" != 1 ]; then
     write_upgrade_result failed-no-rollback "$cur" "${raw#v}" "not an upgrade"
     die "refusing upgrade request ${raw}: this node runs v${cur}, and this path never moves a node backwards (a database ahead of its code does not boot)."
+  fi
+
+  # A blacklisted release is not installed from chat either (spec §8.4): the
+  # button is the owner's word on POLICY, not on a release this node threw out.
+  local blocked
+  if blocked="$(blocked_entry "$raw")"; then
+    write_upgrade_result failed-no-rollback "$cur" "${raw#v}" "blocked" "$(failed_list_describe "$blocked")"
+    die "refusing upgrade request ${raw}: it is $(failed_list_describe "$blocked"). Lift it on the machine first: agentos rollback --clear-failed ${raw}"
   fi
 
   step "Forced upgrade requested by the owner: v${cur} → ${raw}"
@@ -3970,6 +4250,8 @@ cmd_preset() {
 #   agentos agent add <git-url|dir> [--ref r] [--path sub] [--name n] [--repo dir]
 #                     [--force] [--dry-run]
 #               | check <dir> [--name n] | ls [--repo dir]
+#               | update <name> [--ref r] [--force] [--dry-run]   (task 12418aggjhv)
+#               | rm <name> [--force] [--dry-run]
 # Installs a portable agent package (a folder: <name>.md with a `version`, no
 # secrets, parameters as {{ env.X }}) into the context repo's
 # .agentos/agents/<name>/, where `agent: { name: <name> }` in a routine step
@@ -4274,16 +4556,35 @@ cmd_import_history() { # agentos import-history --from <path> --chat <id> [--dry
 }
 
 cmd_rollback() {
-  local over_lock=0
+  local over_lock=0 code_only=0 to="" expect="" reason="" episode="" crashes="" clear="" list=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --force-over-lock) over_lock=1; shift ;;
+      --code-only) code_only=1; shift ;;
+      --to) to="${2:?--to needs a value}"; shift 2 ;;
+      --expect-current) expect="${2:?--expect-current needs a value}"; shift 2 ;;
+      --reason) reason="${2:?--reason needs a value}"; shift 2 ;;
+      --episode) episode="${2:?--episode needs a value}"; shift 2 ;;
+      --crashes) crashes="${2:?--crashes needs a value}"; shift 2 ;;
+      --clear-failed) clear="${2:?--clear-failed needs a tag}"; shift 2 ;;
+      --list-failed) list=1; shift ;;
       *) die "unknown rollback option: $1 (try --help)" ;;
     esac
   done
+  if [ "$list" = 1 ]; then cmd_list_failed; return; fi
+  if [ -n "$clear" ]; then cmd_clear_failed "$clear"; return; fi
+  case "$reason" in ''|crash-loop|manual) ;; *) die "unknown rollback reason: $reason" ;; esac
+  case "$episode" in ''|*[!A-Za-z0-9_.@-]*) [ -z "$episode" ] || die "--episode is not a plain word" ;; esac
+  case "$crashes" in ''|*[!0-9]*) [ -z "$crashes" ] || die "--crashes is not a number" ;; esac
   fleet_guard_or_die rollback "$over_lock"
+  if [ "$code_only" = 1 ]; then
+    [ "$(detect_mode)" = systemd ] || die "rollback --code-only is systemd-mode only"
+    systemd_rollback_code_only "$to" "$expect" "${reason:-manual}" "$episode" "$crashes"
+    return
+  fi
+  [ -z "$to$expect$reason$episode$crashes" ] || die "--to/--expect-current/--reason/--episode/--crashes go with --code-only"
   case "$(detect_mode)" in
-    systemd) systemd_rollback ;;
+    systemd) stability_dir_init; systemd_rollback ;;
     docker)  docker_rollback ;;
     none)    die "no install found under $AGENTOS_HOME" ;;
   esac
@@ -4341,7 +4642,20 @@ agentos — operate an AgentOS Core node
                               lets a multi-hop chain outlive the node it
                               restarts
   rollback [--force-over-lock]
-                              undo the last upgrade (code + database)
+                              undo the last upgrade (code + database); the
+                              release it leaves goes on the blacklist
+  rollback --code-only [--to <tag>] [--expect-current <tag>]
+                              move current back to the previous release and
+                              restart; data/ is not touched. Refused unless the
+                              release's db_reversible_from and this host's
+                              migration lists both allow it. Run by
+                              agentos-exit-watch after the 2nd crash of a fresh
+                              release (systemd mode only)
+  rollback --clear-failed <tag>
+                              lift <tag> from this node's release blacklist
+                              (/var/lib/<unit>/failed.json) — the only way; a
+                              forced poke or the /update button does not
+  rollback --list-failed      print the blacklist
   fleet-op claim|release|pin|unpin|list|log ...
                               advisory lock and journal of operations on a node
                               (/var/lib/agentos-fleet): `upgrade` and `rollback`
@@ -4356,6 +4670,9 @@ agentos — operate an AgentOS Core node
       | check <dir> | ls      install a shared agent package into the context
                               repo's .agentos/agents/<name>/ (refused when it
                               carries a secret, has no version, or widens the node)
+  agent update <name> [--ref r] [--force] | rm <name> [--force]
+                              re-install a newer version from the recorded source
+                              (same checks) / remove one installed from a package
   state ls | get <scope.key> | set <scope.key> <v> | incr <scope.key> [--by N]
         | cas <scope.key> <v> --expect <old> | history [<scope.key>]
                               shared state between routines and runs; incr and
