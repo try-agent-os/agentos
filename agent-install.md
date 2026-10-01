@@ -304,7 +304,11 @@ until copied — Phase 3B says how.) Offer three, in this order:
    Phase 2.
 2. **A repo they already have.** Take the clone URL. Phase 3 still writes the
    charter and the owner profile into it if they are missing, so the GitHub
-   token needs write access to it too.
+   token needs write access to it too. Tell them before they pick it: the node
+   becomes a second author on that repository's `main` — it commits and pushes
+   on its own, starting about a minute after its first boot (Phase 2 lists
+   exactly what it writes). If the repo must stay untouched, option 1 is the
+   answer.
 3. **Local for now** — a checkout on this box only. It works; it just means the
    brain lives on one disk and dies with it.
 
@@ -397,9 +401,44 @@ knows about: it rides through `--secrets` as one more opaque `KEY=VALUE` line
 into `.env`, where the Claude CLI picks it up — a way to give the node Claude
 credentials without a browser, not a flag or a check of the installer's.
 `AGENTOS_REPO_DIR` is how the node learns which checkout is its brain: on a boot
-where its context registry is still empty, it adopts that directory — in place,
-read-only, nothing scaffolded — as its active context. The installer preserves
-the key across every re-run but never sets it, so this file is where it belongs.
+where its context registry is still empty, it adopts that directory in place as
+its active context. The installer preserves the key across every re-run but
+never sets it, so this file is where it belongs.
+
+Adopting is not read-only. The node treats the checkout as its own working tree
+and writes to it — say so to the owner, above all when the brain is a repository
+they already had (Phase 1B, option 2):
+
+- **Scaffold.** On every start it creates whatever is missing of its layout:
+  `.gitkeep` files in `.agentos/`, `agents/`, `skills/`, `memory/` and
+  `workspace/`, an empty `data/`, a placeholder `CLAUDE.md`, and
+  `.claude-plugin/plugin.json`. Existing files are never overwritten.
+- **`.gitignore`.** It appends a block headed `# --- AgentOS repo-sync …` with
+  `data/`, `.env`, `.env.*`, `.aop/`, `.claude/`, `*.pem`, `*.key`,
+  `*credential*`, `*secret*` and `.session-state.json`. The two name masks are
+  broad on purpose: a new file whose *name* contains `secret` or `credential`
+  (`notes-secret-santa.md` included) is silently never added. The save also
+  matches those words anywhere in a path, case-insensitively, and unstages such
+  a path even when it is already tracked — so the next save of a changed
+  `docs/Secrets.md` removes it from the repository (it stays on disk). A `!`
+  exception in `.gitignore` does not override that; renaming the file does.
+- **Commit and push to `main`.** About a minute after the tree goes quiet the
+  node commits everything it finds as `agentos: save <timestamp> (<n> files)`,
+  author `AgentOS <agent@agentos.local>` unless a GitHub App identity is set,
+  and pushes it to the tracked branch — with whatever credentials the checkout
+  already has, i.e. the token `--repo` cloned with. The first such commit is the
+  scaffold above. From then on anyone else pushing to that branch from
+  another clone gets `! [rejected] main -> main (fetch first)`: pull, then push.
+
+To see what it did: `git -C <install-dir>/repos/<name> log -3` for the
+commits, and `git check-ignore -v <path>` for why a file is not tracked. To stop
+the commits and pushes without uninstalling, run
+`agentos ctl settings set sync.contextAutoSave false` once the node is up: the
+node then leaves its changes uncommitted in the checkout and pushes nothing.
+That does not undo a save that already happened, and the scaffold and the
+`.gitignore` lines are still written to the working tree on every start; if the
+owner's repository must stay exactly as it is, give the node a repository of
+its own instead (Phase 1B, option 1).
 
 Set `AGENTOS_REPO_DIR` to `<install-dir>/repos/<name>`, where `<name>` is the
 repository name from Phase 1B with no `.git` — that is exactly where `--repo`
