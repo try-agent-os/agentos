@@ -3109,6 +3109,32 @@ schema_compat_preflight() { # schema_compat_preflight <prev-tag> <target-tag> �
   die "schema-compat: refusing $tag before install — migration(s) $offenders are older than the newest migration $prev has already applied, so $tag would not boot here (SchemaCompatError). Nothing was stopped or replaced; the node stays on $prev. Not bypassed by --force; operator override: AGENTOS_SCHEMA_COMPAT_OVERRIDE=1 agentos upgrade --to $tag"
 }
 
+# Serialize restart-pause decisions with the stopped snapshot/swap window.
+# The timer's service may already be dispatched, so drain both before stopping
+# the core. Missing transient units are normal; other stop failures abort.
+EXIT_RESTART_FD=""
+hold_exit_watch_restart() {
+  stability_dir_init
+  mkdir -p "$STABILITY_DIR"
+  [ ! -L "$STABILITY_DIR/.restart-pause.lock" ] || die "unsafe restart-pause lock"
+  exec {EXIT_RESTART_FD}>"$STABILITY_DIR/.restart-pause.lock"
+  flock -w 25 "$EXIT_RESTART_FD" || die "could not hold crash-loop restart decisions"
+  local unit kind state
+  unit="${AGENTOS_SERVICE%.service}"
+  for kind in timer service; do
+    if ! systemctl_bus stop "agentos-exit-watch-restart-${unit}.${kind}"; then
+      state="$(systemctl_bus show -p LoadState --value "agentos-exit-watch-restart-${unit}.${kind}")" \
+        || die "could not inspect crash-loop restart ${kind}"
+      [ "$state" = not-found ] || die "could not cancel crash-loop restart ${kind}"
+    fi
+  done
+}
+release_exit_watch_restart() {
+  [ -n "$EXIT_RESTART_FD" ] || return 0
+  exec {EXIT_RESTART_FD}>&-
+  EXIT_RESTART_FD=""
+}
+
 systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   local to="${1:-}" manifest tag tarball sha url prev tmp_dir snap started
   local stop_epoch snap_started snap_seconds start_epoch
@@ -3217,6 +3243,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   # The silence starts HERE, not at the snapshot: this is the instant the owner
   # stops being able to reach the node, and it is the instant the next
   # upgrade's estimate has to be measured from.
+  hold_exit_watch_restart
   stop_epoch="$(date +%s)"
   systemctl_bus stop "$AGENTOS_SERVICE"
   snap_started="$(date +%s)"
@@ -3246,6 +3273,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   started=0
   # The moment the boot-failure record has to be newer than (wait_healthz).
   start_epoch="$(date +%s)"
+  release_exit_watch_restart
   if systemctl_bus start "$AGENTOS_SERVICE"; then started=1; fi
 
   if [ "$started" = 1 ] && wait_healthz "$AGENTOS_SERVICE" "$start_epoch"; then
@@ -3284,12 +3312,14 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     # dying on a bare systemctl error that reads like the tail of a rollback —
     # on 2026-09-24 that is how a node left on the new release was announced in
     # the chat as "rolled back" (ClickUp 12418agg32g).
+    hold_exit_watch_restart
     if ! systemctl_bus stop "$AGENTOS_SERVICE"; then
       die "rollback FAILED: could not stop $AGENTOS_SERVICE — nothing was restored, current still points at $tag"
     fi
     systemd_restore_sqlite "$snap"
     ln -sfn "$AGENTOS_HOME/versions/$prev" "$AGENTOS_HOME/current"
     set_env_version "$prev"
+    release_exit_watch_restart
     systemctl_bus start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
     wait_healthz "$AGENTOS_SERVICE" || die "rollback FAILED: $prev restored but ALSO unhealthy — inspect: journalctl -u $AGENTOS_SERVICE"
     # The node is back — on the OLD version, after the longest silence this path
@@ -3313,6 +3343,7 @@ systemd_rollback() { # undo the last recorded upgrade — code + database togeth
   [ -d "$AGENTOS_HOME/versions/$prev" ] || die "version dir gone: $AGENTOS_HOME/versions/$prev"
   local left; left="$(basename "$(readlink "$AGENTOS_HOME/current")")"
   step "Rolling back to $prev"
+  hold_exit_watch_restart
   systemctl_bus stop "$AGENTOS_SERVICE"
   systemd_restore_sqlite "$src"
   ln -sfn "$AGENTOS_HOME/versions/$prev" "$AGENTOS_HOME/current"
@@ -3322,6 +3353,7 @@ systemd_rollback() { # undo the last recorded upgrade — code + database togeth
   # just thrown out — the v4.41.0 return on hub and symoditi, 24.09.
   blacklist_left "$left" "$prev" rollback
   rm -f "$STABILITY_DIR/.last-upgrade" 2>/dev/null || true
+  release_exit_watch_restart
   systemctl_bus start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
   if wait_healthz "$AGENTOS_SERVICE"; then
     ok "rolled back to $prev and healthy"
@@ -3424,6 +3456,7 @@ systemd_rollback_code_only() { # systemd_rollback_code_only <to-tag|""> <expect-
   esac
 
   step "Rolling back $cur → $to (code only — data/ is not touched)"
+  hold_exit_watch_restart
   if ! systemctl_bus stop "$AGENTOS_SERVICE"; then
     [ "$auto" = 1 ] && stability_notice "$(jq -nc --arg f "${cur#v}" --arg t "${to#v}" --arg e "$episode" --arg c "$crashes" --arg d "could not stop $AGENTOS_SERVICE" \
       '{id: "rollback-failed-\($f)-\(now | floor)", kind: "rollback-failed", from: $f, to: $t, detail: $d,
@@ -3436,6 +3469,7 @@ systemd_rollback_code_only() { # systemd_rollback_code_only <to-tag|""> <expect-
   BLACKLIST_BY="${BLACKLIST_BY:-$( [ "$auto" = 1 ] && echo agentos-exit-watch || failed_actor)}" \
     blacklist_left "$cur" "$to" "$( [ "$auto" = 1 ] && echo crash-loop || echo rollback)"
   rm -f "$STABILITY_DIR/.last-upgrade" 2>/dev/null || true
+  release_exit_watch_restart
   systemctl_bus start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
   if wait_healthz "$AGENTOS_SERVICE"; then
     ok "rolled back $cur → $to (code only) and healthy"
