@@ -1,0 +1,36 @@
+name: Feature request
+description: Describe a problem or use case AgentOS could support.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue is public. Do not include tokens, API keys, passwords, .env files, private conversations, or personal data. Redact logs and screenshots before posting.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the problem you want to solve and why it matters.
+    validations:
+      required: true
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Use case
+      description: Describe who needs this and the situation in which they would use it.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Suggested solution
+      description: Optionally describe the behavior you would like to see.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or workarounds
+      description: Optionally describe what you have tried or how you handle this today.
+    validations:
+      required: false
