@@ -1,0 +1,43 @@
+name: Bug report
+description: Report a reproducible problem with AgentOS.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue is public. Do not include tokens, API keys, passwords, .env files, private conversations, or personal data. Redact logs and screenshots before posting.
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: List the steps and any prerequisites needed to reproduce the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Describe what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Describe what happened instead, including any error message with secrets removed.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include your AgentOS version (agentos version), OS, installation profile (systemd or Docker), and affected interface.
+    validations:
+      required: false
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Additional context
+      description: Optionally include redacted logs or screenshots. Remove secrets and personal data before attaching anything.
+    validations:
+      required: false

@@ -184,6 +184,15 @@ up healthy. The installer has no such snapshot, so it stays out of that business
 unless you pass `--upgrade` (which hands the version change to `agentos upgrade`
 anyway, backup and all).
 
+## Feedback
+
+Found a bug or have a feature request? [Open an issue](https://github.com/try-agent-os/agentos/issues/new/choose)
+and choose **Bug report** or **Feature request**.
+
+Issues are public. Do not post tokens, API keys, passwords, `.env` files,
+private conversations, or personal data. Redact logs and screenshots before
+sharing them.
+
 ## Releases
 
 [Releases](https://github.com/try-agent-os/agentos/releases) carry the
