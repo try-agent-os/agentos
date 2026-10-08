@@ -1,0 +1,52 @@
+name: node-notes
+
+# Read-only checks of the node-notes/ layer (format: node-notes/README.md).
+# A merged main is the publication of the notes, so everything that decides
+# whether a note may land runs here, on the pull request AND on the push to
+# main. No path filter: a required check that does not run is a pending check.
+# No write permission and no secrets: this workflow can not publish anything.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  node-notes:
+    name: node-notes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # The author gate diffs base...head and reads AUTHORS from the base;
+          # min_core is compared with the highest v* tag. Both need history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Self-test of the checker
+        run: python3 .github/test-node-notes.py
+
+      - name: Notes, limits and the committed bundle
+        run: python3 .github/node-notes.py check
+
+      - name: Author is listed in AUTHORS of the pull-request base
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          # Run the BASE commit's copy of the checker: the pull request must
+          # not be able to rewrite the rule that judges its own author. Only
+          # the very first pull request (no checker in the base) uses its own.
+          gate="$RUNNER_TEMP/node-notes-base.py"
+          if git cat-file -e "$BASE_SHA:.github/node-notes.py" 2>/dev/null; then
+            git show "$BASE_SHA:.github/node-notes.py" > "$gate"
+          else
+            cp .github/node-notes.py "$gate"
+          fi
+          python3 -I "$gate" authors --base "$BASE_SHA" --head "$HEAD_SHA" --author "$PR_AUTHOR"

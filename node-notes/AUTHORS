@@ -1,0 +1,4 @@
+# GitHub logins allowed to change node-notes/ (and its checker).
+# The pull-request gate reads this file from the BASE of the pull request,
+# so a pull request cannot add its own author. One login per line.
+k-vasily
