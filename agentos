@@ -48,6 +48,10 @@ info() { echo -e "  ${DIM}$*${NC}"; }
 ok()   { echo -e "  ${GREEN}✓${NC} $*"; }
 warn() { echo -e "  ${YELLOW}!${NC} $*"; }
 die()  { echo "agentos: $*" >&2; exit 1; }
+# The name of THIS install's CLI on PATH: `agentos` for the default slot,
+# `agentos-<name>` for a named (--user) instance (its wrapper pins
+# AGENTOS_SERVICE). Used in the commands a refusal tells a person to run.
+cli_name() { if [ "$AGENTOS_SERVICE" = agentos ]; then printf 'agentos'; else printf '%s' "$AGENTOS_SERVICE"; fi; }
 
 detect_mode() {
   if [ -L "$AGENTOS_HOME/current" ]; then echo systemd
@@ -818,6 +822,241 @@ reconcile_secret_reader_acls() {
     fi
     ok "secret reader ${u}: rX on ${secrets_dir} (+ traverse on ${AGENTOS_HOME})"
   done <<< "$readers"
+}
+
+# ─── usage-group: the shared usage-sampler store's root-owned half ───────────
+#
+# Contours that share ONE subscription account can share one usage-sampler
+# schedule, but only through a store every one of them can reach: os.tmpdir() is
+# private under PrivateTmp=yes, so the core looks for the fixed root
+# /var/lib/agentos-shared/usage-sampler (root:<group> 3770) and uses it when its
+# process is a member of that root's group (12418aggu5w). The core never creates
+# or repairs that root — it is root-owned, and THIS is the root path that lays it
+# down (spec 2026-09-27-usage-sampler-shared-store §4, ClickUp 12418aggu5x).
+#
+# The decision is DECLARED, never inferred: one line, the group name, in
+# /var/lib/<service>/usage-group, root:root 0644 in a root-owned directory —
+# outside the install root the core can rewrite, because a process that could
+# write it could join any group on the host. `install.sh --usage-group <g>`
+# writes it; on an existing node a fleet admin does. install.sh AND both exits of
+# `agentos upgrade` ("already at" and a healthy new release) run the reconcile:
+#
+#   1. the declaration and every component of its path are checked (no symlink,
+#      root-owned, nobody else can write them); a bad one is REFUSED, never fixed;
+#   2. the system group is created if missing, /var/lib/agentos-shared root:root
+#      0755 and the usage root root:<g> 3770 if missing — an existing root is never
+#      changed: one owned by ANOTHER group is an explicit refusal (one fixed root
+#      cannot belong to two groups, so no chgrp), one with a wrong mode is refused;
+#   3. only our own drop-in, <service>.service.d/50-usage-group.conf, carries
+#      SupplementaryGroups=<g> (systemd adds such lists across drop-ins, so no
+#      other setting of the unit is touched); daemon-reload only when it changed;
+#   4. with the declaration gone, only that drop-in is removed — the root and the
+#      group stay for the other members — and a membership granted some OTHER way
+#      (/etc/group, primary group) is named, because removing the drop-in does not
+#      revoke it.
+#
+# It NEVER restarts the unit: a process keeps the groups it started with, so a
+# change is reported as "restart required" both when access is added and when
+# it is removed, and the operator restarts each node (`agentos restart`).
+#
+# The function bodies below are identical in install.sh and scripts/agentos
+# (install.sh arrives by curl, the CLI ships in the release); the suite
+# scripts/tests/usage-group.test.sh fails the moment they drift.
+# AGENTOS_USAGE_ROOT_UID is that suite's seam for "owned by root" (it runs
+# without root); never set in production.
+usage_group_root_uid() { printf '%s' "${AGENTOS_USAGE_ROOT_UID:-0}"; }
+
+usage_group_name_ok() { # usage_group_name_ok <name> -> 0 for a plain system group name
+  case "$1" in
+    ''|*[!a-z0-9_-]*|[!a-z_]*) return 1 ;;
+  esac
+  [ "${#1}" -le 32 ]
+}
+
+usage_group_owner_ok() { # usage_group_owner_ok <uid> -> 0 when that uid is root (or the suite's stand-in)
+  [ "$1" = 0 ] || [ "$1" = "$(usage_group_root_uid)" ]
+}
+
+usage_group_trusted_path() { # usage_group_trusted_path <path> <label> -> 0 when <path> and every parent are root-owned, real and not writable by others
+  local p="$1" st uid mode
+  while :; do
+    if [ -L "$p" ]; then
+      warn "usage-group: refusing ${2}: ${p} is a symlink — nothing was changed"
+      return 1
+    fi
+    st="$(${SUDO:-} stat -c '%u %a' "$p" 2>/dev/null)" || { warn "usage-group: refusing ${2}: cannot stat ${p}"; return 1; }
+    uid="${st%% *}"; mode="${st##* }"
+    if ! usage_group_owner_ok "$uid"; then
+      warn "usage-group: refusing ${2}: ${p} is owned by uid ${uid}, not root — nothing was changed"
+      return 1
+    fi
+    # Writable by group/other is only tolerable on a sticky root-owned dir (/tmp).
+    if [ $(( 8#$mode & 8#022 )) -ne 0 ] && [ $(( 8#$mode & 8#1000 )) -eq 0 ]; then
+      warn "usage-group: refusing ${2}: ${p} is writable by others (mode ${mode}) — nothing was changed"
+      return 1
+    fi
+    [ "$p" = / ] && return 0
+    p="$(dirname "$p")"
+  done
+}
+
+usage_group_read_declaration() { # usage_group_read_declaration <file> -> sets USAGE_GROUP_DECLARED; 1 when refused
+  # A global, not stdout: the refusals below are warn lines the operator must
+  # SEE, and a $(...) capture would swallow them.
+  local f="$1" st uid mode body
+  USAGE_GROUP_DECLARED=""
+  usage_group_trusted_path "$(dirname "$f")" "the usage-group declaration" || return 1
+  if [ -L "$f" ] || ! ${SUDO:-} test -f "$f"; then
+    warn "usage-group: refusing the declaration ${f}: not a regular file — nothing was changed"
+    return 1
+  fi
+  st="$(${SUDO:-} stat -c '%u %a' "$f" 2>/dev/null)" || { warn "usage-group: cannot stat ${f}"; return 1; }
+  uid="${st%% *}"; mode="${st##* }"
+  if ! usage_group_owner_ok "$uid" || [ $(( 8#$mode & 8#022 )) -ne 0 ]; then
+    warn "usage-group: refusing the declaration ${f}: owned by uid ${uid}, mode ${mode} — it must be root-owned and writable by root alone"
+    return 1
+  fi
+  # nofollow makes the -L check above binding; 256 bytes is plenty for one name.
+  body="$(${SUDO:-} dd if="$f" iflag=nofollow bs=256 count=1 status=none 2>/dev/null)" \
+    || { warn "usage-group: cannot read ${f} without following links"; return 1; }
+  # Exactly one line: the name, optionally newline-terminated. $(...) strips the
+  # trailing newlines, so any newline left inside means a second line.
+  case "$body" in
+    *$'\n'*) warn "usage-group: refusing the declaration ${f}: more than one line"; return 1 ;;
+  esac
+  if ! usage_group_name_ok "$body"; then
+    warn "usage-group: refusing the declaration ${f}: '${body}' is not a group name ([a-z_][a-z0-9_-]*, at most 32)"
+    return 1
+  fi
+  USAGE_GROUP_DECLARED="$body"
+}
+
+usage_group_dropin_body() { # usage_group_dropin_body <group>
+  printf '%s\n' \
+    "# Managed by agentos (usage-group reconcile, /var/lib/<service>/usage-group)." \
+    "# Edits are overwritten; remove the declaration and upgrade to drop it." \
+    "[Service]" \
+    "SupplementaryGroups=$1"
+}
+
+usage_group_foreign_membership() { # usage_group_foreign_membership <group> <account> -> warns when <account> is in <group> by other means
+  local g="$1" acct="$2" ent members pgid
+  ent="$(getent group "$g" 2>/dev/null)" || return 0
+  members=",$(printf '%s' "$ent" | cut -d: -f4),"
+  case "$members" in
+    *",${acct},"*) warn "usage-group: ${acct} is still listed in group ${g} (/etc/group) — removing the drop-in does NOT revoke that; drop it with \`gpasswd -d ${acct} ${g}\` if access must end" ;;
+  esac
+  pgid="$(getent passwd "$acct" 2>/dev/null | cut -d: -f4)"
+  if [ -n "$pgid" ] && [ "$pgid" = "$(printf '%s' "$ent" | cut -d: -f3)" ]; then
+    warn "usage-group: ${g} is ${acct}'s PRIMARY group — removing the drop-in does NOT revoke access"
+  fi
+  return 0
+}
+
+reconcile_usage_group() { # reconcile_usage_group <state-root> <units-dir> <service> <account> -> 0 done/nothing to do, 1 refused
+  local state_root="$1" units="$2" svc="$3" acct="$4"
+  local decl="${state_root}/${svc}/usage-group"
+  local shared="${state_root}/agentos-shared" root="${state_root}/agentos-shared/usage-sampler"
+  local ddir="${units}/${svc}.service.d" conf="${units}/${svc}.service.d/50-usage-group.conf"
+  local g gid st uid rgid mode want have old tmp
+  local marker="# Managed by agentos (usage-group reconcile"
+
+  # ── no declaration: take back only what we put there ──
+  if [ ! -e "$decl" ] && [ ! -L "$decl" ]; then
+    [ -e "$conf" ] || [ -L "$conf" ] || return 0
+    if [ -L "$conf" ] || ! ${SUDO:-} test -f "$conf" \
+       || ! ${SUDO:-} grep -qF "$marker" "$conf" 2>/dev/null; then
+      warn "usage-group: ${conf} is not the drop-in this reconcile writes — left in place"
+      return 1
+    fi
+    old="$(${SUDO:-} sed -n '/^SupplementaryGroups=/{s///p;q;}' "$conf" 2>/dev/null)"
+    ${SUDO:-} rm -f "$conf" || { warn "usage-group: could not remove ${conf}"; return 1; }
+    ${SUDO:-} systemctl daemon-reload || warn "usage-group: daemon-reload failed; the change applies on next boot"
+    ok "usage-group: declaration removed — dropped ${conf}; the shared root and group stay for the other members"
+    [ -n "$old" ] && usage_group_foreign_membership "$old" "$acct"
+    warn "usage-group: restart required — ${svc} keeps group ${old:-?} until \`systemctl restart ${svc}\`"
+    return 0
+  fi
+
+  # ── 1. the declaration ──
+  usage_group_read_declaration "$decl" || return 1
+  g="$USAGE_GROUP_DECLARED"
+
+  # ── 2. group, shared parent, usage root ──
+  if ! getent group "$g" >/dev/null 2>&1; then
+    ${SUDO:-} groupadd --system "$g" || { warn "usage-group: could not create system group ${g}"; return 1; }
+    ok "usage-group: created system group ${g}"
+  fi
+  gid="$(getent group "$g" 2>/dev/null | cut -d: -f3)"
+  [ -n "$gid" ] || { warn "usage-group: group ${g} has no gid"; return 1; }
+
+  usage_group_trusted_path "$state_root" "the shared usage root's parent" || return 1
+  if [ -L "$shared" ]; then
+    warn "usage-group: refusing ${shared}: it is a symlink — nothing was changed"
+    return 1
+  elif [ -e "$shared" ]; then
+    ${SUDO:-} test -d "$shared" || { warn "usage-group: refusing ${shared}: not a directory"; return 1; }
+    usage_group_trusted_path "$shared" "the shared directory" || return 1
+  else
+    ${SUDO:-} mkdir -m 0755 "$shared" || { warn "usage-group: could not create ${shared}"; return 1; }
+    ${SUDO:-} chown root:root "$shared" 2>/dev/null || true
+  fi
+
+  if [ -L "$root" ]; then
+    warn "usage-group: refusing ${root}: it is a symlink — nothing was changed"
+    return 1
+  elif [ -e "$root" ]; then
+    ${SUDO:-} test -d "$root" || { warn "usage-group: refusing ${root}: not a directory"; return 1; }
+    st="$(${SUDO:-} stat -c '%u %g %a' "$root" 2>/dev/null)" || { warn "usage-group: cannot stat ${root}"; return 1; }
+    uid="${st%% *}"; rgid="$(printf '%s' "$st" | cut -d' ' -f2)"; mode="${st##* }"
+    if ! usage_group_owner_ok "$uid"; then
+      warn "usage-group: refusing ${root}: owned by uid ${uid}, not root — nothing was changed"
+      return 1
+    fi
+    if [ "$rgid" != "$gid" ]; then
+      warn "usage-group: REFUSED — ${root} belongs to gid ${rgid}, but this node declares ${g} (gid ${gid}). One fixed root cannot belong to two groups; nothing was chgrp'ed. Declare the root's group or leave this node out"
+      return 1
+    fi
+    if [ "$mode" != 3770 ]; then
+      warn "usage-group: refusing ${root}: mode ${mode}, expected 3770 — not repaired; the core will not trust it either"
+      return 1
+    fi
+  else
+    # 0700 first, group and mode after: never a moment with the wrong group on an open dir.
+    ${SUDO:-} mkdir -m 0700 "$root" || { warn "usage-group: could not create ${root}"; return 1; }
+    ${SUDO:-} chown "root:${g}" "$root" || { warn "usage-group: could not hand ${root} to group ${g}"; return 1; }
+    ${SUDO:-} chmod 3770 "$root" || { warn "usage-group: could not set mode 3770 on ${root}"; return 1; }
+    ok "usage-group: created ${root} root:${g} 3770"
+  fi
+
+  # ── 3. our drop-in ──
+  if [ -L "$ddir" ] || { [ -e "$ddir" ] && ! ${SUDO:-} test -d "$ddir"; }; then
+    warn "usage-group: refusing ${ddir}: not a plain directory — nothing was changed"
+    return 1
+  fi
+  if [ -L "$conf" ] || { [ -e "$conf" ] && ! ${SUDO:-} test -f "$conf"; }; then
+    warn "usage-group: refusing ${conf}: not a regular file — nothing was changed"
+    return 1
+  fi
+  want="$(usage_group_dropin_body "$g")"
+  have=""
+  [ -e "$conf" ] && have="$(${SUDO:-} cat "$conf" 2>/dev/null || true)"
+  if [ "$have" = "$want" ]; then
+    ok "usage-group: ${svc} is in group ${g} (drop-in current, nothing reloaded)"
+    return 0
+  fi
+  ${SUDO:-} mkdir -p "$ddir" || { warn "usage-group: could not create ${ddir}"; return 1; }
+  tmp="${ddir}/.50-usage-group.conf.$$"
+  if ! printf '%s\n' "$want" | ${SUDO:-} bash -c 'umask 022; set -C; exec cat > "$1"' _ "$tmp" 2>/dev/null \
+     || ! ${SUDO:-} mv -f -T "$tmp" "$conf"; then
+    ${SUDO:-} rm -f "$tmp" 2>/dev/null || true
+    warn "usage-group: could not write ${conf}"
+    return 1
+  fi
+  ${SUDO:-} systemctl daemon-reload || warn "usage-group: daemon-reload failed; the change applies on next boot"
+  ok "usage-group: ${conf} -> SupplementaryGroups=${g}"
+  warn "usage-group: restart required — ${svc} joins group ${g} only at its next start (\`systemctl restart ${svc}\`); until then it keeps its private store"
+  return 0
 }
 
 # ─── the GitHub CLI on a systemd host ───────────────────────────────────────
@@ -3160,6 +3399,8 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     # much as any other. Idempotent: unchanged units mean no daemon-reload.
     reconcile_units "$AGENTOS_HOME/current/profiles" || warn "unit reconciliation hit a snag"
     reconcile_secret_reader_acls || warn "secret-reader ACL reconciliation hit a snag"
+    reconcile_usage_group "${AGENTOS_STATE_ROOT:-/var/lib}" "${AGENTOS_UNITS_DIR:-/etc/systemd/system}" "$AGENTOS_SERVICE" "$AGENTOS_ACCOUNT" \
+      || warn "usage-group reconciliation refused (see above) — the node keeps its private usage store"
     reconcile_gh || warn "gh reconciliation hit a snag"
     # Written, but the running core still has the environment it booted with, so
     # say what makes it count rather than restarting a healthy node unasked.
@@ -3292,6 +3533,8 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     # undoes an upgrade that is already healthy.
     reconcile_units "$AGENTOS_HOME/current/profiles" || warn "unit reconciliation hit a snag"
     reconcile_secret_reader_acls || warn "secret-reader ACL reconciliation hit a snag"
+    reconcile_usage_group "${AGENTOS_STATE_ROOT:-/var/lib}" "${AGENTOS_UNITS_DIR:-/etc/systemd/system}" "$AGENTOS_SERVICE" "$AGENTOS_ACCOUNT" \
+      || warn "usage-group reconciliation refused (see above) — the node keeps its private usage store"
     reconcile_gh || warn "gh reconciliation hit a snag"
     prune_versions
   else
@@ -4169,7 +4412,7 @@ cmd_manual_upgrade() {
         die "refusing upgrade request ${raw}: its rollout is HALTED (${ROLLOUT_REASON:-no reason given}; by ${ROLLOUT_BY:-?} at ${ROLLOUT_AT:-?}). No ring installs it." ;;
       awaiting-promotion)
         write_upgrade_result failed-no-rollback "$cur" "${raw#v}" "awaiting-promotion"
-        die "refusing upgrade request ${raw}: this node is on the fleet ring and ${raw} is not promoted yet (${ROLLOUT_WHY}). It installs by itself once the canaries vouch for it; to put it everywhere now, promote it: gh workflow run promote.yml -R ${DIST_REPO} -f tag=${raw} -f action=promote" ;;
+        die "refusing upgrade request ${raw}: this node is on the fleet ring and ${raw} is not promoted yet (${ROLLOUT_WHY}). It installs by itself once the canaries vouch for it; to put it everywhere now, promote it: gh workflow run promote.yml -R ${DIST_REPO} -f tag=${raw} -f action=promote; to take it on this node only, as root on the machine: sudo $(cli_name) upgrade --to ${raw}" ;;
     esac
   fi
 
@@ -4826,6 +5069,17 @@ agentos — operate an AgentOS Core node
   status | logs [n] | version
 EOF
 }
+
+# Test hook: run the REAL reconcile_usage_group against a sandbox state root and
+# units dir (AGENTOS_STATE_ROOT / AGENTOS_UNITS_DIR) with whatever getent/groupadd/
+# systemctl the caller put on $PATH, then print its exit code. Driven by
+# scripts/tests/usage-group.test.sh — no root, no systemd.
+if [ -n "${AGENTOS_PRINT_USAGE_GROUP_RECONCILE:-}" ]; then
+  _ug_rc=0
+  reconcile_usage_group "${AGENTOS_STATE_ROOT:-/var/lib}" "${AGENTOS_UNITS_DIR:-/etc/systemd/system}" "$AGENTOS_SERVICE" "$AGENTOS_ACCOUNT" || _ug_rc=$?
+  echo "rc=${_ug_rc}"
+  exit 0
+fi
 
 # Test hook, the CLI half of install.sh's AGENTOS_PRINT_GH_PLAN: run the REAL
 # reconcile_gh against whatever `gh`/`apt-get`/`curl`/`dpkg`/`tee` the caller put

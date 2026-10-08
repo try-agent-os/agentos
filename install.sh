@@ -24,17 +24,25 @@
 #                              name several, in any mix. Omit it entirely and the node is UNCLAIMED:
 #                              the first person who DMs the bot becomes its admin — once, no time
 #                              limit. (Else: prompt, or $TELEGRAM_ADMIN_USER_IDS.)
+#   (no HTTPS flag)            On a FRESH install of the default instance: automatic. A host with its own
+#                              public IP and free 80/443 gets <ip-with-dashes>.sslip.io via Caddy + real
+#                              certs (no DNS record needed); anything else (NAT, a laptop, no certificate
+#                              in ~2 min) gets a Cloudflare quick tunnel — a trial mode, the address
+#                              changes when the tunnel restarts; if neither works, bot only. A re-run or
+#                              a named instance (--user) keeps the old behaviour: bot only unless asked.
+#   --auto-https               The automatic choice above, also on a re-run or a named instance.
 #   --domain <host>            HTTPS via Caddy + real certs. Needs an A record → this host, 80+443 open.
 #   --tunnel-token <token>     HTTPS via a named Cloudflare tunnel. No open ports needed. (Docker mode.)
-#   --quick                    HTTPS via a throwaway trycloudflare hostname. Demo only. (Docker mode.)
+#   --quick                    HTTPS via a throwaway trycloudflare hostname. Demo only. (Selects Docker
+#                              mode unless --no-docker is given.)
 #   --no-https                 Bot only. No Mini App button (the bot itself is fully functional).
 #   --docker                   Run the node as a Docker container instead of the default systemd
 #                              service. Required for --tunnel-token/--quick/--channel/--image, and for
 #                              any host that is not x86_64 + apt. Implied by those flags.
 #   --no-docker                The DEFAULT (bare-metal systemd unit, no Docker daemon) — still accepted
 #                              so existing command lines keep working. Needs x86_64 + apt (Debian 12 /
-#                              Ubuntu 24.04); --tunnel-token/--quick are not supported in this mode yet
-#                              — use --domain or --no-https.
+#                              Ubuntu 24.04); --tunnel-token is not supported in this mode yet — use
+#                              --domain, --quick or --no-https.
 #   --dir <path>               Install root. Default /opt/<user>.
 #   --user <name>              Unix service account to run the node as. Default agentos. Everything
 #                              else keys off it, so a second instance on the same host is just a
@@ -80,6 +88,12 @@
 #                              install AND every re-run, and the grant is remembered in
 #                              /var/lib/<service>/secret-readers (root-owned) so the auto-updater keeps
 #                              it without the flag. Repeatable. systemd-mode only. Requires `acl`.
+#   --usage-group <group>      Join this node to the shared usage-sampler store of contours on ONE
+#                              subscription account: declares <group> in /var/lib/<service>/usage-group
+#                              (root-owned), creates the system group and /var/lib/agentos-shared/
+#                              usage-sampler (root:<group> 3770) and adds SupplementaryGroups=<group> in
+#                              the unit's own drop-in. Re-applied by every `agentos upgrade`; remove the
+#                              declaration file and upgrade to leave. systemd-mode only.
 #
 # TWO NODES ON ONE HOST: same install, twice, with a different --user/--port and
 # its own .env — that is the whole story. Nothing is shared between instances
@@ -151,6 +165,7 @@ SECRET_READERS=()                           # --secret-reader, repeatable: host 
 if [ -n "${AGENTOS_SECRET_READERS:-}" ]; then # space/comma list also accepted via env
   IFS=', ' read -r -a SECRET_READERS <<< "${AGENTOS_SECRET_READERS}"
 fi
+USAGE_GROUP="${AGENTOS_USAGE_GROUP:-}"      # --usage-group: system group of the shared usage-sampler store (declared in /var/lib/<service>/usage-group)
 COMPOSE_FILE="docker-compose.node.yml"
 INSTALL_MODE=""                  # docker | systemd; empty → resolved after args (default: systemd)
 # Prefix for the absolute HOST paths the auto-update channel writes OUTSIDE the
@@ -259,6 +274,541 @@ plain_dir_ok() { # plain_dir_ok <path> <label> -> 0 when it is safe to create/ch
   return 1
 }
 
+# ─── usage-group: the shared usage-sampler store's root-owned half ───────────
+#
+# Contours that share ONE subscription account can share one usage-sampler
+# schedule, but only through a store every one of them can reach: os.tmpdir() is
+# private under PrivateTmp=yes, so the core looks for the fixed root
+# /var/lib/agentos-shared/usage-sampler (root:<group> 3770) and uses it when its
+# process is a member of that root's group (12418aggu5w). The core never creates
+# or repairs that root — it is root-owned, and THIS is the root path that lays it
+# down (spec 2026-09-27-usage-sampler-shared-store §4, ClickUp 12418aggu5x).
+#
+# The decision is DECLARED, never inferred: one line, the group name, in
+# /var/lib/<service>/usage-group, root:root 0644 in a root-owned directory —
+# outside the install root the core can rewrite, because a process that could
+# write it could join any group on the host. `install.sh --usage-group <g>`
+# writes it; on an existing node a fleet admin does. install.sh AND both exits of
+# `agentos upgrade` ("already at" and a healthy new release) run the reconcile:
+#
+#   1. the declaration and every component of its path are checked (no symlink,
+#      root-owned, nobody else can write them); a bad one is REFUSED, never fixed;
+#   2. the system group is created if missing, /var/lib/agentos-shared root:root
+#      0755 and the usage root root:<g> 3770 if missing — an existing root is never
+#      changed: one owned by ANOTHER group is an explicit refusal (one fixed root
+#      cannot belong to two groups, so no chgrp), one with a wrong mode is refused;
+#   3. only our own drop-in, <service>.service.d/50-usage-group.conf, carries
+#      SupplementaryGroups=<g> (systemd adds such lists across drop-ins, so no
+#      other setting of the unit is touched); daemon-reload only when it changed;
+#   4. with the declaration gone, only that drop-in is removed — the root and the
+#      group stay for the other members — and a membership granted some OTHER way
+#      (/etc/group, primary group) is named, because removing the drop-in does not
+#      revoke it.
+#
+# It NEVER restarts the unit: a process keeps the groups it started with, so a
+# change is reported as "restart required" both when access is added and when
+# it is removed, and the operator restarts each node (`agentos restart`).
+#
+# The function bodies below are identical in install.sh and scripts/agentos
+# (install.sh arrives by curl, the CLI ships in the release); the suite
+# scripts/tests/usage-group.test.sh fails the moment they drift.
+# AGENTOS_USAGE_ROOT_UID is that suite's seam for "owned by root" (it runs
+# without root); never set in production.
+usage_group_root_uid() { printf '%s' "${AGENTOS_USAGE_ROOT_UID:-0}"; }
+
+usage_group_name_ok() { # usage_group_name_ok <name> -> 0 for a plain system group name
+  case "$1" in
+    ''|*[!a-z0-9_-]*|[!a-z_]*) return 1 ;;
+  esac
+  [ "${#1}" -le 32 ]
+}
+
+usage_group_owner_ok() { # usage_group_owner_ok <uid> -> 0 when that uid is root (or the suite's stand-in)
+  [ "$1" = 0 ] || [ "$1" = "$(usage_group_root_uid)" ]
+}
+
+usage_group_trusted_path() { # usage_group_trusted_path <path> <label> -> 0 when <path> and every parent are root-owned, real and not writable by others
+  local p="$1" st uid mode
+  while :; do
+    if [ -L "$p" ]; then
+      warn "usage-group: refusing ${2}: ${p} is a symlink — nothing was changed"
+      return 1
+    fi
+    st="$(${SUDO:-} stat -c '%u %a' "$p" 2>/dev/null)" || { warn "usage-group: refusing ${2}: cannot stat ${p}"; return 1; }
+    uid="${st%% *}"; mode="${st##* }"
+    if ! usage_group_owner_ok "$uid"; then
+      warn "usage-group: refusing ${2}: ${p} is owned by uid ${uid}, not root — nothing was changed"
+      return 1
+    fi
+    # Writable by group/other is only tolerable on a sticky root-owned dir (/tmp).
+    if [ $(( 8#$mode & 8#022 )) -ne 0 ] && [ $(( 8#$mode & 8#1000 )) -eq 0 ]; then
+      warn "usage-group: refusing ${2}: ${p} is writable by others (mode ${mode}) — nothing was changed"
+      return 1
+    fi
+    [ "$p" = / ] && return 0
+    p="$(dirname "$p")"
+  done
+}
+
+usage_group_read_declaration() { # usage_group_read_declaration <file> -> sets USAGE_GROUP_DECLARED; 1 when refused
+  # A global, not stdout: the refusals below are warn lines the operator must
+  # SEE, and a $(...) capture would swallow them.
+  local f="$1" st uid mode body
+  USAGE_GROUP_DECLARED=""
+  usage_group_trusted_path "$(dirname "$f")" "the usage-group declaration" || return 1
+  if [ -L "$f" ] || ! ${SUDO:-} test -f "$f"; then
+    warn "usage-group: refusing the declaration ${f}: not a regular file — nothing was changed"
+    return 1
+  fi
+  st="$(${SUDO:-} stat -c '%u %a' "$f" 2>/dev/null)" || { warn "usage-group: cannot stat ${f}"; return 1; }
+  uid="${st%% *}"; mode="${st##* }"
+  if ! usage_group_owner_ok "$uid" || [ $(( 8#$mode & 8#022 )) -ne 0 ]; then
+    warn "usage-group: refusing the declaration ${f}: owned by uid ${uid}, mode ${mode} — it must be root-owned and writable by root alone"
+    return 1
+  fi
+  # nofollow makes the -L check above binding; 256 bytes is plenty for one name.
+  body="$(${SUDO:-} dd if="$f" iflag=nofollow bs=256 count=1 status=none 2>/dev/null)" \
+    || { warn "usage-group: cannot read ${f} without following links"; return 1; }
+  # Exactly one line: the name, optionally newline-terminated. $(...) strips the
+  # trailing newlines, so any newline left inside means a second line.
+  case "$body" in
+    *$'\n'*) warn "usage-group: refusing the declaration ${f}: more than one line"; return 1 ;;
+  esac
+  if ! usage_group_name_ok "$body"; then
+    warn "usage-group: refusing the declaration ${f}: '${body}' is not a group name ([a-z_][a-z0-9_-]*, at most 32)"
+    return 1
+  fi
+  USAGE_GROUP_DECLARED="$body"
+}
+
+usage_group_dropin_body() { # usage_group_dropin_body <group>
+  printf '%s\n' \
+    "# Managed by agentos (usage-group reconcile, /var/lib/<service>/usage-group)." \
+    "# Edits are overwritten; remove the declaration and upgrade to drop it." \
+    "[Service]" \
+    "SupplementaryGroups=$1"
+}
+
+usage_group_foreign_membership() { # usage_group_foreign_membership <group> <account> -> warns when <account> is in <group> by other means
+  local g="$1" acct="$2" ent members pgid
+  ent="$(getent group "$g" 2>/dev/null)" || return 0
+  members=",$(printf '%s' "$ent" | cut -d: -f4),"
+  case "$members" in
+    *",${acct},"*) warn "usage-group: ${acct} is still listed in group ${g} (/etc/group) — removing the drop-in does NOT revoke that; drop it with \`gpasswd -d ${acct} ${g}\` if access must end" ;;
+  esac
+  pgid="$(getent passwd "$acct" 2>/dev/null | cut -d: -f4)"
+  if [ -n "$pgid" ] && [ "$pgid" = "$(printf '%s' "$ent" | cut -d: -f3)" ]; then
+    warn "usage-group: ${g} is ${acct}'s PRIMARY group — removing the drop-in does NOT revoke access"
+  fi
+  return 0
+}
+
+reconcile_usage_group() { # reconcile_usage_group <state-root> <units-dir> <service> <account> -> 0 done/nothing to do, 1 refused
+  local state_root="$1" units="$2" svc="$3" acct="$4"
+  local decl="${state_root}/${svc}/usage-group"
+  local shared="${state_root}/agentos-shared" root="${state_root}/agentos-shared/usage-sampler"
+  local ddir="${units}/${svc}.service.d" conf="${units}/${svc}.service.d/50-usage-group.conf"
+  local g gid st uid rgid mode want have old tmp
+  local marker="# Managed by agentos (usage-group reconcile"
+
+  # ── no declaration: take back only what we put there ──
+  if [ ! -e "$decl" ] && [ ! -L "$decl" ]; then
+    [ -e "$conf" ] || [ -L "$conf" ] || return 0
+    if [ -L "$conf" ] || ! ${SUDO:-} test -f "$conf" \
+       || ! ${SUDO:-} grep -qF "$marker" "$conf" 2>/dev/null; then
+      warn "usage-group: ${conf} is not the drop-in this reconcile writes — left in place"
+      return 1
+    fi
+    old="$(${SUDO:-} sed -n '/^SupplementaryGroups=/{s///p;q;}' "$conf" 2>/dev/null)"
+    ${SUDO:-} rm -f "$conf" || { warn "usage-group: could not remove ${conf}"; return 1; }
+    ${SUDO:-} systemctl daemon-reload || warn "usage-group: daemon-reload failed; the change applies on next boot"
+    ok "usage-group: declaration removed — dropped ${conf}; the shared root and group stay for the other members"
+    [ -n "$old" ] && usage_group_foreign_membership "$old" "$acct"
+    warn "usage-group: restart required — ${svc} keeps group ${old:-?} until \`systemctl restart ${svc}\`"
+    return 0
+  fi
+
+  # ── 1. the declaration ──
+  usage_group_read_declaration "$decl" || return 1
+  g="$USAGE_GROUP_DECLARED"
+
+  # ── 2. group, shared parent, usage root ──
+  if ! getent group "$g" >/dev/null 2>&1; then
+    ${SUDO:-} groupadd --system "$g" || { warn "usage-group: could not create system group ${g}"; return 1; }
+    ok "usage-group: created system group ${g}"
+  fi
+  gid="$(getent group "$g" 2>/dev/null | cut -d: -f3)"
+  [ -n "$gid" ] || { warn "usage-group: group ${g} has no gid"; return 1; }
+
+  usage_group_trusted_path "$state_root" "the shared usage root's parent" || return 1
+  if [ -L "$shared" ]; then
+    warn "usage-group: refusing ${shared}: it is a symlink — nothing was changed"
+    return 1
+  elif [ -e "$shared" ]; then
+    ${SUDO:-} test -d "$shared" || { warn "usage-group: refusing ${shared}: not a directory"; return 1; }
+    usage_group_trusted_path "$shared" "the shared directory" || return 1
+  else
+    ${SUDO:-} mkdir -m 0755 "$shared" || { warn "usage-group: could not create ${shared}"; return 1; }
+    ${SUDO:-} chown root:root "$shared" 2>/dev/null || true
+  fi
+
+  if [ -L "$root" ]; then
+    warn "usage-group: refusing ${root}: it is a symlink — nothing was changed"
+    return 1
+  elif [ -e "$root" ]; then
+    ${SUDO:-} test -d "$root" || { warn "usage-group: refusing ${root}: not a directory"; return 1; }
+    st="$(${SUDO:-} stat -c '%u %g %a' "$root" 2>/dev/null)" || { warn "usage-group: cannot stat ${root}"; return 1; }
+    uid="${st%% *}"; rgid="$(printf '%s' "$st" | cut -d' ' -f2)"; mode="${st##* }"
+    if ! usage_group_owner_ok "$uid"; then
+      warn "usage-group: refusing ${root}: owned by uid ${uid}, not root — nothing was changed"
+      return 1
+    fi
+    if [ "$rgid" != "$gid" ]; then
+      warn "usage-group: REFUSED — ${root} belongs to gid ${rgid}, but this node declares ${g} (gid ${gid}). One fixed root cannot belong to two groups; nothing was chgrp'ed. Declare the root's group or leave this node out"
+      return 1
+    fi
+    if [ "$mode" != 3770 ]; then
+      warn "usage-group: refusing ${root}: mode ${mode}, expected 3770 — not repaired; the core will not trust it either"
+      return 1
+    fi
+  else
+    # 0700 first, group and mode after: never a moment with the wrong group on an open dir.
+    ${SUDO:-} mkdir -m 0700 "$root" || { warn "usage-group: could not create ${root}"; return 1; }
+    ${SUDO:-} chown "root:${g}" "$root" || { warn "usage-group: could not hand ${root} to group ${g}"; return 1; }
+    ${SUDO:-} chmod 3770 "$root" || { warn "usage-group: could not set mode 3770 on ${root}"; return 1; }
+    ok "usage-group: created ${root} root:${g} 3770"
+  fi
+
+  # ── 3. our drop-in ──
+  if [ -L "$ddir" ] || { [ -e "$ddir" ] && ! ${SUDO:-} test -d "$ddir"; }; then
+    warn "usage-group: refusing ${ddir}: not a plain directory — nothing was changed"
+    return 1
+  fi
+  if [ -L "$conf" ] || { [ -e "$conf" ] && ! ${SUDO:-} test -f "$conf"; }; then
+    warn "usage-group: refusing ${conf}: not a regular file — nothing was changed"
+    return 1
+  fi
+  want="$(usage_group_dropin_body "$g")"
+  have=""
+  [ -e "$conf" ] && have="$(${SUDO:-} cat "$conf" 2>/dev/null || true)"
+  if [ "$have" = "$want" ]; then
+    ok "usage-group: ${svc} is in group ${g} (drop-in current, nothing reloaded)"
+    return 0
+  fi
+  ${SUDO:-} mkdir -p "$ddir" || { warn "usage-group: could not create ${ddir}"; return 1; }
+  tmp="${ddir}/.50-usage-group.conf.$$"
+  if ! printf '%s\n' "$want" | ${SUDO:-} bash -c 'umask 022; set -C; exec cat > "$1"' _ "$tmp" 2>/dev/null \
+     || ! ${SUDO:-} mv -f -T "$tmp" "$conf"; then
+    ${SUDO:-} rm -f "$tmp" 2>/dev/null || true
+    warn "usage-group: could not write ${conf}"
+    return 1
+  fi
+  ${SUDO:-} systemctl daemon-reload || warn "usage-group: daemon-reload failed; the change applies on next boot"
+  ok "usage-group: ${conf} -> SupplementaryGroups=${g}"
+  warn "usage-group: restart required — ${svc} joins group ${g} only at its next start (\`systemctl restart ${svc}\`); until then it keeps its private store"
+  return 0
+}
+
+# ─── automatic HTTPS for a newcomer with no domain (12418agh2ky) ───────────
+#
+# Telegram opens a Mini App only on a public https origin, and "go buy a domain
+# and point an A record here" is where a first install used to stop. When no
+# HTTPS flag is given on a FRESH install of the default instance (or with
+# --auto-https), the script picks the origin itself, without a question:
+#
+#   1. the host has a public IPv4 bound to one of its own interfaces (a cloud VM,
+#      not a laptop behind NAT) and :80/:443 are free  ->  <ip-with-dashes>.sslip.io
+#      through the ordinary --domain chain (Caddy + Let's Encrypt). sslip.io is a
+#      public wildcard DNS that answers 1-2-3-4.sslip.io with 1.2.3.4, so there is
+#      no record to create. A public address on a local interface is a hint, not
+#      a proof — a cloud firewall can still drop :80 — so the certificate itself
+#      is the external reachability check: the https://<name>/healthz probe runs
+#      with full TLS verification, and only a valid certificate keeps this mode.
+#   2. anything else (NAT, busy ports, no public address, or the certificate did
+#      not come — including Let's Encrypt's per-domain rate limit, which sslip.io
+#      shares with the whole internet because it is NOT on the Public Suffix
+#      List)  ->  a Cloudflare quick tunnel. Its hostname changes whenever the
+#      tunnel restarts, so it is announced as a TRIAL mode, not a production one.
+#   3. the tunnel cannot be set up either  ->  bot only, exactly as --no-https.
+#      Automatic HTTPS never fails an install: the bot works without it.
+#
+# What it never does: override an explicit flag (--domain, --tunnel-token,
+# --quick, --no-https always win), change a RE-RUN (an existing install keeps
+# whatever its flags say, as before), or touch a named instance (--user X: those
+# share the host's single Caddyfile and are wired by their contour). The manual
+# path — --domain / --no-https / your own proxy in front of 127.0.0.1:$PORT —
+# stays the fully independent last resort.
+AUTO_HTTPS=""          # "" | sslip | quick — set once HTTPS_MODE=auto is resolved
+AUTO_HTTPS_REASON=""
+AUTO_HTTPS_CADDY_FAILED=""  # 1 when caddy itself failed for the automatic sslip.io name
+
+# The host's public IPv4 as the internet sees it. Two independent echo services,
+# IPv4 forced: the sslip.io name is built from a dotted quad.
+detect_public_ip() {
+  local ip=""
+  command -v curl >/dev/null 2>&1 || return 0
+  ip="$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  [ -n "$ip" ] || ip="$(curl -4 -fsS --max-time 5 https://ifconfig.me/ip 2>/dev/null || true)"
+  printf '%s' "$ip"
+}
+
+# Every IPv4 bound to a local interface, space-separated. A public address that
+# is NOT in this list means a NAT in front of the host: inbound :80 lands on the
+# router, never here.
+host_ipv4s() {
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' '
+  elif command -v hostname >/dev/null 2>&1; then
+    hostname -I 2>/dev/null || true
+  fi
+}
+
+port_in_use() { # port_in_use <port> -> 0 when something already listens on it
+  local listeners
+  listeners="$(command -v ss >/dev/null 2>&1 && ss -ltn "( sport = :$1 )" 2>/dev/null || true)"
+  grep -q ":$1\b" <<<"$listeners"
+}
+
+is_ipv4() {
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local o
+  for o in "${BASH_REMATCH[@]:1}"; do [ "$((10#$o))" -le 255 ] || return 1; done
+}
+
+# Resolve HTTPS_MODE=auto into a concrete mode. Sets HTTPS_MODE, DOMAIN,
+# AUTO_HTTPS and AUTO_HTTPS_REASON; prints nothing. The AGENTOS_AUTO_* variables
+# replace the three probes for scripts/tests/install-https.test.sh — no network,
+# no root.
+auto_https_pick() {
+  local ip local_ips busy="" p
+  if [ -n "${AGENTOS_AUTO_PUBLIC_IP+x}" ]; then ip="$AGENTOS_AUTO_PUBLIC_IP"; else ip="$(detect_public_ip)"; fi
+  if [ -n "${AGENTOS_AUTO_LOCAL_IPS+x}" ]; then local_ips="$AGENTOS_AUTO_LOCAL_IPS"; else local_ips="$(host_ipv4s)"; fi
+  if [ -n "${AGENTOS_AUTO_BUSY_PORTS+x}" ]; then
+    busy="$AGENTOS_AUTO_BUSY_PORTS"
+  else
+    for p in 80 443; do
+      if port_in_use "$p"; then busy="${busy:+$busy }$p"; fi
+    done
+  fi
+  DOMAIN=""; TUNNEL_TOKEN=""
+  if ! is_ipv4 "$ip"; then
+    AUTO_HTTPS_REASON="no public IPv4 detected"
+  elif ! grep -qwF -- "$ip" <<<" $local_ips "; then
+    AUTO_HTTPS_REASON="public IP $ip is not on this host (NAT)"
+  elif [ -n "$busy" ]; then
+    AUTO_HTTPS_REASON="port(s) $busy already in use"
+  else
+    HTTPS_MODE="caddy"; AUTO_HTTPS="sslip"
+    DOMAIN="${ip//./-}.sslip.io"
+    AUTO_HTTPS_REASON="public IP $ip on this host, ports 80/443 free"
+    return 0
+  fi
+  HTTPS_MODE="quick"; AUTO_HTTPS="quick"
+}
+
+# Does a missing HTTPS flag mean "pick automatically" on this run? --auto-https
+# always does; no flag at all does only on a fresh install of the default
+# instance — see the block comment above.
+auto_https_applies() { # auto_https_applies <existing-install 0|1>
+  [ "$HTTPS_MODE" = "auto" ] && return 0
+  [ -z "$HTTPS_MODE" ] && [ "$1" = "0" ] && [ "$SERVICE_USER" = "agentos" ]
+}
+
+# The sslip.io name only counts once a browser would accept it: a real
+# certificate, fetched over the public name, through Caddy, to the node. Polls
+# up to ~2 minutes (ACME HTTP-01 plus the node's own boot).
+verify_auto_https() { # verify_auto_https <domain>
+  local _
+  for _ in $(seq 1 40); do
+    curl -fsS --max-time 5 -o /dev/null "https://$1/healthz" 2>/dev/null && return 0
+    sleep 3
+  done
+  return 1
+}
+
+auto_https_announce() {
+  case "$AUTO_HTTPS" in
+    sslip)
+      ok "no domain given — using ${DOMAIN} (${AUTO_HTTPS_REASON})"
+      info "sslip.io resolves that name to this host's own IP; Caddy gets a real certificate for it."
+      info "Your own domain always wins: re-run with --domain <host>. Bot only: --no-https." ;;
+    quick)
+      warn "no domain given and no direct public access (${AUTO_HTTPS_REASON}) — using a Cloudflare quick tunnel."
+      warn "TRIAL MODE: the address changes whenever the tunnel restarts (the node re-registers"
+      warn "the Mini App button each time), and Cloudflare gives it no uptime guarantee."
+      warn "For a stable Mini App: re-run with --domain <host>. Bot only: --no-https." ;;
+  esac
+}
+
+# ─── bare-metal quick tunnel (systemd mode) ─────────────────────────────────
+#
+# cloudflared from Cloudflare's signed apt repository, run as the service
+# account in its own unit next to the node. The hostname exists only once the
+# tunnel has connected and changes on every tunnel restart, so the unit's
+# ExecStartPost hook reads it from cloudflared's local metrics endpoint
+# (/quicktunnel) and writes MINIAPP_URL into the node's env file, and a second
+# ExecStartPost (as root, `+`, nothing but systemctl) restarts the node — the
+# node registers the Mini App menu button from MINIAPP_URL at boot. A reboot
+# therefore ends with a working button, not a dead URL.
+# The env-file rewrite runs as the SERVICE ACCOUNT, never as root: the account
+# owns $INSTALL_DIR, so a root mktemp/chown/chmod/mv there could be raced into
+# following its symlink (e.g. onto /etc/sudoers) — a root escalation it could
+# retry at will by killing its own cloudflared. Root keeps exactly one fixed
+# command line with no file access.
+quick_tunnel_unit() { echo "${SERVICE_NAME}-tunnel"; }
+quick_tunnel_metrics_port() { echo $((PORT + 20000)); }
+
+install_cloudflared_apt() {
+  command -v cloudflared >/dev/null 2>&1 && return 0
+  $SUDO mkdir -p --mode=0755 /usr/share/keyrings
+  curl -fsSL --max-time 30 https://pkg.cloudflare.com/cloudflare-main.gpg \
+    | $SUDO tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null || return 1
+  echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+    | $SUDO tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
+  $SUDO apt-get -o DPkg::Lock::Timeout=120 update -qq >/dev/null 2>&1 || return 1
+  $SUDO apt-get -o DPkg::Lock::Timeout=120 install -y -qq cloudflared >/dev/null 2>&1 || return 1
+  command -v cloudflared >/dev/null 2>&1
+}
+
+# Returns 0 with MINIAPP_URL set when the tunnel is up and the node knows its
+# URL; 1 (and nothing half-installed left running) when it could not be set up.
+install_quick_tunnel_systemd() {
+  local unit hook mport bin envf
+  unit="$(quick_tunnel_unit)"; mport="$(quick_tunnel_metrics_port)"
+  hook="/usr/local/lib/${SERVICE_NAME}/quick-tunnel-url"
+  envf="$INSTALL_DIR/.env"
+  step "HTTPS (Cloudflare quick tunnel)"
+  if ! install_cloudflared_apt; then
+    warn "could not install cloudflared from pkg.cloudflare.com"
+    return 1
+  fi
+  bin="$(command -v cloudflared)"
+  $SUDO mkdir -p "$(dirname "$hook")"
+  $SUDO tee "$hook" >/dev/null <<HOOK
+#!/usr/bin/env bash
+# Written by install.sh (12418agh2ky). Runs as the service account (${SERVICE_USER})
+# after ${unit} starts: reads the quick tunnel's hostname and publishes it as
+# MINIAPP_URL in the node's env file. The node restart is the unit's separate
+# root ExecStartPost. Never fails the tunnel unit.
+umask 077
+env_file='${envf}'
+host=""
+for _ in \$(seq 1 60); do
+  host="\$(curl -fsS --max-time 2 http://127.0.0.1:${mport}/quicktunnel 2>/dev/null | jq -r '.hostname // empty' 2>/dev/null || true)"
+  [ -n "\$host" ] && break
+  sleep 1
+done
+[ -n "\$host" ] || { echo "quick tunnel: no hostname after 60s" >&2; exit 0; }
+# Only a trycloudflare.com name may reach the env file (no newline, no '=').
+if ! [[ "\$host" =~ ^[a-z0-9-]+\.trycloudflare\.com\$ ]]; then
+  echo "quick tunnel: refusing unexpected hostname" >&2; exit 0
+fi
+url="https://\${host}/app"
+cur="\$(cat "\$env_file" 2>/dev/null || true)"
+old="\$(sed -n 's/^MINIAPP_URL=//p' <<<"\$cur" | tail -1)"
+[ "\$old" = "\$url" ] && exit 0
+tmp="\$(mktemp "\${env_file}.XXXXXX")" || exit 0
+{ grep -v '^MINIAPP_URL=' <<<"\$cur" || true; echo "MINIAPP_URL=\${url}"; } > "\$tmp"
+chmod 600 "\$tmp"
+mv -f "\$tmp" "\$env_file" || { rm -f "\$tmp"; exit 0; }
+echo "quick tunnel: MINIAPP_URL=\${url}"
+exit 0
+HOOK
+  $SUDO chmod 755 "$hook"
+  $SUDO tee "/etc/systemd/system/${unit}.service" >/dev/null <<UNIT
+# Written by install.sh: throwaway Cloudflare quick tunnel for the AgentOS Mini App.
+# The hostname changes on every restart; ExecStartPost republishes it.
+[Unit]
+Description=AgentOS quick tunnel (${SERVICE_NAME})
+After=network-online.target ${SERVICE_NAME}.service
+Wants=network-online.target
+
+[Service]
+User=${SERVICE_USER}
+ExecStart=${bin} tunnel --no-autoupdate --metrics 127.0.0.1:${mport} --url http://127.0.0.1:${PORT}
+ExecStartPost=${hook}
+ExecStartPost=+/bin/systemctl try-restart --no-block ${SERVICE_NAME}.service
+TimeoutStartSec=120
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable "$unit" >/dev/null 2>&1 || true
+  # restart, not `enable --now`: a re-run just rewrote the env file without
+  # MINIAPP_URL, and only a fresh tunnel start puts it back.
+  if ! $SUDO systemctl restart "$unit"; then
+    warn "the tunnel unit did not start: journalctl -u $unit"
+    remove_quick_tunnel_systemd
+    return 1
+  fi
+  MINIAPP_URL="$(read_maybe_sudo "$envf" 2>/dev/null | sed -n 's/^MINIAPP_URL=//p' | tail -1 || true)"
+  if [ -z "$MINIAPP_URL" ]; then
+    warn "the tunnel did not report a hostname — journalctl -u $unit"
+    remove_quick_tunnel_systemd
+    return 1
+  fi
+  ok "quick tunnel → ${MINIAPP_URL%/app}"
+}
+
+# A run in any other HTTPS mode leaves no tunnel behind publishing the node.
+remove_quick_tunnel_systemd() {
+  local unit; unit="$(quick_tunnel_unit)"
+  [ -e "/etc/systemd/system/${unit}.service" ] || return 0
+  $SUDO systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  $SUDO rm -f "/etc/systemd/system/${unit}.service" "/usr/local/lib/${SERVICE_NAME}/quick-tunnel-url"
+  $SUDO systemctl daemon-reload
+}
+
+# Caddy for --domain / the automatic sslip.io name. Returns 1 instead of
+# exiting under `set -e`, so an automatic choice can fall back (the caller
+# dies only for an explicit --domain).
+install_caddy_systemd() {
+  $SUDO apt-get -o DPkg::Lock::Timeout=120 install -y -qq caddy || return 1
+  # Same $SUDO-on-the-read reasoning as the unit render: this template also
+  # lives under $INSTALL_DIR (the service account's $HOME).
+  $SUDO sed -e "s/{\$AGENTOS_DOMAIN}/${DOMAIN}/" -e "s/node:8787/127.0.0.1:${PORT}/" \
+    "$INSTALL_DIR/current/profiles/docker/Caddyfile" | $SUDO tee /etc/caddy/Caddyfile >/dev/null || return 1
+  # enable as well: a host where an earlier automatic run fell back to the
+  # tunnel left caddy disabled.
+  $SUDO systemctl enable caddy >/dev/null 2>&1 || true
+  $SUDO systemctl reload caddy 2>/dev/null || $SUDO systemctl restart caddy || return 1
+}
+
+# Bare metal, after the node and Caddy are up: keep sslip.io only with a valid
+# certificate, else fall back to the tunnel, else to bot only. Each fallback
+# drops what the previous mode wrote — no Mini App button may point at an origin
+# that is not serving (12418agfwfy).
+settle_auto_https_systemd() {
+  local envf="$INSTALL_DIR/.env"
+  if [ "$AUTO_HTTPS" = "sslip" ]; then
+    if [ "$AUTO_HTTPS_CADDY_FAILED" = "1" ]; then
+      warn "Falling back to a Cloudflare quick tunnel."
+    else
+      step "Checking https://${DOMAIN} from the outside"
+      if verify_auto_https "$DOMAIN"; then
+        ok "certificate issued — the Mini App is at https://${DOMAIN}/app"
+        return 0
+      fi
+      warn "https://${DOMAIN} did not come up with a valid certificate in ~2 minutes"
+      warn "(inbound :80/:443 blocked by a cloud firewall, or the Let's Encrypt limit for sslip.io)."
+      warn "Falling back to a Cloudflare quick tunnel."
+    fi
+    $SUDO systemctl disable --now caddy >/dev/null 2>&1 || true
+    DOMAIN=""; HTTPS_MODE="quick"; AUTO_HTTPS="quick"
+    $SUDO sed -i '/^MINIAPP_URL=/d' "$envf"
+  fi
+  if [ "$HTTPS_MODE" = "quick" ]; then
+    install_quick_tunnel_systemd && return 0
+    warn "no automatic HTTPS available — continuing bot only (re-run with --domain <host> to add the Mini App)."
+    HTTPS_MODE="none"; AUTO_HTTPS=""; MINIAPP_URL=""
+    $SUDO sed -i -e '/^MINIAPP_URL=/d' -e 's/^TRUST_PROXY=.*/TRUST_PROXY=/' "$envf"
+    $SUDO systemctl restart "$SERVICE_NAME" || true
+  fi
+}
+
 # ─── args ───────────────────────────────────────────────────────────────────
 
 while [ $# -gt 0 ]; do
@@ -271,6 +821,7 @@ while [ $# -gt 0 ]; do
     --tunnel-token) TUNNEL_TOKEN="${2:?--tunnel-token needs a value}"; HTTPS_MODE="cloudflared"; shift 2 ;;
     --quick)        HTTPS_MODE="quick"; shift ;;
     --no-https)     HTTPS_MODE="none"; shift ;;
+    --auto-https)   HTTPS_MODE="auto"; shift ;;
     --docker)       INSTALL_MODE="docker"; shift ;;
     --no-docker)    INSTALL_MODE="systemd"; shift ;;
     --dir)          INSTALL_DIR="${2:?--dir needs a value}"; shift 2 ;;
@@ -282,12 +833,13 @@ while [ $# -gt 0 ]; do
     --repo)         CONTOUR_REPOS+=("${2:?--repo needs a value}"); shift 2 ;;
     --gh-token-key) GH_TOKEN_KEY="${2:?--gh-token-key needs a value}"; shift 2 ;;
     --secret-reader) SECRET_READERS+=("${2:?--secret-reader needs a value}"); shift 2 ;;
+    --usage-group)  USAGE_GROUP="${2:?--usage-group needs a value}"; shift 2 ;;
     --image)        IMAGE_REF="${2:?--image needs a value}"; IMAGE_PINNED_BY_USER=1; shift 2 ;;
     --scoped-sudo)  SUDO_SCOPE="selfmgmt"; shift ;;
     -y|--yes)       ASSUME_YES=1; shift ;;
     # Line range = the whole header block above (ends one line before
     # `set -euo pipefail`). Grow the header, grow this range, or --help truncates.
-    -h|--help)      sed -n '2,117p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,131p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              die "unknown option: $1 (try --help)" ;;
   esac
 done
@@ -316,6 +868,20 @@ if [ -n "${AGENTOS_PRINT_HTTPS:-}" ]; then
   exit 0
 fi
 
+# "What would the automatic choice pick here?" — auto_https_applies with the
+# existing-install bit from AGENTOS_AUTO_EXISTING (default 0), then
+# auto_https_pick with its probes replaced by AGENTOS_AUTO_PUBLIC_IP /
+# AGENTOS_AUTO_LOCAL_IPS / AGENTOS_AUTO_BUSY_PORTS. scripts/tests/install-https.test.sh.
+if [ -n "${AGENTOS_PRINT_AUTO_HTTPS:-}" ]; then
+  if auto_https_applies "${AGENTOS_AUTO_EXISTING:-0}"; then
+    auto_https_pick
+    printf 'mode=%s domain=%s auto=%s\n' "$HTTPS_MODE" "${DOMAIN:-}" "$AUTO_HTTPS"
+  else
+    printf 'mode=%s domain=%s auto=off\n' "${HTTPS_MODE:-unset}" "${DOMAIN:-}"
+  fi
+  exit 0
+fi
+
 # ─── instance identity: user → install root, unit name, CLI name ────────────
 #
 # One knob. A second node on the same host is the same install run again with a
@@ -340,6 +906,9 @@ esac
 # merge_contour_secrets, which streams the file straight into .env.
 if [ -n "$SECRETS_FILE" ] && [ ! -e "$SECRETS_FILE" ]; then
   die "--secrets: no such file: ${SECRETS_FILE}"
+fi
+if [ -n "$USAGE_GROUP" ] && ! usage_group_name_ok "$USAGE_GROUP"; then
+  die "--usage-group: expected a system group name ([a-z_][a-z0-9_-]*, at most 32 characters), got '${USAGE_GROUP}'"
 fi
 for _repo in ${CONTOUR_REPOS+"${CONTOUR_REPOS[@]}"}; do
   case "$_repo" in
@@ -521,6 +1090,26 @@ reconcile_secret_reader_acls() {
       ok "secret reader ${u}: traverse on ${INSTALL_DIR} (create ${secrets_dir} for shared secrets)"
     fi
   done <<< "$readers"
+}
+
+# Record --usage-group as the root-owned declaration reconcile_usage_group reads
+# (and every later `agentos upgrade` re-reads). Written to a fresh name, then
+# renamed over: a link at the final name is replaced, never followed.
+persist_usage_group() {
+  [ -n "$USAGE_GROUP" ] || return 0
+  local dir="${HOST_PREFIX}/var/lib/${SERVICE_NAME}" tmp
+  plain_dir_ok "$dir" "usage-group declaration directory" || return 1
+  $SUDO mkdir -p "$dir"
+  tmp="${dir}/.usage-group.$$"
+  if ! printf '%s\n' "$USAGE_GROUP" | $SUDO bash -c 'umask 022; set -C; exec cat > "$1"' _ "$tmp" 2>/dev/null \
+     || ! $SUDO mv -f -T "$tmp" "${dir}/usage-group"; then
+    $SUDO rm -f "$tmp" 2>/dev/null || true
+    warn "could not write the usage-group declaration ${dir}/usage-group"
+    return 1
+  fi
+  $SUDO chown root:root "${dir}/usage-group" 2>/dev/null || true
+  $SUDO chmod 0644 "${dir}/usage-group"
+  ok "usage-group declared: ${USAGE_GROUP} (${dir}/usage-group)"
 }
 
 # Resolve the GitHub token from the merged .env, by the operator's chosen key if
@@ -871,6 +1460,12 @@ if [ -z "$INSTALL_MODE" ]; then
   fi
 fi
 
+# The shared usage store is a systemd-host arrangement (a root-owned /var/lib
+# root and a unit drop-in); a container shares it through a volume instead.
+if [ "$INSTALL_MODE" = "docker" ] && [ -n "$USAGE_GROUP" ]; then
+  die "--usage-group is systemd-mode only (a docker node shares the usage store through a volume)"
+fi
+
 # Answer "which channel would this command pick?" without touching the machine.
 # scripts/tests/install-mode.test.sh drives the whole matrix through it, and it
 # is a straight answer to give a user who is about to re-run the installer on a
@@ -1155,6 +1750,20 @@ if [ -n "${AGENTOS_PRINT_CONTOUR:-}" ]; then
   done
   echo "repos=${_rnames}"
   echo "gh_token_key=${GH_TOKEN_KEY}"
+  exit 0
+fi
+
+# "What does the usage-group reconcile leave behind?" — persists --usage-group
+# and runs the REAL reconcile_usage_group under HOST_PREFIX (the hook's value),
+# with whatever getent/groupadd/systemctl the caller put on $PATH. No root, no
+# systemd. Driven by scripts/tests/usage-group.test.sh.
+if [ -n "${AGENTOS_PRINT_USAGE_GROUP:-}" ]; then
+  SUDO="${SUDO:-}"
+  HOST_PREFIX="$AGENTOS_PRINT_USAGE_GROUP"
+  _ug_rc=0
+  persist_usage_group || _ug_rc=$?
+  [ "$_ug_rc" = 0 ] && { reconcile_usage_group "${HOST_PREFIX}/var/lib" "${HOST_PREFIX}/etc/systemd/system" "$SERVICE_NAME" "$SERVICE_USER" || _ug_rc=$?; }
+  echo "rc=${_ug_rc}"
   exit 0
 fi
 
@@ -2099,6 +2708,20 @@ install_systemd() {
   # install still reported success (12418agfwft).
   $SUDO apt-get -o DPkg::Lock::Timeout=300 install -y -qq ffmpeg git tmux curl zstd jq ca-certificates acl sudo
 
+  # Automatic HTTPS (12418agh2ky): resolved here, after curl/iproute are in
+  # place and before write_env_systemd keys MINIAPP_URL off DOMAIN. Caddy holds
+  # one /etc/caddy/Caddyfile per host, so a named instance asking for
+  # --auto-https never gets sslip.io — the tunnel is per instance.
+  if [ "$HTTPS_MODE" = "auto" ]; then
+    step "HTTPS — automatic (no domain given)"
+    auto_https_pick
+    if [ "$AUTO_HTTPS" = "sslip" ] && [ "$SERVICE_NAME" != "agentos" ]; then
+      HTTPS_MODE="quick"; AUTO_HTTPS="quick"; DOMAIN=""
+      AUTO_HTTPS_REASON="a named instance cannot claim the host's single Caddyfile"
+    fi
+    auto_https_announce
+  fi
+
   step "Release"
   local manifest tag tarball sha node_ver url
   manifest="$(curl -fsSL --max-time 30 \
@@ -2187,7 +2810,7 @@ install_systemd() {
   # its bin dir on PATH for any child `node` processes npm spawns.
   $SUDO env PATH="$INSTALL_DIR/node/bin:$PATH" \
     "$INSTALL_DIR/node/bin/node" "$INSTALL_DIR/node/bin/npm" \
-    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.285"
+    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.292"
 
   step "Config + unit"
   # Snapshot what a RUNNING node booted with, before this run rewrites any of
@@ -2231,6 +2854,15 @@ install_systemd() {
   # without a manual setfacl. No-op when none are declared.
   persist_secret_readers
   reconcile_secret_reader_acls
+  # The shared usage-sampler store (--usage-group / an existing declaration):
+  # BEFORE the start below, so a fresh node boots already in the group. An
+  # explicit --usage-group that cannot be honoured stops the install; a stale
+  # declaration on a re-run only warns, like every other reconcile.
+  persist_usage_group || die "--usage-group: the declaration could not be written"
+  if ! reconcile_usage_group "${HOST_PREFIX}/var/lib" "${HOST_PREFIX}/etc/systemd/system" "$SERVICE_NAME" "$SERVICE_USER"; then
+    [ -n "$USAGE_GROUP" ] && die "--usage-group ${USAGE_GROUP}: refused (see above) — nothing was chgrp'ed or repaired"
+    warn "usage-group reconciliation refused (see above) — the node keeps its private usage store"
+  fi
   $SUDO systemctl daemon-reload
   $SUDO systemctl enable --now "$SERVICE_NAME"
 
@@ -2246,13 +2878,25 @@ install_systemd() {
     # renders a per-instance snippet, only the default install may claim it.
     [ "$SERVICE_NAME" = "agentos" ] || \
       die "--domain writes the single /etc/caddy/Caddyfile — a second instance would clobber the first. Use --no-https here and put this instance behind your own vhost on 127.0.0.1:${PORT}"
-    $SUDO apt-get -o DPkg::Lock::Timeout=120 install -y -qq caddy
-    # Same $SUDO-on-the-read reasoning as the unit render above: this template
-    # also lives under $INSTALL_DIR (the service account's $HOME).
-    $SUDO sed -e "s/{\$AGENTOS_DOMAIN}/${DOMAIN}/" -e "s/node:8787/127.0.0.1:${PORT}/" \
-      "$INSTALL_DIR/current/profiles/docker/Caddyfile" | $SUDO tee /etc/caddy/Caddyfile >/dev/null
-    $SUDO systemctl reload caddy 2>/dev/null || $SUDO systemctl restart caddy
-    ok "caddy → https://${DOMAIN} (127.0.0.1:${PORT})"
+    if install_caddy_systemd; then
+      ok "caddy → https://${DOMAIN} (127.0.0.1:${PORT})"
+    elif [ "$AUTO_HTTPS" = "sslip" ]; then
+      # The automatic choice never fails the install: the settle step below
+      # skips the certificate wait and falls back to the tunnel / bot only.
+      warn "caddy could not be installed or started — the automatic sslip.io name is dropped"
+      AUTO_HTTPS_CADDY_FAILED=1
+    else
+      die "caddy could not be installed or started for --domain ${DOMAIN}: see apt / journalctl -u caddy"
+    fi
+  fi
+
+  # sslip.io is kept only with a valid certificate; a quick tunnel (asked for or
+  # fallen back to) is laid down here; any other mode removes a tunnel an
+  # earlier run left publishing the node.
+  if [ -n "$AUTO_HTTPS" ] || [ "$HTTPS_MODE" = "quick" ]; then
+    settle_auto_https_systemd
+  else
+    remove_quick_tunnel_systemd
   fi
 
   step "Health"
@@ -2729,13 +3373,24 @@ if [ "$INSTALL_MODE" = "systemd" ]; then
     ask_admin
   fi
 
-  # --tunnel-token / --quick need cloudflared, which this task does not wire
-  # up on bare metal (YAGNI — see task brief). Fail fast rather than silently
-  # downgrading to --no-https, whatever HTTPS_MODE the flags already picked.
+  # --tunnel-token needs a named-tunnel setup this path does not wire up on bare
+  # metal (YAGNI). Fail fast rather than silently downgrading to --no-https.
+  # --quick is wired since 12418agh2ky (install_quick_tunnel_systemd).
   case "$HTTPS_MODE" in
-    cloudflared|quick)
-      die "--tunnel-token/--quick: not yet supported in --no-docker mode, use --domain or --no-https" ;;
+    cloudflared)
+      die "--tunnel-token: not yet supported in --no-docker mode, use --domain, --quick or --no-https" ;;
   esac
+  # No HTTPS flag on a fresh default install → automatic (sslip.io or a quick
+  # tunnel). Resolved inside install_systemd, once curl/ip are installed.
+  # Read the .env first and grep a here-string: `read | grep -q` under pipefail
+  # can lose the verdict to a broken pipe (scripts/tests/shell-pipe-race.test.sh).
+  AUTO_HTTPS_HAD_TOKEN=0
+  if grep -q '^TELEGRAM_BOT_TOKEN=.' <<<"$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null || true)"; then
+    AUTO_HTTPS_HAD_TOKEN=1
+  fi
+  if auto_https_applies "$AUTO_HTTPS_HAD_TOKEN"; then
+    HTTPS_MODE="auto"
+  fi
   if [ -z "$HTTPS_MODE" ]; then
     if [ "$ASSUME_YES" = "1" ] || [ ! -t 0 ]; then
       HTTPS_MODE="none"
@@ -2768,8 +3423,9 @@ $(if [ -z "${ADMIN_IDS:-}${ADMIN_USERNAMES:-}" ]; then
     echo "               Message it NOW, before anybody else does."
   fi)
   $(echo -e "${BOLD}Mini App${NC}")   $(case "$HTTPS_MODE" in
-      none) echo "not published (bot-only install). Add it: re-run with --domain <host>." ;;
-      *)    echo "https://${DOMAIN}/app — open it from the bot's menu button or /app." ;;
+      none)  echo "not published (bot-only install). Add it: re-run with --domain <host>." ;;
+      quick) echo "${MINIAPP_URL:-<pending>} — TRIAL: the address changes when the tunnel restarts. Stable: --domain <host>." ;;
+      *)     echo "https://${DOMAIN}/app — open it from the bot's menu button or /app." ;;
     esac)
   $(echo -e "${BOLD}Install${NC}")    $INSTALL_DIR ($SERVICE_USER, 127.0.0.1:$PORT)
 
@@ -2970,7 +3626,11 @@ if [ -z "${ADMIN_IDS}${ADMIN_USERNAMES}" ] && [ "$ASSUME_YES" != "1" ] && [ -t 0
   ask_admin
 fi
 
-# HTTPS mode: ask only if no flag decided it.
+# HTTPS mode: no flag on a fresh default install → automatic (12418agh2ky);
+# otherwise ask only if no flag decided it.
+if auto_https_applies "$(if [ -f .env ] && grep -q '^TELEGRAM_BOT_TOKEN=.' .env; then echo 1; else echo 0; fi)"; then
+  HTTPS_MODE="auto"
+fi
 if [ -z "$HTTPS_MODE" ]; then
   if [ "$ASSUME_YES" = "1" ] || [ ! -t 0 ]; then
     HTTPS_MODE="none"
@@ -2996,6 +3656,11 @@ fi
 # ─── 4. domain preflight (grabla #7: fail here, not after boot) ─────────────
 
 MINIAPP_URL=""
+if [ "$HTTPS_MODE" = "auto" ]; then
+  step "HTTPS — automatic (no domain given)"
+  auto_https_pick
+  auto_https_announce
+fi
 case "$HTTPS_MODE" in
   caddy)
     [ -n "$DOMAIN" ] || die "--domain needs a hostname."
@@ -3182,6 +3847,26 @@ esac
 
 step "Starting"
 docker compose -f "$COMPOSE_FILE" "${PROFILE_ARGS[@]}" up -d
+
+# Automatic sslip.io is kept only with a valid certificate (12418agh2ky): a
+# cloud firewall in front of :80, or Let's Encrypt's shared limit for sslip.io,
+# turns it into a quick tunnel instead — §7 below resolves its hostname. The
+# domain keys go first, so no Mini App button is left pointing at Caddy.
+if [ "$AUTO_HTTPS" = "sslip" ]; then
+  step "Checking https://${DOMAIN} from the outside"
+  if verify_auto_https "$DOMAIN"; then
+    ok "certificate issued — the Mini App is at https://${DOMAIN}/app"
+  else
+    warn "https://${DOMAIN} did not come up with a valid certificate in ~2 minutes"
+    warn "(inbound :80/:443 blocked by a cloud firewall, or the Let's Encrypt limit for sslip.io)."
+    warn "Falling back to a Cloudflare quick tunnel."
+    docker compose -f "$COMPOSE_FILE" --profile caddy rm -sf caddy >/dev/null 2>&1 || true
+    unset_env AGENTOS_DOMAIN
+    unset_env MINIAPP_URL
+    DOMAIN=""; MINIAPP_URL=""; HTTPS_MODE="quick"; AUTO_HTTPS="quick"
+    docker compose -f "$COMPOSE_FILE" --profile quick up -d
+  fi
+fi
 
 # ─── 7. quick tunnel: resolve the URL, then re-boot the node with it ─────────
 #
