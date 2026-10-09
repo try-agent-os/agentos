@@ -1199,6 +1199,56 @@ gh_installed_version() { # gh_installed_version → x.y.z, empty when gh is abse
   gh_version_of "$(gh --version 2>/dev/null || true)"
 }
 
+# bubblewrap for the Codex sandbox (task 12418agh8ee) — the `bubblewrap` entry
+# of the core-dependency list (apps/api/src/core/deps/core-dependencies.ts).
+# Codex runs its read-only / workspace-write sandbox through bwrap. Ubuntu 24.04
+# sets kernel.apparmor_restrict_unprivileged_userns=1, and there an unconfined
+# bwrap cannot create the user namespace it needs ("No permissions to create a
+# new namespace") until an AppArmor profile grants `userns` — BitMotors had both
+# done by hand. The node's default sandbox (danger-full-access) never uses bwrap,
+# so nothing here stops the run: a gap is a warning, and an existing profile is
+# the operator's and is never overwritten. HOST_PREFIX is the test suite's
+# stand-in for /.
+BWRAP_APPARMOR_PROFILE="/etc/apparmor.d/bwrap"
+bwrap_apparmor_profile() { # bwrap_apparmor_profile <bwrap-path>
+  cat <<PROFILE
+# AgentOS: let bubblewrap create user namespaces for the Codex sandbox where
+# kernel.apparmor_restrict_unprivileged_userns=1 (Ubuntu 24.04 and later).
+abi <abi/4.0>,
+include <tunables/global>
+profile bwrap $1 flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+PROFILE
+}
+ensure_bwrap() { # ensure_bwrap — always 0
+  local bwrap profile="${HOST_PREFIX:-}${BWRAP_APPARMOR_PROFILE}"
+  if ! bwrap="$(command -v bwrap 2>/dev/null)"; then
+    if command -v apt-get >/dev/null 2>&1; then
+      ${SUDO:-} apt-get -o DPkg::Lock::Timeout=120 install -y -qq bubblewrap >/dev/null 2>&1 || true
+    fi
+    if ! bwrap="$(command -v bwrap 2>/dev/null)"; then
+      warn "bubblewrap is not installed: the Codex sandbox modes read-only/workspace-write will not start (the default danger-full-access does not need it)"
+      return 0
+    fi
+    ok "bubblewrap installed (Codex sandbox)"
+  fi
+  [ "$(cat "${HOST_PREFIX:-}/proc/sys/kernel/apparmor_restrict_unprivileged_userns" 2>/dev/null)" = 1 ] || return 0
+  [ -d "${HOST_PREFIX:-}/etc/apparmor.d" ] || return 0
+  [ -e "$profile" ] && return 0
+  if ! bwrap_apparmor_profile "$bwrap" | ${SUDO:-} tee "$profile" >/dev/null 2>&1; then
+    warn "could not write ${BWRAP_APPARMOR_PROFILE}: bubblewrap cannot create user namespaces here, so the Codex sandbox modes read-only/workspace-write will not start"
+    return 0
+  fi
+  if command -v apparmor_parser >/dev/null 2>&1 && ${SUDO:-} apparmor_parser -r "$profile" >/dev/null 2>&1; then
+    ok "bubblewrap may create user namespaces (AppArmor profile ${BWRAP_APPARMOR_PROFILE})"
+  else
+    warn "wrote ${BWRAP_APPARMOR_PROFILE} but could not load it — run: apparmor_parser -r ${BWRAP_APPARMOR_PROFILE}"
+  fi
+  return 0
+}
+
 # Declare GitHub's own apt source (cli/cli) — the source that actually carries a
 # current gh. Every step used to end in `|| true`, which made a failure here
 # invisible: the only symptom was gh missing, or gh silently staying old. Now
@@ -1510,6 +1560,18 @@ fi
 # assert the ORDER of the sources (cli/cli first, distro last) and what each
 # outcome reports, which is where both defects lived. Prints ensure_gh's own
 # output, then the version it left behind.
+# Test hook: run the REAL ensure_bwrap against the stub `bwrap`/`apt-get`/
+# `apparmor_parser`/`tee` on $PATH, with the value as the stand-in for /.
+# Driven by scripts/tests/install-bwrap.test.sh — no root, apt or kernel.
+if [ -n "${AGENTOS_PRINT_BWRAP_PLAN:-}" ]; then
+  SUDO="${SUDO:-}"
+  HOST_PREFIX="$AGENTOS_PRINT_BWRAP_PLAN"
+  _bw_rc=0
+  ensure_bwrap || _bw_rc=$?
+  echo "rc=${_bw_rc}"
+  exit 0
+fi
+
 if [ -n "${AGENTOS_PRINT_GH_PLAN:-}" ]; then
   SUDO="${SUDO:-}"                       # not resolved this early; every call tolerates empty
   _gh_rc=0
@@ -2706,7 +2768,10 @@ install_systemd() {
   # visudo and is useless without sudo. A minimal Debian run as root ships
   # neither, and the drop-in used to be skipped there with a warning while the
   # install still reported success (12418agfwft).
-  $SUDO apt-get -o DPkg::Lock::Timeout=300 install -y -qq ffmpeg git tmux curl zstd jq ca-certificates acl sudo
+  # `bubblewrap`: the Codex sandbox (ensure_bwrap below adds the AppArmor
+  # profile it needs on Ubuntu 24.04).
+  $SUDO apt-get -o DPkg::Lock::Timeout=300 install -y -qq ffmpeg git tmux curl zstd jq ca-certificates acl sudo bubblewrap
+  ensure_bwrap
 
   # Automatic HTTPS (12418agh2ky): resolved here, after curl/iproute are in
   # place and before write_env_systemd keys MINIAPP_URL off DOMAIN. Caddy holds
