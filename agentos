@@ -1138,6 +1138,57 @@ gh_add_apt_repo() {
 #     one. Installing is the installer's decision; healing is the upgrade's.
 #   - gh below minimum   → cli/cli apt repo, then `apt-get install gh`, which
 #     moves an installed package to the newest candidate.
+# bubblewrap for the Codex sandbox (task 12418agh8ee) — the `bubblewrap` entry
+# of the core-dependency list (apps/api/src/core/deps/core-dependencies.ts).
+# Codex runs its read-only / workspace-write sandbox through bwrap. Ubuntu 24.04
+# sets kernel.apparmor_restrict_unprivileged_userns=1, and there an unconfined
+# bwrap cannot create the user namespace it needs ("No permissions to create a
+# new namespace") until an AppArmor profile grants `userns` — BitMotors had both
+# done by hand. The node's default sandbox (danger-full-access) never uses bwrap,
+# so nothing here stops the run: a gap is a warning, and an existing profile is
+# the operator's and is never overwritten. HOST_PREFIX is the test suite's
+# stand-in for /. Same function as install.sh's: `agentos upgrade` is the root
+# path every node walks after install, so an existing node heals here.
+BWRAP_APPARMOR_PROFILE="/etc/apparmor.d/bwrap"
+bwrap_apparmor_profile() { # bwrap_apparmor_profile <bwrap-path>
+  cat <<PROFILE
+# AgentOS: let bubblewrap create user namespaces for the Codex sandbox where
+# kernel.apparmor_restrict_unprivileged_userns=1 (Ubuntu 24.04 and later).
+abi <abi/4.0>,
+include <tunables/global>
+profile bwrap $1 flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+PROFILE
+}
+ensure_bwrap() { # ensure_bwrap — always 0
+  local bwrap profile="${HOST_PREFIX:-}${BWRAP_APPARMOR_PROFILE}"
+  if ! bwrap="$(command -v bwrap 2>/dev/null)"; then
+    if command -v apt-get >/dev/null 2>&1; then
+      ${SUDO:-} apt-get -o DPkg::Lock::Timeout=120 install -y -qq bubblewrap >/dev/null 2>&1 || true
+    fi
+    if ! bwrap="$(command -v bwrap 2>/dev/null)"; then
+      warn "bubblewrap is not installed: the Codex sandbox modes read-only/workspace-write will not start (the default danger-full-access does not need it)"
+      return 0
+    fi
+    ok "bubblewrap installed (Codex sandbox)"
+  fi
+  [ "$(cat "${HOST_PREFIX:-}/proc/sys/kernel/apparmor_restrict_unprivileged_userns" 2>/dev/null)" = 1 ] || return 0
+  [ -d "${HOST_PREFIX:-}/etc/apparmor.d" ] || return 0
+  [ -e "$profile" ] && return 0
+  if ! bwrap_apparmor_profile "$bwrap" | ${SUDO:-} tee "$profile" >/dev/null 2>&1; then
+    warn "could not write ${BWRAP_APPARMOR_PROFILE}: bubblewrap cannot create user namespaces here, so the Codex sandbox modes read-only/workspace-write will not start"
+    return 0
+  fi
+  if command -v apparmor_parser >/dev/null 2>&1 && ${SUDO:-} apparmor_parser -r "$profile" >/dev/null 2>&1; then
+    ok "bubblewrap may create user namespaces (AppArmor profile ${BWRAP_APPARMOR_PROFILE})"
+  else
+    warn "wrote ${BWRAP_APPARMOR_PROFILE} but could not load it — run: apparmor_parser -r ${BWRAP_APPARMOR_PROFILE}"
+  fi
+  return 0
+}
+
 reconcile_gh() {
   local have decision
   have="$(gh_installed_version)"
@@ -3402,6 +3453,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     reconcile_usage_group "${AGENTOS_STATE_ROOT:-/var/lib}" "${AGENTOS_UNITS_DIR:-/etc/systemd/system}" "$AGENTOS_SERVICE" "$AGENTOS_ACCOUNT" \
       || warn "usage-group reconciliation refused (see above) — the node keeps its private usage store"
     reconcile_gh || warn "gh reconciliation hit a snag"
+    ensure_bwrap
     # Written, but the running core still has the environment it booted with, so
     # say what makes it count rather than restarting a healthy node unasked.
     if ensure_ctl_env; then
@@ -3536,6 +3588,7 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     reconcile_usage_group "${AGENTOS_STATE_ROOT:-/var/lib}" "${AGENTOS_UNITS_DIR:-/etc/systemd/system}" "$AGENTOS_SERVICE" "$AGENTOS_ACCOUNT" \
       || warn "usage-group reconciliation refused (see above) — the node keeps its private usage store"
     reconcile_gh || warn "gh reconciliation hit a snag"
+    ensure_bwrap
     prune_versions
   else
     # Why the new release did not come up, when its boot guard said so — kept
@@ -5085,6 +5138,15 @@ fi
 # reconcile_gh against whatever `gh`/`apt-get`/`curl`/`dpkg`/`tee` the caller put
 # on $PATH, then print its exit code and the version it left behind. Driven by
 # scripts/tests/agentos-gh.test.sh — no root, apt or network.
+# Test hook, the CLI half of install.sh's AGENTOS_PRINT_BWRAP_PLAN.
+if [ -n "${AGENTOS_PRINT_BWRAP_RECONCILE:-}" ]; then
+  HOST_PREFIX="$AGENTOS_PRINT_BWRAP_RECONCILE"
+  _bw_rc=0
+  ensure_bwrap || _bw_rc=$?
+  echo "rc=${_bw_rc}"
+  exit 0
+fi
+
 if [ -n "${AGENTOS_PRINT_GH_RECONCILE:-}" ]; then
   _gh_rc=0
   reconcile_gh || _gh_rc=$?
