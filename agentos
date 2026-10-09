@@ -3190,6 +3190,18 @@ systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores 
     mkdir -p "$keep/$(dirname "$rel")" && mv "$o" "$keep/$rel"
   done
   rm -rf "$AGENTOS_HOME/data/.aop" "$AGENTOS_HOME/data/contexts"
+  # A database file restored next to the live one's WAL is NOT restored: SQLite
+  # replays the leftover <db>-wal into the snapshot on the next open. A release
+  # that is killed while unhealthy leaves exactly that WAL behind, holding its
+  # own migrations — on 2026-10-09 every rollback from v4.77.0 brought back a
+  # messages.db that still carried CompletionJournal1752800000414, and v4.75.0
+  # refused it in a crash loop. Drop the sidecars of every database the
+  # snapshot replaces; a sidecar the snapshot itself holds comes back with it.
+  for o in "$src"/*.db; do
+    [ -f "$o" ] || continue
+    rel="$(basename "$o")"
+    rm -f "$AGENTOS_HOME/data/$rel-wal" "$AGENTOS_HOME/data/$rel-shm" "$AGENTOS_HOME/data/$rel-journal"
+  done
   cp -a "$src"/. "$AGENTOS_HOME/data/"
   if [ -d "$keep/contexts" ]; then
     for o in "$keep"/$SNAPSHOT_ORPHAN_GLOB; do
