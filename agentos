@@ -2669,6 +2669,49 @@ snapshot_refetch_module() {
   snapshot_git "$g" reflog expire --expire-unreachable=now --stale-fix --all >/dev/null 2>&1 || true
   return 0
 }
+
+# snapshot_module_need <gitdir> — every object id the git dir's refs and HEAD
+# name, one per line, deduplicated (reading a ref does not need its object).
+snapshot_module_need() {
+  { snapshot_git "$1" for-each-ref --format='%(objectname)' 2>/dev/null
+    snapshot_git "$1" rev-parse --verify -q HEAD 2>/dev/null
+  } | LC_ALL=C sort -u
+}
+
+# snapshot_module_complete <gitdir> — zero when the git dir answers for itself
+# and holds every object its refs and HEAD name (12418agh9v6).
+snapshot_module_complete() {
+  local g="$1" sha
+  [ "$(snapshot_git "$g" rev-parse --absolute-git-dir 2>/dev/null)" = "$(cd "$g" 2>/dev/null && pwd -P)" ] || return 1
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    snapshot_git "$g" cat-file -e "$sha" 2>/dev/null || return 1
+  done < <(snapshot_module_need "$g")
+  return 0
+}
+
+# snapshot_refill_module <data> <gitdir-rel> — fetches, by id, the objects the
+# restored refs of a kept store name but the store lacks, straight into that
+# store (additive: nothing it holds is replaced). Shallow stores stay shallow.
+# Zero when the store is complete afterwards.
+snapshot_refill_module() {
+  local data="$1" rel="$2" g remote url sha
+  local -a miss=() depth=()
+  g="$data/$rel"
+  remote="$(snapshot_git "$g" remote 2>/dev/null)" || return 1
+  case "$remote" in ''|*$'\n'*) return 1 ;; esac
+  url="$(snapshot_git "$g" config --get "remote.$remote.url" 2>/dev/null)" || return 1
+  [ -n "$url" ] || return 1
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    snapshot_git "$g" cat-file -e "$sha" 2>/dev/null || miss+=("$sha")
+  done < <(snapshot_module_need "$g")
+  [ "${#miss[@]}" -gt 0 ] || return 0
+  [ -e "$g/shallow" ] && depth=(--depth=1)
+  snapshot_net_git "$g" fetch -q --no-tags --no-write-fetch-head ${depth[@]+"${depth[@]}"} "$url" "${miss[@]}" >/dev/null 2>&1 || true
+  snapshot_module_complete "$g"
+}
+
 # entries of one linked worktree git cannot rebuild, expanded (NUL, relative
 # to <data>), plus its deleted-tracked list. Non-zero on any git failure.
 snapshot_tree_members() {
@@ -2720,7 +2763,19 @@ snapshot_rehydrate() {
   if [ -f "$manifest/modules" ]; then
     while IFS= read -r w; do
       [ -n "$w" ] && [ -d "$data/$w" ] || continue
-      [ -d "$data/$w/objects" ] && [ -n "$(ls -A "$data/$w/objects" 2>/dev/null)" ] && continue
+      if [ -d "$data/$w/objects" ] && [ -n "$(ls -A "$data/$w/objects" 2>/dev/null)" ]; then
+        # The live store came back (systemd_restore_keep_module_objects). It
+        # is enough when it holds every object the restored refs name; only
+        # what it lacks is asked of the remote, into the same store.
+        snapshot_module_complete "$data/$w" && continue
+        info "restore: $w lacks objects its restored refs name; fetching them from its remote" >&2
+        snapshot_refill_module "$data" "$w" && continue
+        # A remote that serves no ids: rebuild the store from its branches
+        # instead (it is replaced only when that fetch succeeds).
+        snapshot_refetch_module "$data" "$w" && snapshot_module_complete "$data/$w" && continue
+        warn "submodule git dir $w lacks objects its refs name and its remote did not serve them; run 'git fetch' in that submodule by hand"
+        continue
+      fi
       info "restore: fetching the objects of $w back from its remote" >&2
       if ! snapshot_refetch_module "$data" "$w"; then
         warn "could not fetch the objects of submodule git dir $w from its remote; its refs, index and working tree are restored — run 'git fetch' in that submodule by hand"
@@ -3168,6 +3223,139 @@ systemd_prune_backups() { # AGENTOS_KEEP_BACKUPS (default 5) — never removes t
   done
 }
 
+# systemd_restore_keep_module_objects <snapshot> <data> <keep> — moves the live
+# objects/ (and shallow boundary) of every submodule git dir the snapshot's
+# manifest names out of <data> into <keep>, before contexts/ is wiped. Only a
+# real directory whose physical path stays under <data>/contexts is taken: the
+# path is agent-writable, and root must not move (and later chown) whatever a
+# planted symlink points at. Never fails: a store it cannot take is simply
+# refetched from the remote, as before.
+systemd_restore_keep_module_objects() {
+  local src="$1" data="$2" keep="$3" rel g real ctx
+  [ -f "$src/$SNAPSHOT_MANIFEST/modules" ] || return 0
+  [ -d "$data/contexts" ] || return 0
+  ctx="$(cd "$data/contexts" 2>/dev/null && pwd -P)" || return 0
+  while IFS= read -r rel; do
+    case "$rel" in ''|/*|*..*|*$'\n'*) continue ;; esac
+    case "$rel" in contexts/*) ;; *) continue ;; esac
+    # The snapshot carries its own store for this git dir: nothing to keep.
+    [ -e "$src/$rel/objects" ] && continue
+    g="$data/$rel"
+    [ -d "$g" ] && [ ! -L "$g" ] || continue
+    [ -d "$g/objects" ] && [ ! -L "$g/objects" ] || continue
+    real="$(cd "$g" 2>/dev/null && pwd -P)" || continue
+    [ "$real" = "$ctx/${rel#contexts/}" ] || continue
+    [ -n "$(ls -A "$g/objects" 2>/dev/null)" ] || continue
+    mkdir -p "$keep/$rel" || continue
+    mv "$g/objects" "$keep/$rel/objects" || continue
+    if [ -f "$g/shallow" ] && [ ! -L "$g/shallow" ]; then
+      cp "$g/shallow" "$keep/$rel/shallow" 2>/dev/null || true
+    fi
+  done < "$src/$SNAPSHOT_MANIFEST/modules"
+  return 0
+}
+
+# systemd_restore_return_module_objects <snapshot> <data> <keep> — puts each
+# store systemd_restore_keep_module_objects set aside back under the restored
+# git dir (which the snapshot copy just created, so the target path is the
+# snapshot's, not the agent's). The shallow boundary becomes the union of the
+# snapshot's and the live one: a listed commit whose parents are present only
+# hides them, an unlisted shallow commit would make git look for parents the
+# store never had. A store with no restored git dir to go into is dropped.
+systemd_restore_return_module_objects() {
+  local src="$1" data="$2" keep="$3" rel g
+  [ -f "$src/$SNAPSHOT_MANIFEST/modules" ] || return 0
+  [ -d "$keep" ] || return 0
+  while IFS= read -r rel; do
+    case "$rel" in ''|/*|*..*|*$'\n'*) continue ;; esac
+    [ -d "$keep/$rel/objects" ] || continue
+    g="$data/$rel"
+    [ -d "$g" ] && [ ! -L "$g" ] || continue
+    [ -e "$g/objects" ] && continue
+    mv "$keep/$rel/objects" "$g/objects" || continue
+    if [ -f "$keep/$rel/shallow" ]; then
+      if [ -f "$g/shallow" ]; then
+        LC_ALL=C sort -u "$g/shallow" "$keep/$rel/shallow" > "$g/shallow.agentos-union" \
+          && mv "$g/shallow.agentos-union" "$g/shallow" || rm -f "$g/shallow.agentos-union"
+      else
+        cp "$keep/$rel/shallow" "$g/shallow" || true
+      fi
+    fi
+    info "restore: kept the local objects of $rel instead of refetching them" >&2
+  done < "$src/$SNAPSHOT_MANIFEST/modules"
+  return 0
+}
+
+# ─── restore verification: the schema a restored database will boot with ────
+#
+# A restore is only a restore when the database the old release is about to
+# open carries the snapshot's schema. On 2026-10-09 the rollback said
+# "✓ restored <snapshot>" over a messages.db that SQLite then completed from the
+# failed release's leftover WAL, and v4.75.0 crash-looped on SchemaCompatError
+# for ~70 minutes (ClickUp 12418agh9v4). So after the copy each restored
+# database is checked twice before the old release is started:
+#   1. its sidecars (-wal/-shm/-journal) are exactly the snapshot's: one the
+#      snapshot does not hold must not exist, one it holds must match byte for
+#      byte. No reader needed, so this check always runs.
+#   2. its migration head — what SQLite returns once it has replayed whatever
+#      WAL sits next to the file — equals the snapshot's. Read with the Node
+#      runtime's built-in node:sqlite; a database neither side can read (no
+#      runtime, an old Node, a file that is not SQLite) is not judged here.
+# A mismatch fails the rollback BEFORE the old release starts: one clear
+# "rollback FAILED" instead of a crash loop the owner learns about later.
+
+# The reader. Prints "<count> <last-migration-name>" (or "none" when the file
+# has no migrations table). Opened read-only, so it never writes the database;
+# SQLite still creates an empty -wal/-shm pair on open, and those are removed
+# again so the reader leaves the directory exactly as it found it.
+SQLITE_MIGRATION_HEAD_JS='
+const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync(process.argv[1], { readOnly: true });
+const t = db.prepare("SELECT 1 AS x FROM sqlite_master WHERE type = '"'"'table'"'"' AND name = '"'"'migrations'"'"'").get();
+if (!t) { process.stdout.write("none"); }
+else {
+  const r = db.prepare("SELECT count(*) AS n, (SELECT name FROM migrations ORDER BY id DESC LIMIT 1) AS last FROM migrations").get();
+  process.stdout.write(r.n + " " + (r.last == null ? "" : r.last));
+}
+db.close();
+'
+
+sqlite_migration_head() { # sqlite_migration_head <db-file> → "<count> <last>" | "none"; 0 read, 2 not readable
+  local db="$1" node="$AGENTOS_HOME/node/bin/node" s pre="" out rc=0
+  [ -f "$db" ] || return 2
+  if [ ! -x "$node" ]; then node="$(command -v node 2>/dev/null)" || return 2; [ -n "$node" ] || return 2; fi
+  for s in wal shm; do [ -e "$db-$s" ] && pre="$pre $s"; done
+  out="$("$node" --no-warnings -e "$SQLITE_MIGRATION_HEAD_JS" "$db" 2>/dev/null)" || rc=2
+  for s in wal shm; do
+    case " $pre " in *" $s "*) ;; *) rm -f "$db-$s" ;; esac
+  done
+  [ "$rc" = 0 ] && [ -n "$out" ] || return 2
+  printf '%s' "$out"
+}
+
+restore_verify_sqlite() { # restore_verify_sqlite <snapshot-dir> <data-dir> → 0 verified; 1 with the reasons on stdout
+  local src="$1" data="$2" o rel s want got bad="" judged=0
+  for o in "$src"/*.db; do
+    [ -f "$o" ] || continue
+    rel="$(basename "$o")"
+    if [ ! -f "$data/$rel" ]; then bad="$bad; $rel is missing after the restore"; continue; fi
+    for s in wal shm journal; do
+      if [ -e "$o-$s" ]; then
+        cmp -s "$o-$s" "$data/$rel-$s" || bad="$bad; $rel-$s differs from the snapshot's"
+      elif [ -e "$data/$rel-$s" ]; then
+        bad="$bad; $rel-$s is left next to the restored $rel (the snapshot has none)"
+      fi
+    done
+    want="$(sqlite_migration_head "$o")" || continue
+    judged=$((judged + 1))
+    got="$(sqlite_migration_head "$data/$rel")" || got="unreadable"
+    [ "$got" = "$want" ] || bad="$bad; $rel migrations: on disk [$got], snapshot [$want]"
+  done
+  if [ -n "$bad" ]; then printf '%s' "${bad#; }"; return 1; fi
+  [ "$judged" -gt 0 ] && info "restore verified: $judged database(s) carry the snapshot's migrations" >&2
+  return 0
+}
+
 systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores data/ from a dir systemd_backup_sqlite created
   if uses_managed_postgres; then
     docker_managed_postgres_warning
@@ -3189,6 +3377,18 @@ systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores 
     rel="${o#"$AGENTOS_HOME/data/"}"
     mkdir -p "$keep/$(dirname "$rel")" && mv "$o" "$keep/$rel"
   done
+  # Submodule object stores the snapshot left out (5. above, 12418agg7zh) are
+  # set aside too, so the restore does not depend on the remote for them: on
+  # 2026-10-09 the hub's rollback could not refetch workspaces/prpillar/analytics
+  # (the node had no access to its remote), the git dir came back with an empty
+  # objects/ under HEAD=e2b36d3 and repo-sync stopped on "bad object HEAD". The
+  # live store is the same content-addressed store the snapshot was taken from,
+  # minutes later — objects are only ever added to it — so it is put back under
+  # the restored refs and the remote is asked only for what it lacks
+  # (snapshot_rehydrate).
+  local mkeep="$AGENTOS_HOME/data/.agentos-restore-modules"
+  rm -rf "$mkeep"
+  systemd_restore_keep_module_objects "$src" "$AGENTOS_HOME/data" "$mkeep"
   rm -rf "$AGENTOS_HOME/data/.aop" "$AGENTOS_HOME/data/contexts"
   # A database file restored next to the live one's WAL is NOT restored: SQLite
   # replays the leftover <db>-wal into the snapshot on the next open. A release
@@ -3215,11 +3415,19 @@ systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores 
     done
   fi
   [ -d "$keep" ] && find "$keep" -depth -type d -empty -delete 2>/dev/null || true
+  systemd_restore_return_module_objects "$src" "$AGENTOS_HOME/data" "$mkeep"
+  rm -rf "$mkeep"
   # The snapshots are root-owned (this CLI runs as root), and `cp -a` of
   # "<dir>/." carries the snapshot dir's OWN ownership onto data/ itself — the
   # rolled-back User=agentos node would then hit SQLITE_READONLY_DIRECTORY and
   # never start. Give the whole data dir back to the service account.
   chown -R "$AGENTOS_ACCOUNT:$AGENTOS_ACCOUNT" "$AGENTOS_HOME/data"
+  # Last thing before the old release may start: is what it will open the
+  # snapshot? Not "restored" otherwise (see restore_verify_sqlite above).
+  local why
+  if ! why="$(restore_verify_sqlite "$src" "$AGENTOS_HOME/data")"; then
+    die "rollback FAILED: the restore of $(basename "$src") did not verify — $why. The node is NOT started; the snapshot is intact at $src"
+  fi
   # The manifest travelled with `cp -a <dir>/.`; it describes the snapshot, not
   # the node. Rehydrate the linked worktrees it names (after the chown: git runs
   # as the service account and writes files it owns), then drop it.
