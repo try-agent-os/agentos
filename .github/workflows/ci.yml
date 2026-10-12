@@ -42,6 +42,16 @@ jobs:
         # how AgentOS is installed. The script checks exactly that.
         run: python3 .github/check-agent-prompt.py
 
+      - name: Protection of main keeps its invariants
+        # .github/rulesets/main.json is the ruleset applied to main by
+        # .github/ruleset.py apply: empty bypass list, PR required, no force
+        # push or deletion, and every required check is a job that really runs
+        # on each pull request. A weakened file or a renamed job fails here,
+        # before anyone applies it.
+        run: |
+          python3 .github/test-ruleset.py
+          python3 .github/ruleset.py lint
+
   english:
     # try-agent-os/agentos is public. Branch names, commit subjects and bodies,
     # PR title and body, code, comments and docs are read by people who do not
