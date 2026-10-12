@@ -1,0 +1,57 @@
+name: commit-identity
+
+# Every e-mail address in a commit of this public repository -- author,
+# committer, each `Co-authored-by:` trailer -- is published forever and listed
+# among its contributors. Only the addresses in .github/commit-identities.txt
+# may appear (rule and rationale: .github/check-commit-identity.py).
+# The pull-request run reads the allowlist AND the checker from the base, so a
+# pull request can neither add its own address nor rewrite the rule. The push
+# run on main catches what only appears at merge time (the squash message).
+# No write permission and no secrets: this workflow can not publish anything.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  commit-identity:
+    name: commit-identity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # The gate walks base..head and reads the allowlist from the base.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Self-test of the gate
+        run: python3 .github/test-check-commit-identity.py
+
+      - name: Author, committer and Co-authored-by are allowlisted
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            base="$PR_BASE"; head="$PR_HEAD"
+          else
+            base="$PUSH_BEFORE"; head="$PUSH_AFTER"
+          fi
+          # Run the base commit's copy of the checker: the change must not be
+          # able to rewrite the rule that judges it. Only the change that
+          # introduces the checker (none in the base) uses its own copy.
+          gate="$RUNNER_TEMP/check-commit-identity-base.py"
+          if [ -n "$base" ] && git cat-file -e "$base:.github/check-commit-identity.py" 2>/dev/null; then
+            git show "$base:.github/check-commit-identity.py" > "$gate"
+          else
+            cp .github/check-commit-identity.py "$gate"
+          fi
+          python3 -I "$gate" --base "$base" --head "$head"

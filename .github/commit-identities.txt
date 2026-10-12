@@ -1,0 +1,28 @@
+# E-mail addresses allowed to appear in commits of this repository.
+#
+# .github/check-commit-identity.py checks every commit of a pull request (and
+# of every push to main): the author e-mail, the committer e-mail and every
+# `Co-authored-by:` trailer of the message must be listed here. Each of them
+# ends up in the public history and in the Contributors list, forever.
+#
+# The gate reads this file from the BASE of the pull request, never from its
+# head: a pull request cannot add its own identity. A new address lands in its
+# own pull request first, made by an identity that is already listed.
+#
+# One address per line, compared case-insensitively. `#` starts a comment.
+# No wildcards: an entry is one exact address.
+
+# The owner (k-vasily): primary address and the GitHub noreply address.
+krylov@vasily.dev
+257636770+k-vasily@users.noreply.github.com
+
+# The release bot that syncs the installer and the CLI on every core release.
+release@try-agent-os.dev
+
+# GitHub itself: the committer of web merges, squash merges and web edits.
+noreply@github.com
+
+# The AgentOS development factory, which prepares pull requests here under the
+# owner's organisation domain. GitHub adds it as a `Co-authored-by:` trailer to
+# the squash commit of every pull request it prepared.
+agent@try-agent-os.dev
