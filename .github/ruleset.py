@@ -39,6 +39,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -50,6 +51,9 @@ REPO = "try-agent-os/agentos"
 # by a check run of a workflow in this repository, not by a commit status that
 # any token with `statuses: write` could post under the same name.
 GITHUB_ACTIONS_APP_ID = 15368
+
+READBACK_TRIES = 4
+READBACK_PAUSE_S = 3
 
 REQUIRED_RULE_TYPES = {"deletion", "non_fast_forward", "pull_request", "required_status_checks"}
 
@@ -260,8 +264,17 @@ def cmd_apply(repo: str, want: dict) -> int:
         made = gh("-X", "POST", f"repos/{repo}/rulesets", body=want)
         print(f"created ruleset {want['name']!r} (id {made['id']}) on {repo}")
     gh("-X", "PATCH", f"repos/{repo}", body={"allow_auto_merge": True})
-    # Read back from scratch: what counts is what GitHub now holds.
-    return cmd_check(repo, want)
+    # Read back from scratch: what counts is what GitHub now holds. The REST
+    # reads lag the writes by a moment (seen on 2026-10-12: the repository
+    # answered allow_auto_merge=false seconds after the PATCH, true after), so
+    # a mismatch is re-read a few times before it is believed.
+    for attempt in range(READBACK_TRIES):
+        if attempt:
+            time.sleep(READBACK_PAUSE_S)
+        rc = cmd_check(repo, want)
+        if rc == 0:
+            return 0
+    return rc
 
 
 def main(argv: list[str]) -> int:
