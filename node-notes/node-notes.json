@@ -1,4 +1,31 @@
 {
   "format": 1,
-  "notes": []
+  "notes": [
+    {
+      "id": "alarm-once-per-signature",
+      "title": "Send an alarm with the same signature to the owner once",
+      "min_core": "4.0.0",
+      "requires_tools": [],
+      "source": "field practice of the aos contour (factory monitoring routines, autumn 2026)",
+      "body": "A monitor that runs every few minutes and finds the same problem every time\nmust not tell the owner about it every time. The tenth identical message is\nnot a signal, it is noise that teaches the owner to ignore the channel, and\nthe next real alarm drowns in it.\n\nThe habit that held on live nodes:\n\n- Give each alarm a signature: the identifier of the object (a pull request\n  number, a task id, a routine name) plus the kind of problem. Put the\n  identifier in the text, not just the class of the problem (\"PR 123 is red\n  on lint\", not \"some PRs are red\").\n- Keep the signatures already sent in the routine's own state. Send again\n  only when the signature changes (a new object, a different problem) or\n  after an explicit snooze from the owner has expired.\n- The rule for repeating lives in the routine, not in the memory of the agent\n  that runs it: a fresh session does not remember what the previous one sent.\n\nA routine that goes red a second time with the same text is a broken routine,\nnot a second alarm. Fix the routine (or record the snooze) instead of letting\nit repeat."
+    },
+    {
+      "id": "promise-needs-a-watcher",
+      "title": "Do not promise \"I will write when it is done\" without a watcher",
+      "min_core": "4.51.0",
+      "requires_tools": [
+        "watch_start"
+      ],
+      "source": "field practice of the aos contour, agent-os#1251 (orchestration routes the promise to watch_start)",
+      "body": "A chat turn ends, and nothing wakes the session up again on its own. A reply\nsuch as \"the build is running, I will tell you when it finishes\" is therefore\na promise nobody keeps: the turn closes, the build finishes, and the owner\nhears nothing until he asks \"so how is it going?\".\n\nBefore you write such a promise, hand the waiting to the node:\n\n- start a watcher with `watch_start` on the thing you are waiting for (a CI\n  run, a pull request, a command), so the node itself posts the result to the\n  chat when it reaches a terminal state;\n- for work that is not observable that way, set a reminder on the moment you\n  expect a result, and check it then.\n\nOnly after the watcher (or the reminder) exists, say so in the reply, in the\nform \"watching X, the result will come here\". A promise with nothing behind\nit is worse than no promise: the owner waits for a message that never comes.\n\nThe same applies to a background session or a spawned worker: its report does\nnot wake the chat by itself unless something is set to deliver it."
+    },
+    {
+      "id": "state-claims-need-a-command",
+      "title": "Report a state only from a command run in the same turn",
+      "min_core": "4.0.0",
+      "requires_tools": [],
+      "source": "field practice of the aos contour (owner reports on rights, usage and CI, autumn 2026)",
+      "body": "\"The CI is green\", \"the node has root on this host\", \"we used 40% of the\nweek\" -- each of these sounds like a fact, and each has been wrong on a live\nnode when it came from memory, from a document or from an earlier turn. Rights\nchange, usage moves every minute, a check that was green an hour ago is red on\nthe new head.\n\nThe habit: a claim about the current state goes into a reply only together\nwith a command run in this same turn that shows it.\n\n- Rights: ask the system (for example `sudo -l`, or the node's own boundary\n  file), not the canon or a note.\n- Usage and limits: the node's usage tool or command, with the time of the\n  reading.\n- CI and pull requests: the GitHub API or `gh` on the current head sha.\n- Anything else: the shortest read-only command that returns the value.\n\nIf the command cannot be run, say \"not checked\" and list what was tried. \"I\ncannot\" without the list of checked options is an unchecked answer: go\nthrough the node's tools first (the `gh` scopes, `sudo -l`, the MCP tools,\nthe neighbour APIs) and name what was checked."
+    }
+  ]
 }
