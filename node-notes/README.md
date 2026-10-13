@@ -7,8 +7,8 @@ these notes on its host auto-update tick and hands them out only on request
 system context, and a node's own built-in docs win on any conflict: a note is
 practice, not a contract.
 
-The catalog is empty on purpose until `main` is protected; the format and the
-checks come first.
+`main` is protected by a no-bypass ruleset (`.github/rulesets/main.json`), so
+every note lands through a reviewed pull request and the checks below.
 
 ## Publication
 
