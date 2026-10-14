@@ -3621,7 +3621,10 @@ schema_compat_preflight() { # schema_compat_preflight <prev-tag> <target-tag> �
 
 # Serialize restart-pause decisions with the stopped snapshot/swap window.
 # The timer's service may already be dispatched, so drain both before stopping
-# the core. Missing transient units are normal; other stop failures abort.
+# the core. Missing transient units are normal and are skipped without a stop:
+# `systemctl stop` of a unit that is not loaded prints "Failed to stop …: Unit
+# … not loaded." on every upgrade, which read as a fault in the update journal
+# (ClickUp 12418agh8nm). Other stop failures abort.
 EXIT_RESTART_FD=""
 hold_exit_watch_restart() {
   stability_dir_init
@@ -3629,11 +3632,15 @@ hold_exit_watch_restart() {
   [ ! -L "$STABILITY_DIR/.restart-pause.lock" ] || die "unsafe restart-pause lock"
   exec {EXIT_RESTART_FD}>"$STABILITY_DIR/.restart-pause.lock"
   flock -w 25 "$EXIT_RESTART_FD" || die "could not hold crash-loop restart decisions"
-  local unit kind state
+  local unit kind state name
   unit="${AGENTOS_SERVICE%.service}"
   for kind in timer service; do
-    if ! systemctl_bus stop "agentos-exit-watch-restart-${unit}.${kind}"; then
-      state="$(systemctl_bus show -p LoadState --value "agentos-exit-watch-restart-${unit}.${kind}")" \
+    name="agentos-exit-watch-restart-${unit}.${kind}"
+    state="$(systemctl_bus show -p LoadState --value "$name")" \
+      || die "could not inspect crash-loop restart ${kind}"
+    [ "$state" != not-found ] || continue
+    if ! systemctl_bus stop "$name"; then
+      state="$(systemctl_bus show -p LoadState --value "$name")" \
         || die "could not inspect crash-loop restart ${kind}"
       [ "$state" = not-found ] || die "could not cancel crash-loop restart ${kind}"
     fi
