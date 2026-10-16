@@ -3490,9 +3490,10 @@ prune_versions() { # keep current + 2 previous version dirs under versions/ — 
 # Keep .env's AGENTOS_VERSION honest about which code is actually live. The
 # symlink is the source of truth for WHICH TREE RUNS, but this value is not
 # merely cosmetic: .env is the unit's EnvironmentFile and core/build-info.ts
-# reads AGENTOS_VERSION ahead of the release tree's build-info.json, so
-# whatever the process is started with is the version /info reports until it
-# restarts. Every caller must therefore write it BEFORE `systemctl start`.
+# reads AGENTOS_VERSION wherever the tree carries no build-info.json (older
+# tarballs) and the autoupdate poller falls back to it, so whatever the process
+# is started with can be the version /info reports until it restarts. Every
+# caller must therefore write it BEFORE `systemctl start`.
 # Absent key => nothing to do; this never CREATES the key.
 set_env_version() { # set_env_version <tag>
   local tag="$1" env_file="$AGENTOS_HOME/.env"
@@ -3621,7 +3622,10 @@ schema_compat_preflight() { # schema_compat_preflight <prev-tag> <target-tag> �
 
 # Serialize restart-pause decisions with the stopped snapshot/swap window.
 # The timer's service may already be dispatched, so drain both before stopping
-# the core. Missing transient units are normal; other stop failures abort.
+# the core. Missing transient units are normal and are skipped without a stop:
+# `systemctl stop` of a unit that is not loaded prints "Failed to stop …: Unit
+# … not loaded." on every upgrade, which read as a fault in the update journal
+# (ClickUp 12418agh8nm). Other stop failures abort.
 EXIT_RESTART_FD=""
 hold_exit_watch_restart() {
   stability_dir_init
@@ -3629,11 +3633,15 @@ hold_exit_watch_restart() {
   [ ! -L "$STABILITY_DIR/.restart-pause.lock" ] || die "unsafe restart-pause lock"
   exec {EXIT_RESTART_FD}>"$STABILITY_DIR/.restart-pause.lock"
   flock -w 25 "$EXIT_RESTART_FD" || die "could not hold crash-loop restart decisions"
-  local unit kind state
+  local unit kind state name
   unit="${AGENTOS_SERVICE%.service}"
   for kind in timer service; do
-    if ! systemctl_bus stop "agentos-exit-watch-restart-${unit}.${kind}"; then
-      state="$(systemctl_bus show -p LoadState --value "agentos-exit-watch-restart-${unit}.${kind}")" \
+    name="agentos-exit-watch-restart-${unit}.${kind}"
+    state="$(systemctl_bus show -p LoadState --value "$name")" \
+      || die "could not inspect crash-loop restart ${kind}"
+    [ "$state" != not-found ] || continue
+    if ! systemctl_bus stop "$name"; then
+      state="$(systemctl_bus show -p LoadState --value "$name")" \
         || die "could not inspect crash-loop restart ${kind}"
       [ "$state" = not-found ] || die "could not cancel crash-loop restart ${kind}"
     fi
@@ -3674,6 +3682,17 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
       || warn "usage-group reconciliation refused (see above) — the node keeps its private usage store"
     reconcile_gh || warn "gh reconciliation hit a snag"
     ensure_bwrap
+    # The install file's AGENTOS_VERSION is repaired here too (agent-os#1789).
+    # It is the unit's EnvironmentFile, and once it drifted behind the symlink
+    # (a node on v4.82.0 whose file still said v4.58.0) the node reported the
+    # old version, the core kept poking the updater for a release it already
+    # ran, and every poke ended right here — the one exit that never wrote it.
+    local env_ver
+    env_ver="$(dotenv_val AGENTOS_VERSION 2>/dev/null || true)"
+    if [ -n "$env_ver" ] && [ "$env_ver" != "$tag" ]; then
+      set_env_version "$tag"
+      warn "AGENTOS_VERSION in $AGENTOS_HOME/.env said ${env_ver} while ${tag} is live — corrected; the running core reads it at boot, so \`agentos restart\` makes it report ${tag}"
+    fi
     # Written, but the running core still has the environment it booted with, so
     # say what makes it count rather than restarting a healthy node unasked.
     if ensure_ctl_env; then
