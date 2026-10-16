@@ -28,7 +28,8 @@
 #                              public IP and free 80/443 gets <ip-with-dashes>.sslip.io via Caddy + real
 #                              certs (no DNS record needed); anything else (NAT, a laptop, no certificate
 #                              in ~2 min) gets a Cloudflare quick tunnel — a trial mode, the address
-#                              changes when the tunnel restarts; if neither works, bot only. A re-run or
+#                              changes when the tunnel restarts and live updates (SSE) do not stream
+#                              through it (view only); if neither works, bot only. A re-run or
 #                              a named instance (--user) keeps the old behaviour: bot only unless asked.
 #   --auto-https               The automatic choice above, also on a re-run or a named instance.
 #   --domain <host>            HTTPS via Caddy + real certs. Needs an A record → this host, 80+443 open.
@@ -636,6 +637,8 @@ auto_https_announce() {
       warn "no domain given and no direct public access (${AUTO_HTTPS_REASON}) — using a Cloudflare quick tunnel."
       warn "TRIAL MODE: the address changes whenever the tunnel restarts (the node re-registers"
       warn "the Mini App button each time), and Cloudflare gives it no uptime guarantee."
+      warn "VIEW ONLY: live updates (SSE streams: session feed, run output) do not pass through"
+      warn "a quick tunnel — the Mini App opens, but nothing streams into it."
       warn "For a stable Mini App: re-run with --domain <host>. Bot only: --no-https." ;;
   esac
 }
@@ -718,6 +721,8 @@ HOOK
   $SUDO tee "/etc/systemd/system/${unit}.service" >/dev/null <<UNIT
 # Written by install.sh: throwaway Cloudflare quick tunnel for the AgentOS Mini App.
 # The hostname changes on every restart; ExecStartPost republishes it.
+# --config /dev/null: a host-wide /etc/cloudflared/config.yml (a named tunnel
+# already on this box) would otherwise load its ingress rules and answer 404.
 [Unit]
 Description=AgentOS quick tunnel (${SERVICE_NAME})
 After=network-online.target ${SERVICE_NAME}.service
@@ -725,7 +730,7 @@ Wants=network-online.target
 
 [Service]
 User=${SERVICE_USER}
-ExecStart=${bin} tunnel --no-autoupdate --metrics 127.0.0.1:${mport} --url http://127.0.0.1:${PORT}
+ExecStart=${bin} tunnel --config /dev/null --no-autoupdate --metrics 127.0.0.1:${mport} --url http://127.0.0.1:${PORT}
 ExecStartPost=${hook}
 ExecStartPost=+/bin/systemctl try-restart --no-block ${SERVICE_NAME}.service
 TimeoutStartSec=120
@@ -839,7 +844,7 @@ while [ $# -gt 0 ]; do
     -y|--yes)       ASSUME_YES=1; shift ;;
     # Line range = the whole header block above (ends one line before
     # `set -euo pipefail`). Grow the header, grow this range, or --help truncates.
-    -h|--help)      sed -n '2,131p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,132p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              die "unknown option: $1 (try --help)" ;;
   esac
 done
@@ -2875,7 +2880,7 @@ install_systemd() {
   # its bin dir on PATH for any child `node` processes npm spawns.
   $SUDO env PATH="$INSTALL_DIR/node/bin:$PATH" \
     "$INSTALL_DIR/node/bin/node" "$INSTALL_DIR/node/bin/npm" \
-    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.292"
+    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.299"
 
   step "Config + unit"
   # Snapshot what a RUNNING node booted with, before this run rewrites any of
@@ -3489,7 +3494,7 @@ $(if [ -z "${ADMIN_IDS:-}${ADMIN_USERNAMES:-}" ]; then
   fi)
   $(echo -e "${BOLD}Mini App${NC}")   $(case "$HTTPS_MODE" in
       none)  echo "not published (bot-only install). Add it: re-run with --domain <host>." ;;
-      quick) echo "${MINIAPP_URL:-<pending>} — TRIAL: the address changes when the tunnel restarts. Stable: --domain <host>." ;;
+      quick) echo "${MINIAPP_URL:-<pending>} — TRIAL, VIEW ONLY: the address changes when the tunnel restarts and live updates (SSE) do not stream. Stable: --domain <host>." ;;
       *)     echo "https://${DOMAIN}/app — open it from the bot's menu button or /app." ;;
     esac)
   $(echo -e "${BOLD}Install${NC}")    $INSTALL_DIR ($SERVICE_USER, 127.0.0.1:$PORT)
@@ -3706,7 +3711,7 @@ if [ -z "$HTTPS_MODE" ]; then
     info "because Telegram opens a Mini App only on a public https origin."
     echo -e "    ${BOLD}1${NC}) I have a domain pointing here     ${DIM}(real certs, recommended)${NC}"
     echo -e "    ${BOLD}2${NC}) Cloudflare named tunnel token     ${DIM}(no open ports needed)${NC}"
-    echo -e "    ${BOLD}3${NC}) Throwaway quick tunnel            ${DIM}(demo only — new URL each restart)${NC}"
+    echo -e "    ${BOLD}3${NC}) Throwaway quick tunnel            ${DIM}(demo only — new URL each restart, no live updates)${NC}"
     echo -e "    ${BOLD}4${NC}) Skip — bot only                   ${DIM}(add a domain later, re-run this script)${NC}"
     choice="$(read -r -p "$(echo -e "  ${BOLD}Choice${NC} ${DIM}(1-4)${NC}: ")" c </dev/tty; echo "${c:-4}")"
     case "$choice" in
