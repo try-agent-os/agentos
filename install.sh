@@ -19,6 +19,16 @@
 #                              argv or logs. Asks "bot @x, created by @you — use it?" (--yes skips);
 #                              --admin defaults to the account that created the bot. Needs python3.
 #   --manager-url <url>        Base URL of the manager node for --create-bot (or $AGENTOS_MANAGER_URL).
+#   --no-telegram              A node WITHOUT a Telegram bot (a release canary, a test contour; or
+#                              AGENTOS_NO_TELEGRAM=1 in the environment). No token is asked for, .env
+#                              gets an empty TELEGRAM_BOT_TOKEN= plus the marker AGENTOS_NO_TELEGRAM=1,
+#                              and a later re-run or --upgrade on that .env stays in this mode without
+#                              the flag. Node notifications (routines, alerts, notify) are NOT delivered
+#                              anywhere and the Mini App stays closed, so automatic HTTPS is not turned
+#                              on (an explicit --domain/--quick still is). Connect a bot later: re-run
+#                              with --token or --create-bot — that leaves the mode and drops the marker.
+#                              Refused together with --token / --create-bot / $TELEGRAM_BOT_TOKEN.
+#                              Without this flag (or the marker) a missing token is still fatal.
 #   --admin <id|username>      Auto-approved admin: a numeric Telegram id (123510069) or a Telegram
 #                              username (vasily, or @vasily — the @ is optional). Comma-separate to
 #                              name several, in any mix. Omit it entirely and the node is UNCLAIMED:
@@ -28,7 +38,8 @@
 #                              public IP and free 80/443 gets <ip-with-dashes>.sslip.io via Caddy + real
 #                              certs (no DNS record needed); anything else (NAT, a laptop, no certificate
 #                              in ~2 min) gets a Cloudflare quick tunnel — a trial mode, the address
-#                              changes when the tunnel restarts; if neither works, bot only. A re-run or
+#                              changes when the tunnel restarts and live updates (SSE) do not stream
+#                              through it (view only); if neither works, bot only. A re-run or
 #                              a named instance (--user) keeps the old behaviour: bot only unless asked.
 #   --auto-https               The automatic choice above, also on a re-run or a named instance.
 #   --domain <host>            HTTPS via Caddy + real certs. Needs an A record → this host, 80+443 open.
@@ -185,6 +196,12 @@ BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 # exactly when a manager URL is known (flag, env, or this constant).
 DEFAULT_MANAGER_URL=""
 CREATE_BOT="${AGENTOS_CREATE_BOT:-0}"
+# --no-telegram (12418aghg0x): a node with no bot at all. Opt-in only — a missing
+# token without it is still fatal, so a forgotten secret never yields a silent
+# node whose /healthz is green. Sticky through AGENTOS_NO_TELEGRAM=1 in .env
+# (resolve_bot_token below), which only this mode writes.
+NO_TELEGRAM="${AGENTOS_NO_TELEGRAM:-0}"
+[ "$NO_TELEGRAM" = "1" ] || NO_TELEGRAM=0
 MANAGER_URL="${AGENTOS_MANAGER_URL:-$DEFAULT_MANAGER_URL}"
 CREATED_BOT_USERNAME=""   # filled by create_bot_via_manager
 CLAIMER_ID=""             # the Telegram account that created the bot → --admin default
@@ -611,7 +628,9 @@ auto_https_pick() {
 # instance — see the block comment above.
 auto_https_applies() { # auto_https_applies <existing-install 0|1>
   [ "$HTTPS_MODE" = "auto" ] && return 0
-  [ -z "$HTTPS_MODE" ] && [ "$1" = "0" ] && [ "$SERVICE_USER" = "agentos" ]
+  # No bot → no Mini App to publish (it is closed without a token), so a node
+  # without Telegram gets no public address unless one is asked for explicitly.
+  [ -z "$HTTPS_MODE" ] && [ "$1" = "0" ] && [ "$SERVICE_USER" = "agentos" ] && [ "$NO_TELEGRAM" != "1" ]
 }
 
 # The sslip.io name only counts once a browser would accept it: a real
@@ -636,6 +655,8 @@ auto_https_announce() {
       warn "no domain given and no direct public access (${AUTO_HTTPS_REASON}) — using a Cloudflare quick tunnel."
       warn "TRIAL MODE: the address changes whenever the tunnel restarts (the node re-registers"
       warn "the Mini App button each time), and Cloudflare gives it no uptime guarantee."
+      warn "VIEW ONLY: live updates (SSE streams: session feed, run output) do not pass through"
+      warn "a quick tunnel — the Mini App opens, but nothing streams into it."
       warn "For a stable Mini App: re-run with --domain <host>. Bot only: --no-https." ;;
   esac
 }
@@ -718,6 +739,8 @@ HOOK
   $SUDO tee "/etc/systemd/system/${unit}.service" >/dev/null <<UNIT
 # Written by install.sh: throwaway Cloudflare quick tunnel for the AgentOS Mini App.
 # The hostname changes on every restart; ExecStartPost republishes it.
+# --config /dev/null: a host-wide /etc/cloudflared/config.yml (a named tunnel
+# already on this box) would otherwise load its ingress rules and answer 404.
 [Unit]
 Description=AgentOS quick tunnel (${SERVICE_NAME})
 After=network-online.target ${SERVICE_NAME}.service
@@ -725,7 +748,7 @@ Wants=network-online.target
 
 [Service]
 User=${SERVICE_USER}
-ExecStart=${bin} tunnel --no-autoupdate --metrics 127.0.0.1:${mport} --url http://127.0.0.1:${PORT}
+ExecStart=${bin} tunnel --config /dev/null --no-autoupdate --metrics 127.0.0.1:${mport} --url http://127.0.0.1:${PORT}
 ExecStartPost=${hook}
 ExecStartPost=+/bin/systemctl try-restart --no-block ${SERVICE_NAME}.service
 TimeoutStartSec=120
@@ -815,6 +838,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --token)        BOT_TOKEN="${2:?--token needs a value}"; shift 2 ;;
     --create-bot)   CREATE_BOT=1; shift ;;
+    --no-telegram)  NO_TELEGRAM=1; shift ;;
     --manager-url)  MANAGER_URL="${2:?--manager-url needs a value}"; shift 2 ;;
     --admin)        ADMIN_INPUT="${2:?--admin needs a value}"; shift 2 ;;
     --domain)       DOMAIN="${2:?--domain needs a value}"; HTTPS_MODE="caddy"; shift 2 ;;
@@ -839,7 +863,7 @@ while [ $# -gt 0 ]; do
     -y|--yes)       ASSUME_YES=1; shift ;;
     # Line range = the whole header block above (ends one line before
     # `set -euo pipefail`). Grow the header, grow this range, or --help truncates.
-    -h|--help)      sed -n '2,131p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,142p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              die "unknown option: $1 (try --help)" ;;
   esac
 done
@@ -2295,6 +2319,104 @@ default_admin_from_claimer() {
 if [ "$CREATE_BOT" = "1" ] && [ -n "$BOT_TOKEN" ]; then
   die "--create-bot and --token (or \$TELEGRAM_BOT_TOKEN) both given — pick one."
 fi
+if [ "$NO_TELEGRAM" = "1" ] && [ "$CREATE_BOT" = "1" ]; then
+  die "--no-telegram and --create-bot both given — pick one."
+fi
+if [ "$NO_TELEGRAM" = "1" ] && [ -n "$BOT_TOKEN" ]; then
+  die "--no-telegram and --token (or \$TELEGRAM_BOT_TOKEN) both given — pick one."
+fi
+
+# The bot token both install channels end up with, from the existing .env's
+# contents ($1, empty on a fresh install). Order:
+#   1. --create-bot: a NEW bot, outranking whatever .env holds;
+#   2. --no-telegram (flag or env): no bot, no question;
+#   3. --token / $TELEGRAM_BOT_TOKEN, else the token already in .env;
+#   4. no token, but .env carries AGENTOS_NO_TELEGRAM=1: the node was installed
+#      without a bot, and a re-run or --upgrade without the flag continues that
+#      mode (sticky) instead of dying for want of a token;
+#   5. otherwise ask (obtain_bot_token) and die on nothing.
+# An empty TELEGRAM_BOT_TOKEN= WITHOUT the marker is NOT the mode: that is a
+# lost secret, and it stays fatal. A token on a marked node leaves the mode;
+# the marker then drops out of .env (telegram_env_lines / the docker set_env).
+resolve_bot_token() { # resolve_bot_token <existing .env contents>
+  local envc="${1:-}" marked=0
+  if grep -qx 'AGENTOS_NO_TELEGRAM=1' <<<"$envc"; then marked=1; fi
+  if [ "$CREATE_BOT" = "1" ]; then
+    create_bot_via_manager
+  fi
+  if [ "$NO_TELEGRAM" = "1" ]; then
+    BOT_TOKEN=""
+    info "--no-telegram: installing without a Telegram bot"
+    return 0
+  fi
+  if [ -z "$BOT_TOKEN" ] && [ -n "$envc" ]; then
+    BOT_TOKEN="$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' <<<"$envc" | tail -1)"
+    if [ -n "$BOT_TOKEN" ]; then info "reusing the bot token from the existing .env"; fi
+  fi
+  if [ -z "$BOT_TOKEN" ] && [ "$marked" = "1" ]; then
+    NO_TELEGRAM=1
+    info "the existing .env says AGENTOS_NO_TELEGRAM=1 — continuing without a Telegram bot (--token or --create-bot connects one)"
+    return 0
+  fi
+  if [ -z "$BOT_TOKEN" ] && [ "$CREATE_BOT" != "1" ] && { [ "$ASSUME_YES" = "1" ] || [ ! -t 0 ]; }; then
+    die "a bot token is required and there is no terminal to ask on — pass --token (or \$TELEGRAM_BOT_TOKEN) or --create-bot; a node without a bot: --no-telegram."
+  fi
+  if [ -z "$BOT_TOKEN" ]; then
+    obtain_bot_token
+  fi
+  [ -n "$BOT_TOKEN" ] || die "a bot token is required (a node without a bot: --no-telegram)."
+  if [ "$marked" = "1" ]; then
+    info "a bot token is given — leaving the no-Telegram mode (AGENTOS_NO_TELEGRAM drops out of .env)"
+  fi
+  grep -qE '^[0-9]+:[A-Za-z0-9_-]+$' <<<"$BOT_TOKEN" \
+    || warn "that token does not look like a @BotFather token — continuing, but check it if the bot stays silent."
+}
+
+# The Telegram half of a bare-metal .env: the token line always (empty in the
+# no-Telegram mode), the marker only in that mode — write_env_systemd rewrites
+# the file wholesale, so leaving the mode drops the marker by omission.
+telegram_env_lines() {
+  echo "TELEGRAM_BOT_TOKEN=${BOT_TOKEN}"
+  if [ "$NO_TELEGRAM" = "1" ]; then echo "AGENTOS_NO_TELEGRAM=1"; fi
+}
+
+# The "Bot" line of the closing summary, shared by both channels.
+bot_summary_lines() {
+  if [ "$NO_TELEGRAM" = "1" ]; then
+    echo -e "  ${BOLD}Bot${NC}        ${YELLOW}not connected${NC} — this node runs WITHOUT Telegram (AGENTOS_NO_TELEGRAM=1)."
+    echo "               Node notifications (routines, alerts, notify) are NOT delivered anywhere."
+    echo "               Connect a bot: re-run install.sh --upgrade --token <bot-token> (or --create-bot)."
+  else
+    echo -e "  ${BOLD}Bot${NC}        message it on Telegram — it is already polling."
+  fi
+}
+
+# Does this .env ($1 = contents) belong to an install that already exists? A
+# token says so, and so does the no-Telegram marker (its token is empty) — a
+# re-run of a bot-less node must not count as a fresh install for automatic HTTPS.
+env_marks_existing_install() {
+  grep -qE '^(TELEGRAM_BOT_TOKEN=.|AGENTOS_NO_TELEGRAM=1$)' <<<"${1:-}"
+}
+
+# "Which bot would this command line end up with?" — runs the real
+# resolve_bot_token against the .env named by the hook's value (empty or a
+# missing file = a fresh install) and prints the mode, a hash of the token, the
+# existing-install bit automatic HTTPS keys off, and the Telegram lines a
+# bare-metal .env would get. No install, no root.
+# Driven by scripts/tests/install-no-telegram.test.sh.
+if [ -n "${AGENTOS_PRINT_BOT_TOKEN+x}" ]; then
+  _bt_env=""
+  if [ -n "$AGENTOS_PRINT_BOT_TOKEN" ] && [ -f "$AGENTOS_PRINT_BOT_TOKEN" ]; then
+    _bt_env="$(cat "$AGENTOS_PRINT_BOT_TOKEN")"
+  fi
+  resolve_bot_token "$_bt_env"
+  echo "no_telegram=${NO_TELEGRAM}"
+  echo "token_sha256=$(printf '%s' "$BOT_TOKEN" | sha256sum | cut -d' ' -f1)"
+  echo "existing=$(if env_marks_existing_install "$_bt_env"; then echo 1; else echo 0; fi)"
+  echo "--- env ---"
+  telegram_env_lines
+  exit 0
+fi
 
 # "What would --create-bot hand over?" — runs the real claim flow against
 # --manager-url (the suite's stub manager) and prints what it would configure,
@@ -2474,7 +2596,7 @@ write_env_systemd() {
   # call is about to overwrite, so a re-run without --admin keeps its admins.
   $SUDO install -m 600 /dev/null "$INSTALL_DIR/.env"
   $SUDO tee "$INSTALL_DIR/.env" >/dev/null <<EOF
-TELEGRAM_BOT_TOKEN=${BOT_TOKEN}
+$(telegram_env_lines)
 TELEGRAM_ADMIN_USER_IDS=${ADMIN_IDS}
 TELEGRAM_ADMIN_USERNAMES=${ADMIN_USERNAMES}
 PORT=${PORT}
@@ -2875,7 +2997,7 @@ install_systemd() {
   # its bin dir on PATH for any child `node` processes npm spawns.
   $SUDO env PATH="$INSTALL_DIR/node/bin:$PATH" \
     "$INSTALL_DIR/node/bin/node" "$INSTALL_DIR/node/bin/npm" \
-    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.292"
+    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.299"
 
   step "Config + unit"
   # Snapshot what a RUNNING node booted with, before this run rewrites any of
@@ -3412,19 +3534,8 @@ if [ "$INSTALL_MODE" = "systemd" ]; then
   # 0600 root/service-owned file is readable here.
   # --create-bot is an explicit "give this node a NEW bot": it outranks the
   # token already in .env instead of being silently shadowed by it.
-  if [ "$CREATE_BOT" = "1" ]; then
-    create_bot_via_manager
-  fi
-  if [ -z "$BOT_TOKEN" ] && [ -e "$INSTALL_DIR/.env" ]; then
-    BOT_TOKEN="$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null | sed -n 's/^TELEGRAM_BOT_TOKEN=//p' | tail -1 || true)"
-    [ -n "$BOT_TOKEN" ] && info "reusing the bot token from the existing .env"
-  fi
-  if [ -z "$BOT_TOKEN" ]; then
-    obtain_bot_token
-  fi
-  [ -n "$BOT_TOKEN" ] || die "a bot token is required."
-  grep -qE '^[0-9]+:[A-Za-z0-9_-]+$' <<<"$BOT_TOKEN" \
-    || warn "that token does not look like a @BotFather token — continuing, but check it if the bot stays silent."
+  # --no-telegram and its AGENTOS_NO_TELEGRAM=1 marker: resolve_bot_token.
+  resolve_bot_token "$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null || true)"
 
   # Second attempt, now that $SUDO exists: on a re-run the install dir's .env is
   # 0600 root/agentos, so under `sudo install.sh` the pre-hook attempt above read
@@ -3450,11 +3561,15 @@ if [ "$INSTALL_MODE" = "systemd" ]; then
   # Read the .env first and grep a here-string: `read | grep -q` under pipefail
   # can lose the verdict to a broken pipe (scripts/tests/shell-pipe-race.test.sh).
   AUTO_HTTPS_HAD_TOKEN=0
-  if grep -q '^TELEGRAM_BOT_TOKEN=.' <<<"$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null || true)"; then
+  if env_marks_existing_install "$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null || true)"; then
     AUTO_HTTPS_HAD_TOKEN=1
   fi
   if auto_https_applies "$AUTO_HTTPS_HAD_TOKEN"; then
     HTTPS_MODE="auto"
+  fi
+  if [ -z "$HTTPS_MODE" ] && [ "$NO_TELEGRAM" = "1" ]; then
+    HTTPS_MODE="none"
+    info "no Telegram bot → no Mini App to publish (--no-https); --domain or --quick publishes it anyway"
   fi
   if [ -z "$HTTPS_MODE" ]; then
     if [ "$ASSUME_YES" = "1" ] || [ ! -t 0 ]; then
@@ -3481,15 +3596,15 @@ if [ "$INSTALL_MODE" = "systemd" ]; then
 
 $(host_authority_headline)
 
-  $(echo -e "${BOLD}Bot${NC}")        message it on Telegram — it is already polling.
-$(if [ -z "${ADMIN_IDS:-}${ADMIN_USERNAMES:-}" ]; then
+$(bot_summary_lines)
+$(if [ "$NO_TELEGRAM" != "1" ] && [ -z "${ADMIN_IDS:-}${ADMIN_USERNAMES:-}" ]; then
     echo "               No admin was configured, so this node is UNCLAIMED: the FIRST person"
     echo "               who sends it a private message becomes its admin — once, no time limit."
     echo "               Message it NOW, before anybody else does."
   fi)
   $(echo -e "${BOLD}Mini App${NC}")   $(case "$HTTPS_MODE" in
       none)  echo "not published (bot-only install). Add it: re-run with --domain <host>." ;;
-      quick) echo "${MINIAPP_URL:-<pending>} — TRIAL: the address changes when the tunnel restarts. Stable: --domain <host>." ;;
+      quick) echo "${MINIAPP_URL:-<pending>} — TRIAL, VIEW ONLY: the address changes when the tunnel restarts and live updates (SSE) do not stream. Stable: --domain <host>." ;;
       *)     echo "https://${DOMAIN}/app — open it from the bot's menu button or /app." ;;
     esac)
   $(echo -e "${BOLD}Install${NC}")    $INSTALL_DIR ($SERVICE_USER, 127.0.0.1:$PORT)
@@ -3664,19 +3779,8 @@ install_autoupdate_timer "$INSTALL_DIR"
 
 step "Configuration"
 # --create-bot outranks the token in .env — same rule as the bare-metal path.
-if [ "$CREATE_BOT" = "1" ]; then
-  create_bot_via_manager
-fi
-if [ -z "$BOT_TOKEN" ] && [ -f .env ]; then
-  BOT_TOKEN="$(grep -E '^TELEGRAM_BOT_TOKEN=' .env | cut -d= -f2- || true)"
-  [ -n "$BOT_TOKEN" ] && info "reusing the bot token from the existing .env"
-fi
-if [ -z "$BOT_TOKEN" ]; then
-  obtain_bot_token
-fi
-[ -n "$BOT_TOKEN" ] || die "a bot token is required."
-grep -qE '^[0-9]+:[A-Za-z0-9_-]+$' <<<"$BOT_TOKEN" \
-  || warn "that token does not look like a @BotFather token — continuing, but check it if the bot stays silent."
+# --no-telegram and its AGENTOS_NO_TELEGRAM=1 marker: resolve_bot_token.
+resolve_bot_token "$(if [ -f .env ]; then cat .env; fi)"
 
 # Admin, on a re-run: inherited from $INSTALL_DIR/.env unless --admin (or its env
 # default) named one — see inherit_admin_from_dotenv above, which both channels
@@ -3693,8 +3797,12 @@ fi
 
 # HTTPS mode: no flag on a fresh default install → automatic (12418agh2ky);
 # otherwise ask only if no flag decided it.
-if auto_https_applies "$(if [ -f .env ] && grep -q '^TELEGRAM_BOT_TOKEN=.' .env; then echo 1; else echo 0; fi)"; then
+if auto_https_applies "$(if env_marks_existing_install "$(if [ -f .env ]; then cat .env; fi)"; then echo 1; else echo 0; fi)"; then
   HTTPS_MODE="auto"
+fi
+if [ -z "$HTTPS_MODE" ] && [ "$NO_TELEGRAM" = "1" ]; then
+  HTTPS_MODE="none"
+  info "no Telegram bot → no Mini App to publish (--no-https); --domain or --quick publishes it anyway"
 fi
 if [ -z "$HTTPS_MODE" ]; then
   if [ "$ASSUME_YES" = "1" ] || [ ! -t 0 ]; then
@@ -3706,7 +3814,7 @@ if [ -z "$HTTPS_MODE" ]; then
     info "because Telegram opens a Mini App only on a public https origin."
     echo -e "    ${BOLD}1${NC}) I have a domain pointing here     ${DIM}(real certs, recommended)${NC}"
     echo -e "    ${BOLD}2${NC}) Cloudflare named tunnel token     ${DIM}(no open ports needed)${NC}"
-    echo -e "    ${BOLD}3${NC}) Throwaway quick tunnel            ${DIM}(demo only — new URL each restart)${NC}"
+    echo -e "    ${BOLD}3${NC}) Throwaway quick tunnel            ${DIM}(demo only — new URL each restart, no live updates)${NC}"
     echo -e "    ${BOLD}4${NC}) Skip — bot only                   ${DIM}(add a domain later, re-run this script)${NC}"
     choice="$(read -r -p "$(echo -e "  ${BOLD}Choice${NC} ${DIM}(1-4)${NC}: ")" c </dev/tty; echo "${c:-4}")"
     case "$choice" in
@@ -3834,6 +3942,13 @@ if ! grep -qE '^INTERNAL_API_TOKEN=.' .env 2>/dev/null; then
   set_env INTERNAL_API_TOKEN "$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 fi
 set_env TELEGRAM_BOT_TOKEN "$BOT_TOKEN"
+# The no-Telegram marker (resolve_bot_token): written only in that mode, dropped
+# the moment a token arrives — this .env is upserted, not rewritten.
+if [ "$NO_TELEGRAM" = "1" ]; then
+  set_env AGENTOS_NO_TELEGRAM 1
+else
+  unset_env AGENTOS_NO_TELEGRAM
+fi
 set_env TELEGRAM_ADMIN_USER_IDS "${ADMIN_IDS:-}"
 # Written even when empty, exactly like the ids key above: an operator who moves
 # from a username to an id (or the other way) needs the key they abandoned to end
@@ -4018,8 +4133,8 @@ cat <<EOF
 
 $(echo -e "${GREEN}${BOLD}AgentOS Node is running.${NC}")
 
-  $(echo -e "${BOLD}Bot${NC}")        message it on Telegram — it is already polling.
-$(if [ -z "${ADMIN_IDS:-}${ADMIN_USERNAMES:-}" ]; then
+$(bot_summary_lines)
+$(if [ "$NO_TELEGRAM" != "1" ] && [ -z "${ADMIN_IDS:-}${ADMIN_USERNAMES:-}" ]; then
     echo "               No admin was configured, so this node is UNCLAIMED: the FIRST person"
     echo "               who sends it a private message becomes its admin — once, no time limit."
     echo "               Message it NOW, before anybody else does."
