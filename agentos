@@ -3158,6 +3158,9 @@ systemd_backup_sqlite() { # systemd_backup_sqlite <label> — <label> is the cod
   local ts dest
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   dest="$BACKUP_DIR/${ts}-${label}"
+  # Make room first: keep-1 old snapshots plus the one about to be copied, so
+  # the disk never holds keep+1 of them, not even for the length of the copy.
+  systemd_prune_backups 1
   mkdir -p "$dest/$SNAPSHOT_MANIFEST"
   systemd_prune_orphans
   # What is copied: the SQLite files; .aop/ — the agent run-state (in-flight
@@ -3179,7 +3182,7 @@ systemd_backup_sqlite() { # systemd_backup_sqlite <label> — <label> is the cod
   rm -f "$dest/$SNAPSHOT_MANIFEST/list"
   echo "$label" > "$dest/version"
   ok "backup: $(basename "$dest")"
-  systemd_prune_backups
+  systemd_prune_backups 0 "$dest"
   printf '%s' "$dest"
 }
 
@@ -3205,22 +3208,80 @@ systemd_prune_orphans() { # AGENTOS_ORPHAN_KEEP_DAYS (default 14, 0 = never) —
   return 0
 }
 
-systemd_prune_backups() { # AGENTOS_KEEP_BACKUPS (default 5) — never removes the dir $BACKUP_DIR/.last-upgrade points at, regardless of age, so routine backup churn can't strand a pending rollback
-  local keep="${AGENTOS_KEEP_BACKUPS:-5}" protect=""
-  [ -f "$BACKUP_DIR/.last-upgrade" ] && protect="$(basename "$(cat "$BACKUP_DIR/.last-upgrade" 2>/dev/null || true)")"
-  # Only AUTO snapshots are subject to keep-N retention. systemd_backup_sqlite
-  # names them <UTC-timestamp>-<tag> (e.g. 20260807T211046Z-v2.30.1); a human's
+# Retention of the upgrade snapshots (ClickUp 12418aghyzv). Each auto snapshot
+# is a full copy of data/'s contexts tree — on the hub ~1.3 GB of state.db
+# alone, ~3.4 GB per snapshot — and the fleet upgrades about twice a day. The
+# old keep-5-by-mtime rule held five such copies per node (prpillar and
+# symoditi were found holding seven on 2026-10-16, ~10 GB across the host),
+# and its "pruned" lines went into the caller's $(...) capture, so the journal
+# never showed what retention did. Now:
+#   * by COUNT: AGENTOS_KEEP_BACKUPS (default 2 — the pending-rollback pair and
+#     the one before it) auto snapshots in total, the protected ones INCLUDED,
+#     so a pinned old snapshot no longer rides on top of keep-N;
+#   * by SIZE: AGENTOS_BACKUPS_MAX_MB (default 10240, 0 = no cap) over the
+#     snapshots that survive the count, oldest unprotected dropped first, the
+#     newest never;
+#   * ordered by the UTC stamp in the NAME, not by mtime (a touched dir must not
+#     jump the queue);
+#   * run BEFORE the copy too, with one slot reserved for it, so the peak on
+#     disk is keep snapshots, not keep+1;
+#   * reported on stderr, which reaches the journal.
+# What is never removed: the dir .last-upgrade points at (the pending
+# rollback), any dir passed as an argument (the snapshot just taken), and
+# anything not named <UTC-timestamp>-<tag> (a human's manual-* backup).
+systemd_prune_backups() { # systemd_prune_backups [reserve] [protect-dir...] — keeps at most AGENTOS_KEEP_BACKUPS (default 2) auto snapshots minus <reserve> free slots, then caps their total at AGENTOS_BACKUPS_MAX_MB (default 10240, 0 = off). Never fails.
+  local keep="${AGENTOS_KEEP_BACKUPS:-2}" max_mb="${AGENTOS_BACKUPS_MAX_MB:-10240}" reserve="${1:-0}"
+  case "$keep" in ''|*[!0-9]*|0) keep=2 ;; esac
+  case "$max_mb" in ''|*[!0-9]*) max_mb=10240 ;; esac
+  case "$reserve" in ''|*[!0-9]*) reserve=0 ;; esac
+  [ "$#" -gt 0 ] && shift
+  local -a protect=() autos=() kept=()
+  local p d b slots kb total=0
+  [ -f "$BACKUP_DIR/.last-upgrade" ] && p="$(basename "$(cat "$BACKUP_DIR/.last-upgrade" 2>/dev/null || true)")" && [ -n "$p" ] && protect+=("$p")
+  for p in "$@"; do [ -n "$p" ] && protect+=("$(basename "$p")"); done
+  _spb_protected() { local x; for x in "${protect[@]+"${protect[@]}"}"; do [ "$x" = "$1" ] && return 0; done; return 1; }
+  # Only AUTO snapshots are subject to retention. systemd_backup_sqlite names
+  # them <UTC-timestamp>-<tag> (e.g. 20260807T211046Z-v2.30.1); a human's
   # deliberate backup (manual-<ts>-<label>, incident surgery) does NOT match that
   # shape and is NEVER counted toward keep-N nor pruned — auto-retention must not
-  # eat a hand-made safety net. Filtering here (not just skipping in the loop)
-  # also stops manual dirs from occupying keep-N slots and evicting real snapshots.
-  ls -1dt "$BACKUP_DIR"/*/ 2>/dev/null \
-    | grep -E '/[0-9]{8}T[0-9]{6}Z-[^/]+/?$' \
-    | tail -n +"$((keep + 1))" | while IFS= read -r d; do
-    [ -n "$protect" ] && [ "$(basename "$d")" = "$protect" ] && continue
-    rm -rf "$d"
-    info "pruned $(basename "$d")"
+  # eat a hand-made safety net. Newest first by the stamp in the name.
+  while IFS= read -r b; do
+    [ -n "$b" ] && [ -d "$BACKUP_DIR/$b" ] && [ ! -L "$BACKUP_DIR/$b" ] && autos+=("$b")
+  done < <(cd "$BACKUP_DIR" 2>/dev/null && for d in */; do printf '%s\n' "${d%/}"; done \
+             | grep -E '^[0-9]{8}T[0-9]{6}Z-.+$' | LC_ALL=C sort -r)
+  [ "${#autos[@]}" -gt 0 ] || return 0
+  slots=$(( keep > reserve ? keep - reserve : 0 ))
+  # Protected snapshots take their slots first; the newest of the rest fill
+  # what is left; everything else goes.
+  for b in "${autos[@]}"; do _spb_protected "$b" && kept+=("$b"); done
+  slots=$(( slots - ${#kept[@]} ))
+  for b in "${autos[@]}"; do
+    _spb_protected "$b" && continue
+    if [ "$slots" -gt 0 ]; then
+      kept+=("$b"); slots=$(( slots - 1 ))
+    else
+      rm -rf "${BACKUP_DIR:?}/$b" && info "pruned $b (keep $keep)" >&2
+    fi
   done
+  [ "$max_mb" -gt 0 ] || return 0
+  # Size cap over what survived the count, oldest unprotected first.
+  [ "${#kept[@]}" -gt 0 ] || return 0
+  for b in "${kept[@]}"; do
+    kb="$(du -sk "$BACKUP_DIR/$b" 2>/dev/null | awk '{print $1}')"
+    total=$(( total + ${kb:-0} ))
+  done
+  while IFS= read -r b; do
+    [ $(( total / 1024 )) -gt "$max_mb" ] || break
+    # The newest snapshot is the freshest restore point there is: the cap
+    # never takes it, whatever its size.
+    [ "$b" = "${autos[0]}" ] && continue
+    _spb_protected "$b" && continue
+    kb="$(du -sk "$BACKUP_DIR/$b" 2>/dev/null | awk '{print $1}')"
+    rm -rf "${BACKUP_DIR:?}/$b" && total=$(( total - ${kb:-0} )) && info "pruned $b (${kb:-?} KB, snapshots over ${max_mb} MB)" >&2
+  done < <(printf '%s\n' "${kept[@]}" | LC_ALL=C sort)
+  [ $(( total / 1024 )) -le "$max_mb" ] \
+    || warn "snapshots still take $(( total / 1024 )) MB > AGENTOS_BACKUPS_MAX_MB=${max_mb}: what is left is the newest snapshot and the protected ones (pending rollback / the one just taken)" >&2
+  return 0
 }
 
 # systemd_restore_keep_module_objects <snapshot> <data> <keep> — moves the live
@@ -3490,9 +3551,10 @@ prune_versions() { # keep current + 2 previous version dirs under versions/ — 
 # Keep .env's AGENTOS_VERSION honest about which code is actually live. The
 # symlink is the source of truth for WHICH TREE RUNS, but this value is not
 # merely cosmetic: .env is the unit's EnvironmentFile and core/build-info.ts
-# reads AGENTOS_VERSION ahead of the release tree's build-info.json, so
-# whatever the process is started with is the version /info reports until it
-# restarts. Every caller must therefore write it BEFORE `systemctl start`.
+# reads AGENTOS_VERSION wherever the tree carries no build-info.json (older
+# tarballs) and the autoupdate poller falls back to it, so whatever the process
+# is started with can be the version /info reports until it restarts. Every
+# caller must therefore write it BEFORE `systemctl start`.
 # Absent key => nothing to do; this never CREATES the key.
 set_env_version() { # set_env_version <tag>
   local tag="$1" env_file="$AGENTOS_HOME/.env"
@@ -3621,7 +3683,10 @@ schema_compat_preflight() { # schema_compat_preflight <prev-tag> <target-tag> �
 
 # Serialize restart-pause decisions with the stopped snapshot/swap window.
 # The timer's service may already be dispatched, so drain both before stopping
-# the core. Missing transient units are normal; other stop failures abort.
+# the core. Missing transient units are normal and are skipped without a stop:
+# `systemctl stop` of a unit that is not loaded prints "Failed to stop …: Unit
+# … not loaded." on every upgrade, which read as a fault in the update journal
+# (ClickUp 12418agh8nm). Other stop failures abort.
 EXIT_RESTART_FD=""
 hold_exit_watch_restart() {
   stability_dir_init
@@ -3629,11 +3694,15 @@ hold_exit_watch_restart() {
   [ ! -L "$STABILITY_DIR/.restart-pause.lock" ] || die "unsafe restart-pause lock"
   exec {EXIT_RESTART_FD}>"$STABILITY_DIR/.restart-pause.lock"
   flock -w 25 "$EXIT_RESTART_FD" || die "could not hold crash-loop restart decisions"
-  local unit kind state
+  local unit kind state name
   unit="${AGENTOS_SERVICE%.service}"
   for kind in timer service; do
-    if ! systemctl_bus stop "agentos-exit-watch-restart-${unit}.${kind}"; then
-      state="$(systemctl_bus show -p LoadState --value "agentos-exit-watch-restart-${unit}.${kind}")" \
+    name="agentos-exit-watch-restart-${unit}.${kind}"
+    state="$(systemctl_bus show -p LoadState --value "$name")" \
+      || die "could not inspect crash-loop restart ${kind}"
+    [ "$state" != not-found ] || continue
+    if ! systemctl_bus stop "$name"; then
+      state="$(systemctl_bus show -p LoadState --value "$name")" \
         || die "could not inspect crash-loop restart ${kind}"
       [ "$state" = not-found ] || die "could not cancel crash-loop restart ${kind}"
     fi
@@ -3674,6 +3743,17 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
       || warn "usage-group reconciliation refused (see above) — the node keeps its private usage store"
     reconcile_gh || warn "gh reconciliation hit a snag"
     ensure_bwrap
+    # The install file's AGENTOS_VERSION is repaired here too (agent-os#1789).
+    # It is the unit's EnvironmentFile, and once it drifted behind the symlink
+    # (a node on v4.82.0 whose file still said v4.58.0) the node reported the
+    # old version, the core kept poking the updater for a release it already
+    # ran, and every poke ended right here — the one exit that never wrote it.
+    local env_ver
+    env_ver="$(dotenv_val AGENTOS_VERSION 2>/dev/null || true)"
+    if [ -n "$env_ver" ] && [ "$env_ver" != "$tag" ]; then
+      set_env_version "$tag"
+      warn "AGENTOS_VERSION in $AGENTOS_HOME/.env said ${env_ver} while ${tag} is live — corrected; the running core reads it at boot, so \`agentos restart\` makes it report ${tag}"
+    fi
     # Written, but the running core still has the environment it booted with, so
     # say what makes it count rather than restarting a healthy node unasked.
     if ensure_ctl_env; then
