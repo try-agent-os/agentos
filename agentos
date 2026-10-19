@@ -659,6 +659,17 @@ else
   AGENTOS_ROLLOUT=0
 fi
 
+# The recovery LADDER of a failed systemd + SQLite upgrade and its stable
+# runner (ClickUp 12418aghqj1, lib/recovery-ladder.sh). Same relative lookup;
+# absent, a failed upgrade falls back to the single restore it always did.
+if [ -r "$_CLI_HERE/lib/recovery-ladder.sh" ]; then
+  # shellcheck source=lib/recovery-ladder.sh
+  . "$_CLI_HERE/lib/recovery-ladder.sh"
+  AGENTOS_RECOVERY_LADDER=1
+else
+  AGENTOS_RECOVERY_LADDER=0
+fi
+
 # stability_dir_init — where root keeps what it decides on: the parent of the
 # signal outbox, /var/lib/<unit> (the exit journal, the crash-loop episodes,
 # `.last-upgrade`, `failed.json`, `notices.jsonl`). The core reads the same
@@ -3396,9 +3407,11 @@ sqlite_migration_head() { # sqlite_migration_head <db-file> → "<count> <last>"
 
 restore_verify_sqlite() { # restore_verify_sqlite <snapshot-dir> <data-dir> → 0 verified; 1 with the reasons on stdout
   local src="$1" data="$2" o rel s want got bad="" judged=0
-  for o in "$src"/*.db; do
+  # The whole set: the top-level databases AND every context's state.db
+  # (contexts/<ctx>/…/*.db), not just messages.db (ClickUp 12418aghqj1).
+  while IFS= read -r -d '' o; do
     [ -f "$o" ] || continue
-    rel="$(basename "$o")"
+    rel="${o#"$src"/}"
     if [ ! -f "$data/$rel" ]; then bad="$bad; $rel is missing after the restore"; continue; fi
     for s in wal shm journal; do
       if [ -e "$o-$s" ]; then
@@ -3411,19 +3424,35 @@ restore_verify_sqlite() { # restore_verify_sqlite <snapshot-dir> <data-dir> → 
     judged=$((judged + 1))
     got="$(sqlite_migration_head "$data/$rel")" || got="unreadable"
     [ "$got" = "$want" ] || bad="$bad; $rel migrations: on disk [$got], snapshot [$want]"
-  done
+  done < <(find "$src" -maxdepth 4 -name '*.db' -type f -not -path "$src/$SNAPSHOT_MANIFEST/*" -print0 2>/dev/null | sort -z)
   if [ -n "$bad" ]; then printf '%s' "${bad#; }"; return 1; fi
   [ "$judged" -gt 0 ] && info "restore verified: $judged database(s) carry the snapshot's migrations" >&2
   return 0
 }
 
-systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores data/ from a dir systemd_backup_sqlite created
+systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores data/ from a dir systemd_backup_sqlite created; dies on failure
   if uses_managed_postgres; then
     docker_managed_postgres_warning
     die "refusing an unsafe rollback in managed-PostgreSQL mode."
   fi
   local src="${1:?systemd_restore_sqlite needs a snapshot dir}"
   [ -d "$src" ] || die "backup dir gone: $src"
+  RESTORE_FAILURE=""
+  systemd_restore_sqlite_try "$src" \
+    || die "rollback FAILED: the restore of $(basename "$src") did not verify — ${RESTORE_FAILURE:-unknown}. The node is NOT started; the snapshot is intact at $src"
+}
+
+# systemd_restore_sqlite_try <snapshot-dir> — the same restore with a TYPED
+# refusal instead of die: 0 restored and verified; 1 with RESTORE_FAILURE set.
+# The recovery ladder (lib/recovery-ladder.sh) needs the failure back to take
+# its next step; a die here would exit past the ladder and its cleanup
+# (spec 2026-10-10-rollback-schema-ahead-crashloop §2, ClickUp 12418aghqj1).
+RESTORE_FAILURE=""
+systemd_restore_sqlite_try() {
+  local src="$1"
+  RESTORE_FAILURE=""
+  uses_managed_postgres && { RESTORE_FAILURE="managed PostgreSQL has no automatic restore"; return 1; }
+  [ -d "$src" ] && [ ! -L "$src" ] || { RESTORE_FAILURE="backup dir gone: $src"; return 1; }
   # Wipe the live run-state first so restore REPLACES .aop/ wholesale rather
   # than overlaying onto it — `cp -a` alone would leave any current run dir the
   # snapshot lacks in place, mixing old and new state. This mirrors docker mode,
@@ -3463,7 +3492,7 @@ systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores 
     rel="$(basename "$o")"
     rm -f "$AGENTOS_HOME/data/$rel-wal" "$AGENTOS_HOME/data/$rel-shm" "$AGENTOS_HOME/data/$rel-journal"
   done
-  cp -a "$src"/. "$AGENTOS_HOME/data/"
+  cp -a "$src"/. "$AGENTOS_HOME/data/" || { RESTORE_FAILURE="copying $(basename "$src") back into data/ failed"; return 1; }
   if [ -d "$keep/contexts" ]; then
     for o in "$keep"/$SNAPSHOT_ORPHAN_GLOB; do
       [ -e "$o" ] || [ -L "$o" ] || continue
@@ -3482,12 +3511,13 @@ systemd_restore_sqlite() { # systemd_restore_sqlite <snapshot-dir> — restores 
   # "<dir>/." carries the snapshot dir's OWN ownership onto data/ itself — the
   # rolled-back User=agentos node would then hit SQLITE_READONLY_DIRECTORY and
   # never start. Give the whole data dir back to the service account.
-  chown -R "$AGENTOS_ACCOUNT:$AGENTOS_ACCOUNT" "$AGENTOS_HOME/data"
+  chown -R "$AGENTOS_ACCOUNT:$AGENTOS_ACCOUNT" "$AGENTOS_HOME/data" || { RESTORE_FAILURE="chown of data/ failed"; return 1; }
   # Last thing before the old release may start: is what it will open the
   # snapshot? Not "restored" otherwise (see restore_verify_sqlite above).
   local why
   if ! why="$(restore_verify_sqlite "$src" "$AGENTOS_HOME/data")"; then
-    die "rollback FAILED: the restore of $(basename "$src") did not verify — $why. The node is NOT started; the snapshot is intact at $src"
+    RESTORE_FAILURE="$why"
+    return 1
   fi
   # The manifest travelled with `cp -a <dir>/.`; it describes the snapshot, not
   # the node. Rehydrate the linked worktrees it names (after the chown: git runs
@@ -3726,6 +3756,9 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   fi
   tag="$(jq -r .version <<<"$manifest")"
   prev="$(basename "$(readlink "$AGENTOS_HOME/current")")"
+  # A node HELD by a recovery episode is started by no path but the operator's
+  # retry (ClickUp 12418aghqj1).
+  [ "$AGENTOS_RECOVERY_LADDER" = 1 ] && recovery_refuse_if_held
   [ "$tag" = "$prev" ] || refuse_if_blocked "$tag"
   if [ "$tag" = "$prev" ]; then
     echo "already at $tag"
@@ -3836,6 +3869,16 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   # The silence starts HERE, not at the snapshot: this is the instant the owner
   # stops being able to reach the node, and it is the instant the next
   # upgrade's estimate has to be measured from.
+  # The recovery runner and the episode, BEFORE the first destructive step
+  # (spec 2026-10-10-rollback-schema-ahead-crashloop §3.1-3.2, 12418aghqj1):
+  # a stable copy of this CLI outside `current`, and a durable record that a
+  # stop/snapshot is about to happen (phase preparing). SQLite only: managed
+  # PostgreSQL keeps its explicit no-automatic-restore refusal.
+  RECOVERY_EPISODE=""
+  if [ "$AGENTOS_RECOVERY_LADDER" = 1 ] && ! uses_managed_postgres; then
+    recovery_runner_install || warn "recovery runner not installed at $(recovery_dir) — a failed gate is recovered in-process"
+    RECOVERY_EPISODE="$(recovery_episode_begin "$prev" "$tag")" || { RECOVERY_EPISODE=""; warn "could not record the recovery episode"; }
+  fi
   hold_exit_watch_restart
   stop_epoch="$(date +%s)"
   systemctl_bus stop "$AGENTOS_SERVICE"
@@ -3843,6 +3886,10 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   snap="$(systemd_backup_sqlite "$prev" | tail -1)"   # consistent copy: the unit is stopped
   snap_seconds=$(( $(date +%s) - snap_started ))
   [ -n "$snap" ] && echo "$snap" > "$BACKUP_DIR/.last-upgrade"   # pairs snapshot + code tag atomically, before the swap
+  if [ -n "$RECOVERY_EPISODE" ] && [ -n "$snap" ]; then
+    recovery_episode_prepared "$snap" || { RECOVERY_EPISODE=""; warn "could not record the snapshot in the recovery episode"; }
+    [ -z "$RECOVERY_EPISODE" ] || recovery_phase trial
+  fi
   ln -sfn "$AGENTOS_HOME/versions/$tag" "$AGENTOS_HOME/current"
   # Paired with the symlink flip, BEFORE the start — .env is the unit's
   # EnvironmentFile, so a process started against the old value keeps reporting
@@ -3878,6 +3925,9 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     # The pair the exit watcher's crash rollback reads — or, for a downgrade,
     # the release it left on the blacklist (ClickUp 12418agg8wa).
     record_last_upgrade "$prev" "$tag" "$manifest"
+    if [ -n "$RECOVERY_EPISODE" ]; then
+      recovery_terminal committed "$tag" "healthy upgrade"
+    fi
     # The disk-heavy part is over; the next node on this host may stop now.
     release_upgrade_host_lock
     # Only now: the units belong to the release that is actually live, and the
@@ -3902,6 +3952,9 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
       die "refusing an unsafe automatic rollback in managed-PostgreSQL mode; inspect: journalctl -u $AGENTOS_SERVICE"
     fi
     echo "unhealthy — rolling back to $prev (code + database)" >&2
+    if [ -n "$RECOVERY_EPISODE" ]; then
+      systemd_upgrade_recover "$prev" "$tag" "$stop_epoch" "$snap_seconds"
+    fi
     # A rollback that cannot even stop the unit has changed NOTHING: `current`
     # still points at $tag and whatever process systemd has is still running it.
     # Say exactly that, in a line of its own the poller keys on, instead of
@@ -3927,11 +3980,44 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   fi
 }
 
+# systemd_upgrade_recover <prev> <tag> <stop-epoch> <snap-seconds> — the
+# failed gate's recovery through the ladder; never returns. Runs the STABLE
+# runner copy when it is installed and speaks this protocol, else the ladder
+# of this very process. The journal, not the child's exit code, is the truth.
+systemd_upgrade_recover() {
+  local prev="$1" tag="$2" stop_epoch="$3" snap_seconds="$4" first="health-gate" doc outcome live
+  [ -n "$UPGRADE_BOOT_FAILURE" ] && first="schema-compat $UPGRADE_BOOT_FAILURE"
+  if recovery_runner_ok; then
+    info "recovery: running the stable runner $(recovery_dir)/agentos" >&2
+    AGENTOS_DIR="$AGENTOS_HOME" AGENTOS_SERVICE="$AGENTOS_SERVICE" AGENTOS_USER="$AGENTOS_ACCOUNT" \
+      RECOVERY_FIRST_FAILURE="$first" AGENTOS_RECOVERY_FROM_UPDATER=1 \
+      bash "$(recovery_dir)/agentos" rollback --ladder --episode "$RECOVERY_EPISODE" >&2 || true
+  else
+    RECOVERY_FIRST_FAILURE="$first" recovery_ladder >&2 || true
+  fi
+  doc="$(recovery_journal_read 2>/dev/null || true)"
+  outcome="$(jq -r '.outcome // ""' <<<"${doc:-null}" 2>/dev/null || true)"
+  live="$(jq -r '.live // ""' <<<"${doc:-null}" 2>/dev/null || true)"
+  echo "recovery-outcome: ${outcome:-unknown} episode=$RECOVERY_EPISODE live=${live:-none}" >&2
+  release_upgrade_host_lock
+  case "$outcome" in
+    restored)
+      record_upgrade_downtime systemd "${prev#v}" "${prev#v}" "$stop_epoch" "$snap_seconds"
+      die "upgrade to $tag failed; $prev restored" ;;
+    rolled-forward)
+      record_upgrade_downtime systemd "${prev#v}" "${tag#v}" "$stop_epoch" "$snap_seconds"
+      die "upgrade to $tag failed its health gate; $prev could not be restored, recovery ROLLED FORWARD: $tag is running and stays on failed.json" ;;
+    *)
+      die "rollback FAILED: upgrade to $tag failed and recovery is HELD (episode $RECOVERY_EPISODE) — the node is stopped; retry: agentos rollback --ladder --episode $RECOVERY_EPISODE" ;;
+  esac
+}
+
 systemd_rollback() { # undo the last recorded upgrade — code + database together, from the single .last-upgrade pair
   if uses_managed_postgres; then
     docker_managed_postgres_warning
     die "refusing an unsafe rollback in managed-PostgreSQL mode."
   fi
+  [ "$AGENTOS_RECOVERY_LADDER" = 1 ] && recovery_refuse_if_held
   local src prev
   src="$(systemd_last_upgrade_dir)"
   prev="$(cat "$src/version" 2>/dev/null || true)"
@@ -5260,7 +5346,7 @@ cmd_import_history() { # agentos import-history --from <path> --chat <id> [--dry
 }
 
 cmd_rollback() {
-  local over_lock=0 code_only=0 to="" expect="" reason="" episode="" crashes="" clear="" list=0
+  local over_lock=0 code_only=0 to="" expect="" reason="" episode="" crashes="" clear="" list=0 ladder=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --force-over-lock) over_lock=1; shift ;;
@@ -5272,10 +5358,12 @@ cmd_rollback() {
       --crashes) crashes="${2:?--crashes needs a value}"; shift 2 ;;
       --clear-failed) clear="${2:?--clear-failed needs a tag}"; shift 2 ;;
       --list-failed) list=1; shift ;;
+      --ladder) ladder=1; shift ;;
       *) die "unknown rollback option: $1 (try --help)" ;;
     esac
   done
   if [ "$list" = 1 ]; then cmd_list_failed; return; fi
+  if [ "$ladder" = 1 ]; then cmd_rollback_ladder "$episode"; return; fi
   if [ -n "$clear" ]; then cmd_clear_failed "$clear"; return; fi
   case "$reason" in ''|crash-loop|manual) ;; *) die "unknown rollback reason: $reason" ;; esac
   case "$episode" in ''|*[!A-Za-z0-9_.@-]*) [ -z "$episode" ] || die "--episode is not a plain word" ;; esac
@@ -5292,6 +5380,33 @@ cmd_rollback() {
     docker)  docker_rollback ;;
     none)    die "no install found under $AGENTOS_HOME" ;;
   esac
+}
+
+# `agentos rollback --ladder --episode <id>` — run, continue or (for a HELD
+# episode) retry the recovery ladder of a failed upgrade (ClickUp 12418aghqj1).
+# Lock order is fixed: host upgrade lock, then the episode lock. The updater
+# calls this already holding the host lock (AGENTOS_RECOVERY_FROM_UPDATER=1).
+cmd_rollback_ladder() {
+  local ep="$1" lock fd
+  [ "$AGENTOS_RECOVERY_LADDER" = 1 ] || die "rollback --ladder needs lib/recovery-ladder.sh next to this CLI"
+  [ "$(detect_mode)" = systemd ] || die "rollback --ladder is systemd-mode only"
+  [ -n "$ep" ] || die "rollback --ladder needs --episode <id>"
+  case "$ep" in *[!A-Za-z0-9_.@-]*) die "--episode is not a plain word" ;; esac
+  stability_dir_init
+  [ "${AGENTOS_RECOVERY_FROM_UPDATER:-0}" = 1 ] || acquire_upgrade_host_lock
+  lock="$STABILITY_DIR/.recovery.lock"
+  [ ! -L "$lock" ] || die "unsafe recovery lock $lock"
+  exec {fd}>>"$lock"
+  flock -n "$fd" || die "recovery episode lock $lock is held by another process — leaving the episode pending"
+  local doc
+  doc="$(recovery_journal_read)" || die "no trusted recovery journal at $(recovery_journal_path)"
+  [ "$(jq -r .episode <<<"$doc")" = "$ep" ] || die "episode $ep is not this node's current recovery episode"
+  case "$(jq -r .phase <<<"$doc")" in
+    preparing) die "episode $ep never reached a verified snapshot (phase preparing) — no restore is applied from it" ;;
+    committed) die "episode $ep ended in a healthy upgrade — nothing to recover" ;;
+  esac
+  [ "$(jq -r '.outcome // ""' <<<"$doc")" = committed ] && die "episode $ep ended in a healthy upgrade — nothing to recover"
+  recovery_resume "$ep"
 }
 
 cmd_backup() {
@@ -5461,6 +5576,7 @@ case "${1:-}" in
   autoupdate) shift; cmd_autoupdate "$@" ;;
   manual-upgrade) shift; cmd_manual_upgrade "$@" ;;
   rollback)   shift; cmd_rollback "$@" ;;
+  recovery-protocol) [ "$AGENTOS_RECOVERY_LADDER" = 1 ] && echo "$RECOVERY_PROTOCOL" || exit 1 ;;
   fleet-op)   shift
               [ "${FLEET_OP_LIB:-0}" = 1 ] || die "fleet-op: lib/fleet-op.sh is missing next to this CLI"
               rc=0; fleet_op_main "$@" || rc=$?; exit "$rc" ;;
