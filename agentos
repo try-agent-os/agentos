@@ -3226,9 +3226,12 @@ systemd_prune_orphans() { # AGENTOS_ORPHAN_KEEP_DAYS (default 14, 0 = never) —
 # symoditi were found holding seven on 2026-10-16, ~10 GB across the host),
 # and its "pruned" lines went into the caller's $(...) capture, so the journal
 # never showed what retention did. Now:
-#   * by COUNT: AGENTOS_KEEP_BACKUPS (default 2 — the pending-rollback pair and
-#     the one before it) auto snapshots in total, the protected ones INCLUDED,
-#     so a pinned old snapshot no longer rides on top of keep-N;
+#   * by COUNT: AGENTOS_KEEP_BACKUPS (default 1 — the pending-rollback
+#     snapshot, 12418aghy2v) auto snapshots in total, the protected ones
+#     INCLUDED, so a pinned old snapshot no longer rides on top of keep-N. The
+#     snapshot just taken and the pending rollback are both protected while the
+#     upgrade runs, so two sit on disk until the upgrade is healthy; the prune
+#     after the health gate brings it back to keep;
 #   * by SIZE: AGENTOS_BACKUPS_MAX_MB (default 10240, 0 = no cap) over the
 #     snapshots that survive the count, oldest unprotected dropped first, the
 #     newest never;
@@ -3240,9 +3243,9 @@ systemd_prune_orphans() { # AGENTOS_ORPHAN_KEEP_DAYS (default 14, 0 = never) —
 # What is never removed: the dir .last-upgrade points at (the pending
 # rollback), any dir passed as an argument (the snapshot just taken), and
 # anything not named <UTC-timestamp>-<tag> (a human's manual-* backup).
-systemd_prune_backups() { # systemd_prune_backups [reserve] [protect-dir...] — keeps at most AGENTOS_KEEP_BACKUPS (default 2) auto snapshots minus <reserve> free slots, then caps their total at AGENTOS_BACKUPS_MAX_MB (default 10240, 0 = off). Never fails.
-  local keep="${AGENTOS_KEEP_BACKUPS:-2}" max_mb="${AGENTOS_BACKUPS_MAX_MB:-10240}" reserve="${1:-0}"
-  case "$keep" in ''|*[!0-9]*|0) keep=2 ;; esac
+systemd_prune_backups() { # systemd_prune_backups [reserve] [protect-dir...] — keeps at most AGENTOS_KEEP_BACKUPS (default 1) auto snapshots minus <reserve> free slots, then caps their total at AGENTOS_BACKUPS_MAX_MB (default 10240, 0 = off). Never fails.
+  local keep="${AGENTOS_KEEP_BACKUPS:-1}" max_mb="${AGENTOS_BACKUPS_MAX_MB:-10240}" reserve="${1:-0}"
+  case "$keep" in ''|*[!0-9]*|0) keep=1 ;; esac
   case "$max_mb" in ''|*[!0-9]*) max_mb=10240 ;; esac
   case "$reserve" in ''|*[!0-9]*) reserve=0 ;; esac
   [ "$#" -gt 0 ] && shift
@@ -3537,8 +3540,10 @@ systemd_last_upgrade_dir() { # → the snapshot dir recorded by the most recent 
   printf '%s' "$src"
 }
 
-prune_versions() { # keep current + 2 previous version dirs under versions/ — always excludes the current symlink target and the .last-upgrade pair's version, regardless of age
-  local cur="" last_upgrade_ver="" src
+prune_versions() { # keep current + AGENTOS_KEEP_VERSIONS (default 1) previous version dirs under versions/ — the current symlink target and the .last-upgrade pair's version are always kept and counted in, and a tree a live process runs from is never removed
+  local cur="" last_upgrade_ver="" src keep
+  keep="${AGENTOS_KEEP_VERSIONS:-1}"
+  case "$keep" in ''|*[!0-9]*) keep=1 ;; esac
   [ -L "$AGENTOS_HOME/current" ] && cur="$(basename "$(readlink "$AGENTOS_HOME/current")")"
   if [ -f "$BACKUP_DIR/.last-upgrade" ]; then
     src="$(cat "$BACKUP_DIR/.last-upgrade" 2>/dev/null || true)"
@@ -3551,24 +3556,41 @@ prune_versions() { # keep current + 2 previous version dirs under versions/ — 
   # would then pin that one ancient version dir on disk forever (observed on a
   # managed-PG node: a v2.24.0 tree stranded across every later upgrade). And
   # `agentos rollback` is refused in managed mode anyway, so the pin guards
-  # nothing real. Drop it there; the keep-newest-3 window below still retains the
-  # current release plus the two most recent previous trees for a manual re-pin.
+  # nothing real. Drop it there; the newest-first window below still retains
+  # the current release plus the most recent previous tree for a manual re-pin.
   if uses_managed_postgres; then last_upgrade_ver=""; fi
+  # Retention (ClickUp 12418aghy2v): each tree is ~2.6 GB and the fleet ships
+  # several releases a day, so "current + 2 previous" left three or four trees
+  # per contour. Now the window is current + AGENTOS_KEEP_VERSIONS previous
+  # trees IN TOTAL: the current target and the rollback target take their
+  # slots first (after a healthy upgrade they are the same pair: the new tree
+  # and the one it replaced), the newest of the rest by mtime fill what is
+  # left, everything else goes.
   # A tree some live process still runs from is never removed, whatever its age
   # (agent-os#1882): a second instance sharing this install root, or any process
   # this CLI did not restart, would lose its code and its native binaries under
-  # it. It is reclaimed by a later prune, once nothing runs from it any more.
+  # it. It is reclaimed by a later prune, once nothing uses it any more.
   local in_use; in_use="$(version_tags_in_use | cut -d' ' -f1 | sort -u)"
-  ls -1dt "$AGENTOS_HOME/versions"/*/ 2>/dev/null | tail -n +4 | while IFS= read -r d; do
-    local tag; tag="$(basename "$d")"
+  local -a trees=()
+  local d tag slots=$(( keep + 1 ))
+  while IFS= read -r d; do
+    [ -n "$d" ] && trees+=("$(basename "$d")")
+  done < <(ls -1dt "$AGENTOS_HOME/versions"/*/ 2>/dev/null)
+  [ "${#trees[@]}" -gt 0 ] || return 0
+  for tag in "${trees[@]}"; do
+    { [ "$tag" = "$cur" ] || { [ -n "$last_upgrade_ver" ] && [ "$tag" = "$last_upgrade_ver" ]; }; } && slots=$(( slots - 1 ))
+  done
+  for tag in "${trees[@]}"; do
     [ "$tag" = "$cur" ] && continue
     [ -n "$last_upgrade_ver" ] && [ "$tag" = "$last_upgrade_ver" ] && continue
+    if [ "$slots" -gt 0 ]; then slots=$(( slots - 1 )); continue; fi
     if [ -n "$in_use" ] && grep -qxF -- "$tag" <<<"$in_use"; then
       echo "kept versions/$tag: a live process still runs from it" >&2
       continue
     fi
-    rm -rf "$d"
+    rm -rf "${AGENTOS_HOME:?}/versions/$tag" && echo "pruned versions/$tag (keep current + $keep)" >&2
   done
+  return 0
 }
 
 # ─── processes running from a version tree (agent-os#1882) ──────────────────
@@ -4023,6 +4045,10 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     # the new tree first, so its old one is free to go (agent-os#1882).
     restart_stale_siblings "$tag"
     prune_versions
+    # The upgrade is healthy and .last-upgrade now names the snapshot taken
+    # for it, so the one before is no rollback target any more: hold the
+    # snapshot limit again now, not only at the next upgrade (12418aghy2v).
+    systemd_prune_backups 0
   else
     # Why the new release did not come up, when its boot guard said so — kept
     # before the rollback's own wait can overwrite it (12418agg9aw).
