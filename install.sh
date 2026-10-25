@@ -2997,7 +2997,7 @@ install_systemd() {
   # its bin dir on PATH for any child `node` processes npm spawns.
   $SUDO env PATH="$INSTALL_DIR/node/bin:$PATH" \
     "$INSTALL_DIR/node/bin/node" "$INSTALL_DIR/node/bin/npm" \
-    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.299"
+    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.306"
 
   step "Config + unit"
   # Snapshot what a RUNNING node booted with, before this run rewrites any of
