@@ -3047,7 +3047,7 @@ release_upgrade_host_lock() {
 # they never saw.
 UPGRADE_ANNOUNCED_SECONDS=""
 
-announce_going_down() { # announce_going_down <from> <to> — one chat line, BEFORE the stop
+announce_going_down() { # announce_going_down <from> <to> — the pre-stop notice, BEFORE the stop
   UPGRADE_ANNOUNCED_SECONDS=""
   local from="$1" to="$2" port token body reply outcome
   local -a auth=()
@@ -3074,14 +3074,23 @@ announce_going_down() { # announce_going_down <from> <to> — one chat line, BEF
              "${auth[@]+"${auth[@]}"}" --data "$body" \
              "http://127.0.0.1:${port}/internal/updates/pre-stop" 2>/dev/null)" || reply=""
   if [ -z "$reply" ]; then
-    warn "could not tell the owner the node is going down (no answer from the core on 127.0.0.1:${port}); continuing with the upgrade"
+    warn "could not hand the going-down notice to the core (no answer from 127.0.0.1:${port}); continuing with the upgrade"
     return 0
   fi
+  outcome="$(printf '%s' "$reply" | jq -r '.outcome // "?"' 2>/dev/null || true)"
   if [ "$(printf '%s' "$reply" | jq -r '.announced // false' 2>/dev/null || true)" = true ]; then
     UPGRADE_ANNOUNCED_SECONDS="$UPGRADE_ETA_SECONDS"
-    info "told the owner: going down ${from} → ${to}, ~${UPGRADE_ETA_SECONDS}s (${UPGRADE_ETA_BASIS})"
+    # `announced: true` means "the estimate was taken for the closing line", and
+    # only `outcome: delivered` (cores before v4.99.0) means the chat saw it.
+    # Since v4.99.0 the core answers `outcome: recorded` and sends nothing until
+    # the node is back, so "told the owner" here would be a false journal line
+    # that misleads every incident review (12418agjdjq).
+    if [ "$outcome" = delivered ]; then
+      info "told the owner: going down ${from} → ${to}, ~${UPGRADE_ETA_SECONDS}s (${UPGRADE_ETA_BASIS})"
+    else
+      info "pre-stop recorded (not sent to chat, outcome: ${outcome:-?}): going down ${from} → ${to}, ~${UPGRADE_ETA_SECONDS}s (${UPGRADE_ETA_BASIS})"
+    fi
   else
-    outcome="$(printf '%s' "$reply" | jq -r '.outcome // "?"' 2>/dev/null || true)"
     warn "the core took the going-down notice but did not deliver it to chat (outcome: ${outcome:-?})"
   fi
   return 0
