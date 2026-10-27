@@ -5544,6 +5544,61 @@ cmd_backup() {
 #   printf '%s' "$md" | agentos md2quill --body     # POST it as the request body
 # The converter is lib/md2quill.mjs next to this CLI, run under the node's own
 # Node runtime; it needs no running node, no database and no network.
+# `agentos budget permit|observe` and `agentos gh -- <args>` (task 12418aghu01):
+# the request-budget door for steps and scripts. The CLI asks the node's own
+# HTTP listener (`/budget/*`, X-Internal-Token); a routine step already carries
+# PORT and INTERNAL_API_TOKEN from the node's environment, an operator shell
+# gets them lifted from .env. A node that does not answer is not a refusal:
+# the CLI goes ahead without a permit and says `agentos-budget: unavailable`.
+cmd_budget() {
+  # `agentos budget status` is a read of the running node over the console
+  # scope (`agentos ctl budget status`, task 12418aghu07); every other verb
+  # (permit, observe, gh, --help) is the door below. ONE `budget)` arm in the
+  # dispatcher: a shell `case` takes the first match, so a second arm would
+  # shadow the other half silently.
+  if [ "${1:-}" = "status" ]; then
+    cmd_ctl budget "$@"
+    return
+  fi
+  case "$(detect_mode)" in
+    docker)
+      ( cd "$AGENTOS_HOME" && exec docker compose -f "$COMPOSE_FILE" exec -T \
+          -e AGENTOS_ROUTINE_RUN_ID -e AGENTOS_ROUTINE_STEP_ID -e GH_TOKEN -e GITHUB_TOKEN \
+          node node dist/core/api-budget/budget-cli.js "$@" ) ;;
+    systemd)
+      ctl_env_default INTERNAL_API_TOKEN
+      ctl_env_default PORT
+      # The CLI reads PORT only (the core's own listen port); an install that
+      # names its port AGENTOS_PORT gets it carried over here.
+      if [ -z "${PORT:-}" ]; then
+        ctl_env_default AGENTOS_PORT
+        [ -n "${AGENTOS_PORT:-}" ] && export PORT="$AGENTOS_PORT"
+      fi
+      local base="$AGENTOS_HOME/current" cli=""
+      for c in \
+        "$base/dist/core/api-budget/budget-cli.js" \
+        "$base/apps/api/dist/core/api-budget/budget-cli.js" \
+        "$base/node_modules/@agent-os/api/dist/core/api-budget/budget-cli.js"; do
+        [ -f "$c" ] && { cli="$c"; break; }
+      done
+      if [ -z "$cli" ]; then
+        # The door is optional by contract (spec §4.8): without the CLI a
+        # wrapped gh call still runs, unbudgeted, and says so.
+        if [ "${1:-}" = "gh" ]; then
+          shift
+          [ "${1:-}" = "--" ] && shift
+          echo "agentos-budget: unavailable (budget CLI not found under $base)" >&2
+          exec gh "$@"
+        fi
+        die "budget CLI not found under $base (is the node installed?)"
+      fi
+      resolve_node_bin
+      exec "$AGENTOS_NODE_BIN" "$cli" "$@" ;;
+    none)
+      die "no install found under $AGENTOS_HOME" ;;
+  esac
+}
+
 cmd_md2quill() {
   local lib="$_CLI_HERE/lib/md2quill.mjs"
   [ -r "$lib" ] || die "md2quill: lib/md2quill.mjs is missing next to this CLI"
@@ -5648,6 +5703,15 @@ agentos — operate an AgentOS Core node
                               server over stdio (mount it elsewhere as
                               {"command":"agentos","args":["mcp"]}). Read-only
                               unless the node arms AGENTOS_MCP_EXTERNAL_PROFILE
+  budget permit|observe …    the node's request budget for GitHub and ClickUp:
+                              exit 75 + "agentos-budget: denied … reset=<ISO>"
+                              when the quota is spent (`agentos budget --help`)
+  budget status [--json]      the request budget for GitHub and ClickUp: per
+                              token and bucket the estimated remaining, reset,
+                              this hour's share of each class, spend past the
+                              node and the top routines (`agentos ctl budget`).
+  gh [--class c] -- <args>    gh under the request budget: permit -> gh ->
+                              observe; exit 75 when denied, else gh's own code
   md2quill [--body] [--notify]
                               Markdown on stdin -> ClickUp comment JSON on stdout:
                               the Quill ops array, or with --body the whole
@@ -5710,6 +5774,8 @@ case "${1:-}" in
   sessions|session) shift; cmd_sessions "$@" ;;
   mcp)        shift; cmd_mcp "$@" ;;
   md2quill)   shift; cmd_md2quill "$@" ;;
+  budget)     shift; cmd_budget "$@" ;;
+  gh)         shift; cmd_budget gh "$@" ;;
   status)   cmd_status ;;
   logs)     shift || true; cmd_logs "${1:-200}" ;;
   version)  cmd_version ;;
