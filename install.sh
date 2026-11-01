@@ -1638,6 +1638,163 @@ if [ -n "${AGENTOS_PRINT_INSTANCE:-}" ]; then
   exit 0
 fi
 
+# ─── install passport: where this node came from ────────────────────────────
+#
+# A node asked "where was I installed from?" used to guess (12418agjuhx): the
+# release tree carries the core, not the install.sh run that laid it down, so
+# the bot found the public repo only when a person named it and still could not
+# confirm it. The installer therefore leaves a small, secret-free JSON file in
+# the node's data dir — the one place the running core already reads — and the
+# core serves it to the agent (system_get_status → install, agentos_docs topic
+# `install`) and to the owner (/status).
+#
+# The passport is a fact about the INSTALL, not about the running version:
+#   - `installed` is written once, by the run that created the install, and every
+#     later run carries it over from the previous passport;
+#   - `last_run` is rewritten by every run (a re-run, a contour backfill);
+#   - the version the node runs NOW is the core's own build info — `agentos
+#     upgrade` and the autoupdate timer move it without this script.
+# It never holds a token, an admin id or anything from .env.
+#
+# Where it came from: install.sh is downloaded and then run, so the script cannot
+# see its own URL. The default is the documented one; a wrapper that fetched it
+# elsewhere (cloud-init, a mirror, the agent-install prompt) says so through
+# AGENTOS_INSTALLER_URL and AGENTOS_INSTALL_VIA.
+INSTALLER_URL_DEFAULT="https://raw.githubusercontent.com/try-agent-os/agentos/main/install.sh"
+RELEASE_REPO="try-agent-os/agentos"
+
+install_passport_path() { echo "$INSTALL_DIR/data/install-passport.json"; }
+
+# The human behind this run: the account that typed `sudo`, else whoever runs it.
+install_actor() {
+  if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then echo "$SUDO_USER"; return; fi
+  id -un 2>/dev/null || echo "unknown"
+}
+
+# render_install_passport <version> <previous passport JSON or empty> -> JSON on stdout.
+# Pure apart from the clock and the host name, both overridable for tests
+# (AGENTOS_TEST_NOW, AGENTOS_TEST_HOST). A previous passport that is not valid
+# JSON is ignored, never fatal: the install must not die on a damaged file.
+render_install_passport() {
+  local version="$1" previous="$2" now host by cli prev_installed="null"
+  now="${AGENTOS_TEST_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+  host="${AGENTOS_TEST_HOST:-$(hostname 2>/dev/null || echo unknown)}"
+  by="$(install_actor)"
+  cli="$SERVICE_NAME"
+  if [ -n "$previous" ]; then
+    prev_installed="$(jq -c '.installed // null' <<<"$previous" 2>/dev/null || echo null)"
+    [ -n "$prev_installed" ] || prev_installed="null"
+  fi
+  jq -n \
+    --arg installer "${AGENTOS_INSTALLER_URL:-$INSTALLER_URL_DEFAULT}" \
+    --arg via "${AGENTOS_INSTALL_VIA:-install.sh}" \
+    --arg release_repo "$RELEASE_REPO" \
+    --arg channel "$CHANNEL" \
+    --arg mode "$INSTALL_MODE" \
+    --arg host "$host" \
+    --arg user "$SERVICE_USER" \
+    --arg unit "${SERVICE_NAME}.service" \
+    --arg dir "$INSTALL_DIR" \
+    --arg port "$PORT" \
+    --arg cli "$cli" \
+    --arg version "$version" \
+    --arg now "$now" \
+    --arg by "$by" \
+    --argjson prev "$prev_installed" '
+    {
+      schema: 1,
+      source: { installer: $installer, via: $via, release_repo: $release_repo },
+      channel: $channel,
+      mode: $mode,
+      host: $host,
+      service_user: $user,
+      unit: $unit,
+      install_dir: $dir,
+      port: ($port | tonumber),
+      cli: $cli,
+      installed: (if ($prev | type) == "object" and ($prev.at // "") != ""
+                  then $prev
+                  else { version: $version, at: $now, by: $by } end),
+      last_run: { version: $version, at: $now, by: $by }
+    }'
+}
+
+# Write the passport into the data dir. Best effort: a passport that cannot be
+# written costs the node its answer to "where am I from", never the install.
+write_install_passport() { # write_install_passport <version>
+  local file previous body
+  file="$(install_passport_path)"
+  previous="$(read_maybe_sudo "$file" 2>/dev/null || true)"
+  if ! body="$(render_install_passport "$1" "$previous")"; then
+    warn "install passport: could not be rendered (jq?) — the node will not know where it came from"
+    return 0
+  fi
+  ${SUDO:-} mkdir -p "$(dirname "$file")" 2>/dev/null || true
+  if printf '%s\n' "$body" | ${SUDO:-} tee "$file" >/dev/null 2>&1; then
+    ${SUDO:-} chmod 0644 "$file" 2>/dev/null || true
+    ok "install passport → ${file}"
+  else
+    warn "install passport: could not write ${file}"
+  fi
+}
+
+# Is <port> already promised to ANOTHER AgentOS instance on this host? A second
+# instance is the same script with another --user; picking a port a stopped
+# neighbour owns is not caught by a listener probe, and the two units then fight
+# for it on the next boot. Reads each agentos*.service unit's EnvironmentFile and
+# its PORT=; the instance's own unit is skipped. Prints the neighbour's unit name.
+port_claimed_by_other_instance() { # port_claimed_by_other_instance <port>
+  local want="$1" unit envf p units_dir="${HOST_PREFIX}/etc/systemd/system"
+  for unit in "$units_dir"/agentos*.service; do
+    [ -e "$unit" ] || continue
+    case "$(basename "$unit")" in
+      *-autoupdate.service|"${SERVICE_NAME}.service") continue ;;
+    esac
+    envf="$(sed -n '/^EnvironmentFile=/{s/^EnvironmentFile=-\{0,1\}//p;q;}' "$unit" 2>/dev/null || true)"
+    [ -n "$envf" ] || continue
+    [ "$envf" = "$INSTALL_DIR/.env" ] && continue
+    p="$(read_maybe_sudo "${HOST_PREFIX}${envf}" 2>/dev/null | sed -n 's/^PORT=//p' | tail -1 || true)"
+    if [ "$p" = "$want" ]; then basename "$unit" .service; return 0; fi
+  done
+  return 1
+}
+
+# A FRESH systemd instance refuses a port that is taken — by a listener or by a
+# neighbour instance's .env. A re-run of an existing install keeps its own port
+# (it is the listener), so the check only applies when this root has no .env yet.
+check_instance_port_free() {
+  local owner
+  [ -n "$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null || true)" ] && return 0
+  if owner="$(port_claimed_by_other_instance "$PORT")"; then
+    die "--port ${PORT} is already the port of ${owner} on this host — pick another one, e.g. --port $((PORT + 1))"
+  fi
+  if [ -z "${AGENTOS_TEST_SKIP_LISTEN_PROBE:-}" ] && port_in_use "$PORT"; then
+    die "--port ${PORT}: something already listens on it — pick a free port, e.g. --port $((PORT + 1))"
+  fi
+  return 0
+}
+
+# "What passport would this run write?" — answered without touching the machine.
+# AGENTOS_PRINT_PASSPORT_PREV names a file holding a PREVIOUS passport (unset for
+# a fresh install). Driven by scripts/tests/install-passport.test.sh.
+if [ -n "${AGENTOS_PRINT_PASSPORT:-}" ]; then
+  _prev=""
+  [ -n "${AGENTOS_PRINT_PASSPORT_PREV:-}" ] && _prev="$(cat "$AGENTOS_PRINT_PASSPORT_PREV")"
+  render_install_passport "${AGENTOS_TEST_TAG:-v0.0.0-dryrun}" "$_prev"
+  exit 0
+fi
+# "Would a fresh instance with this --port be refused?" — exit code and message
+# only. The hook's value is the stand-in for / (its etc/systemd/system holds the
+# neighbours' units).
+if [ -n "${AGENTOS_PRINT_PORT_CHECK:-}" ]; then
+  HOST_PREFIX="$AGENTOS_PRINT_PORT_CHECK"
+  SUDO="${SUDO:-}"
+  AGENTOS_TEST_SKIP_LISTEN_PROBE=1
+  check_instance_port_free
+  echo "port=${PORT} free"
+  exit 0
+fi
+
 # ─── host authority: the sudoers drop-in ─────────────────────────────────────
 #
 # install_selfmgmt_sudoers (systemd path) drops a file at
@@ -2875,6 +3032,9 @@ install_exit_hooks() { # install_exit_hooks <profiles-dir>
 }
 
 install_systemd() {
+  # A second instance on this host must not take a port its neighbour already
+  # owns (12418agjuhx) — refused before anything is installed.
+  check_instance_port_free
   step "System packages"
   export DEBIAN_FRONTEND=noninteractive
   # DPkg::Lock::Timeout: on a fresh droplet's FIRST boot the provider agent
@@ -2997,7 +3157,7 @@ install_systemd() {
   # its bin dir on PATH for any child `node` processes npm spawns.
   $SUDO env PATH="$INSTALL_DIR/node/bin:$PATH" \
     "$INSTALL_DIR/node/bin/node" "$INSTALL_DIR/node/bin/npm" \
-    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.306"
+    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.310"
 
   step "Config + unit"
   # Snapshot what a RUNNING node booted with, before this run rewrites any of
@@ -3035,6 +3195,9 @@ install_systemd() {
             -e "s|^Group=agentos$|Group=${SERVICE_USER}|" \
             "$INSTALL_DIR/current/profiles/agentos.service" \
     | $SUDO tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null
+  # Before the tree chown, so the passport is the service account's like the
+  # rest of data/: where this node came from, for the node itself (12418agjuhx).
+  write_install_passport "$tag"
   $SUDO chown -R "${SERVICE_USER}:${SERVICE_USER}" "$INSTALL_DIR"
   # AFTER the tree chown: record any newly-declared external secret readers and
   # (re)apply their ACLs, so a reader survives this re-run and every later update
