@@ -1824,17 +1824,95 @@ fi
 # never satisfy the rules. render_selfmgmt_sudoers is a pure function of
 # (user, unit, scope) so the exact drop-in body is testable without root — see
 # AGENTOS_PRINT_SUDOERS below and scripts/tests/install-sudoers.test.sh.
+#
+# The scoped journal is NOT `journalctl -u <unit> *` (12418agk010). journalctl
+# merges repeated `-u` (and `--unit=`, `-M`, `-D`, `--file`, positional matches),
+# so the wildcard let the account append `-u agentos-<neighbour>` and read the
+# neighbour's journal. The grant names a ROOT-OWNED wrapper instead
+# (/usr/local/libexec/<unit>/journal, render_scoped_journal_wrapper): it pins
+# `-u <unit>`, forces `--no-pager`, and re-emits only an allowlist of read
+# options with checked values; anything else is refused before journalctl runs.
+# The two systemctl commands carry `noexec`, so a pager they open cannot spawn
+# a shell (`!sh` in less) as root.
+scoped_journal_wrapper_path() { echo "/usr/local/libexec/$1/journal"; }
+# A sudoers alias name for <unit>: uppercase, `_` → `__`, `-` → `_D`, so two
+# units never map to one alias (a duplicate alias across drop-ins breaks sudo).
+sudoers_alias_token() { local t="$1"; t="${t//_/__}"; t="${t//-/_D}"; echo "${t^^}"; }
+render_scoped_journal_wrapper() { # render_scoped_journal_wrapper <unit> → wrapper body on stdout
+  local unit="$1"
+  cat <<EOF
+#!/bin/sh
+# AgentOS scoped journal reader for ${unit}.service (install.sh --scoped-sudo).
+# Written by install.sh as root:root 0755 — do NOT edit by hand. The sudoers
+# drop-in lets the instance run THIS file as root; it reads ${unit}'s journal and
+# nothing else: the unit is pinned, the pager is off, and only the options below
+# pass (each value checked). Another -u/--unit, -M, -D, --file, --root, -k or a
+# positional match is refused before journalctl runs.
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset SYSTEMD_PAGER SYSTEMD_LESS PAGER LESS LESSOPEN LESSCLOSE 2>/dev/null || true
+refuse() { echo "journal: \$1 (only ${unit}'s journal is readable here)" >&2; exit 2; }
+num() { case "\$1" in ''|*[!0-9]*) refuse "not a number: \$1" ;; esac; }
+when() { case "\$1" in ''|*[!0-9A-Za-z\\ :.+-]*) refuse "bad time: \$1" ;; esac; }
+prio() { case "\$1" in ''|*[!a-z0-9.]*) refuse "bad priority: \$1" ;; esac; }
+boot() { case "\$1" in ''|*[!0-9a-f-]*|?*-*) refuse "bad boot id: \$1" ;; esac; }
+fmt() {
+  case "\$1" in
+    short|short-full|short-iso|short-iso-precise|short-precise|short-monotonic|short-unix|short-delta|verbose|export|json|json-pretty|json-sse|json-seq|cat|with-unit) ;;
+    *) refuse "bad output format: \$1" ;;
+  esac
+}
+n=\$#
+take() { [ "\$n" -gt 0 ] || refuse "\$1 needs a value"; }
+while [ "\$n" -gt 0 ]; do
+  a="\$1"; shift; n=\$((n-1))
+  case "\$a" in
+    -n|--lines) take "\$a"; v="\$1"; shift; n=\$((n-1)); num "\$v"; set -- "\$@" "--lines=\$v" ;;
+    --lines=*) num "\${a#*=}"; set -- "\$@" "\$a" ;;
+    -S|--since) take "\$a"; v="\$1"; shift; n=\$((n-1)); when "\$v"; set -- "\$@" "--since=\$v" ;;
+    --since=*) when "\${a#*=}"; set -- "\$@" "\$a" ;;
+    -U|--until) take "\$a"; v="\$1"; shift; n=\$((n-1)); when "\$v"; set -- "\$@" "--until=\$v" ;;
+    --until=*) when "\${a#*=}"; set -- "\$@" "\$a" ;;
+    -p|--priority) take "\$a"; v="\$1"; shift; n=\$((n-1)); prio "\$v"; set -- "\$@" "--priority=\$v" ;;
+    --priority=*) prio "\${a#*=}"; set -- "\$@" "\$a" ;;
+    -o|--output) take "\$a"; v="\$1"; shift; n=\$((n-1)); fmt "\$v"; set -- "\$@" "--output=\$v" ;;
+    --output=*) fmt "\${a#*=}"; set -- "\$@" "\$a" ;;
+    -g|--grep) take "\$a"; v="\$1"; shift; n=\$((n-1)); set -- "\$@" "--grep=\$v" ;;
+    --grep=*) set -- "\$@" "\$a" ;;
+    -b|--boot) set -- "\$@" "--boot" ;;
+    --boot=*) boot "\${a#*=}"; set -- "\$@" "\$a" ;;
+    -f|--follow) set -- "\$@" "--follow" ;;
+    -r|--reverse) set -- "\$@" "--reverse" ;;
+    -q|--quiet) set -- "\$@" "--quiet" ;;
+    -x|--catalog) set -- "\$@" "--catalog" ;;
+    -a|--all) set -- "\$@" "--all" ;;
+    --no-hostname|--utc|--no-tail) set -- "\$@" "\$a" ;;
+    *) refuse "option not allowed: \$a" ;;
+  esac
+done
+exec /usr/bin/journalctl --no-pager -u ${unit} "\$@"
+EOF
+}
 render_selfmgmt_sudoers() { # render_selfmgmt_sudoers <user> <unit> [scope] → drop-in body on stdout
   local user="$1" unit="$2" scope="${3:-full}"
   if [ "$scope" = "selfmgmt" ]; then
+    local alias wrapper
+    alias="AGENTOS_SELFMGMT_$(sudoers_alias_token "$unit")_SYSTEMCTL"
+    wrapper="$(scoped_journal_wrapper_path "$unit")"
     cat <<EOF
 # AgentOS per-instance self-management for the '${user}' instance (--scoped-sudo).
 # Written by install.sh — do NOT edit by hand; a re-run or upgrade rewrites it,
 # an uninstall removes it. Grants ${user} NOPASSWD sudo for EXACTLY three
 # commands against its own unit (${unit}.service) and nothing else on this host:
 # restart it, read its status, and read its journal. No bare systemctl, no other
-# unit's journal.
-${user} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${unit}, /usr/bin/systemctl status ${unit}, /usr/bin/journalctl -u ${unit} *
+# unit's journal: the journal is read through the root-owned wrapper
+# ${wrapper}, which pins -u ${unit} and refuses any
+# other unit, machine, directory or file. systemctl runs with noexec, so its
+# pager cannot start a shell.
+Cmnd_Alias ${alias} = /usr/bin/systemctl restart ${unit}, /usr/bin/systemctl status ${unit}
+Defaults!${alias} noexec
+${user} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${unit}, /usr/bin/systemctl status ${unit}, ${wrapper}
 EOF
   else
     cat <<EOF
@@ -1856,6 +1934,11 @@ EOF
 # or a box, same dry-run contract as AGENTOS_PRINT_IDENTITY above.
 if [ -n "${AGENTOS_PRINT_SUDOERS:-}" ]; then
   render_selfmgmt_sudoers "$SERVICE_USER" "$SERVICE_NAME" "$SUDO_SCOPE"
+  exit 0
+fi
+# The scoped journal wrapper's body, same contract (driven by the same suite).
+if [ -n "${AGENTOS_PRINT_JOURNAL_WRAPPER:-}" ]; then
+  render_scoped_journal_wrapper "$SERVICE_NAME"
   exit 0
 fi
 
@@ -3157,7 +3240,7 @@ install_systemd() {
   # its bin dir on PATH for any child `node` processes npm spawns.
   $SUDO env PATH="$INSTALL_DIR/node/bin:$PATH" \
     "$INSTALL_DIR/node/bin/node" "$INSTALL_DIR/node/bin/npm" \
-    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.310"
+    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.312"
 
   step "Config + unit"
   # Snapshot what a RUNNING node booted with, before this run rewrites any of
@@ -3364,6 +3447,25 @@ resolve_visudo() {
   [ -n "$found" ] || return 1
   VISUDO="$found"
 }
+# The scoped grant's journal wrapper (12418agk010): root:root 0755 under the
+# unit's root-owned libexec directory, written before the drop-in that names it.
+# A wrapper that did not land leaves the scoped node without its journal, which
+# is a missing host authority like any other (banner + exit 3).
+install_scoped_journal_wrapper() {
+  local libexec="${HOST_PREFIX}/usr/local/libexec/${SERVICE_NAME}"
+  local target; target="${HOST_PREFIX}$(scoped_journal_wrapper_path "$SERVICE_NAME")"
+  local tmp; tmp="$(mktemp)"
+  render_scoped_journal_wrapper "$SERVICE_NAME" > "$tmp"
+  if ! plain_dir_ok "$libexec" "journal wrapper directory" \
+     || ! { $SUDO mkdir -p "$libexec" && $SUDO chmod 0755 "$libexec"; } \
+     || ! $SUDO install -m 0755 -o root -g root "$tmp" "${target}.tmp" 2>/dev/null \
+     || ! $SUDO mv -f "${target}.tmp" "$target"; then
+    $SUDO rm -f "${target}.tmp" 2>/dev/null || true
+    warn "could not write ${target} — the scoped node cannot read its own journal."
+    HOST_AUTHORITY_MISSING="could not write the journal wrapper ${target}"
+  fi
+  rm -f "$tmp"
+}
 install_selfmgmt_sudoers() {
   step "Host authority (sudoers)"
   if ! resolve_visudo && command -v apt-get >/dev/null 2>&1; then
@@ -3378,6 +3480,7 @@ install_selfmgmt_sudoers() {
     return 0
   fi
   local dropin="${HOST_PREFIX}/etc/sudoers.d/${SERVICE_USER}-selfmgmt"
+  if [ "$SUDO_SCOPE" = "selfmgmt" ]; then install_scoped_journal_wrapper; fi
   local tmp; tmp="$(mktemp)"
   render_selfmgmt_sudoers "$SERVICE_USER" "$SERVICE_NAME" "$SUDO_SCOPE" > "$tmp"
   # visudo -cf checks THIS file's syntax in isolation; -f names the file.
