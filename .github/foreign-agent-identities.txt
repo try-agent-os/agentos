@@ -1,0 +1,26 @@
+# Agent identities of OTHER deployments, which may not appear in a commit of this
+# repository (.github/check-commit-identity.py). People are not limited and are
+# never listed here, nor are this project's own agent and release bot.
+#
+# Each line is a salted hash from `check-commit-identity.py --hash`: an address or
+# a whole `@domain`. A plain address here would itself publish who those
+# deployments are, so the gate refuses one, and neither a comment here nor a commit
+# message or pull request that changes this file may name them.
+#
+# The gate reads this file from the BASE of the pull request, never from its head,
+# so a pull request cannot drop an entry to let its own commits through. An empty
+# or unreadable file fails the gate. `#` starts a comment.
+
+0a041d456e8518a7c861cfd069bec0a73be50191922a2bd72d687d2197b20c96
+1b1c44d03d0883c3ad51d79765c7630fafbb18cebd756ec5ee62694c3e291748
+2aee73f9d0b2b4d739273738fd0ebc15823dd37409217a68650c29eea242c658
+51316b51ab2a2fa5db15e7db67d461106d9037737c73ef33c4d266e17e94a588
+570900834e6ca22151fb7b2e56373d44c8b2248d33678a45cbc1a28d9d43f6da
+69b86d0c5fa1dfdc626025ebf627441c46ccf422bfdbb3d17f3119b0a7e9f288
+7626910a0d079034fec096404d95a85d426c40fa9c72d670aaadf293d54962a7
+905aff06b4301311c44ce0615f15fb46768d130688b3a69f55000bc8d08ea0c8
+bfb4960bb611622a75f1483abd8390b20af76fc0ce38dff810f9a2cc20347bc7
+e139921614f9af562a9228803d21ed3cc8dc577a08957549a5440b82e4d3b237
+f144cfe313b7c633c07261ff349671237e74c9c6cf93c00a41d9536f482249d3
+f22eba2e23424224753a3675a88c5ae1ec424469845f2d75b90df28b89aaf7ad
+f7e467e327c8470bddcad6698a78a63187ab1d2b71b7089bb8c3d1a6946d9481
