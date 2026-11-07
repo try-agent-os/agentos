@@ -945,8 +945,8 @@ done
 if [ "$SERVICE_USER" = "agentos" ]; then
   SERVICE_NAME="agentos"
 else
-  # Always prefixed, never doubled: --user symoditi and --user agentos-symoditi
-  # both land on agentos-symoditi.service, so the unit is findable by `systemctl
+  # Always prefixed, never doubled: --user acme and --user agentos-acme
+  # both land on agentos-acme.service, so the unit is findable by `systemctl
   # list-units 'agentos*'` no matter which spelling the operator picked.
   SERVICE_NAME="agentos-${SERVICE_USER#agentos-}"
 fi
@@ -1228,11 +1228,11 @@ gh_installed_version() { # gh_installed_version → x.y.z, empty when gh is abse
 # Codex runs its read-only / workspace-write sandbox through bwrap. Ubuntu 24.04
 # sets kernel.apparmor_restrict_unprivileged_userns=1, and there an unconfined
 # bwrap cannot create the user namespace it needs ("No permissions to create a
-# new namespace") until an AppArmor profile grants `userns` — BitMotors had both
-# done by hand. The node's default sandbox (danger-full-access) never uses bwrap,
-# so nothing here stops the run: a gap is a warning, and an existing profile is
-# the operator's and is never overwritten. HOST_PREFIX is the test suite's
-# stand-in for /.
+# new namespace") until an AppArmor profile grants `userns` — one production
+# node had both done by hand. The node's default sandbox (danger-full-access)
+# never uses bwrap, so nothing here stops the run: a gap is a warning, and an
+# existing profile is the operator's and is never overwritten. HOST_PREFIX is
+# the test suite's stand-in for /.
 BWRAP_APPARMOR_PROFILE="/etc/apparmor.d/bwrap"
 bwrap_apparmor_profile() { # bwrap_apparmor_profile <bwrap-path>
   cat <<PROFILE
