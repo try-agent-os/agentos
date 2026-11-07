@@ -109,7 +109,7 @@ fetch_release_asset() { # fetch_release_asset <what> <url> [outfile]  — no out
 #
 # THE BUDGET IS A COLD START, NOT A FIXED POLL COUNT (ClickUp 12418agg32g). It
 # used to be 45 polls — about 90 s when the port refuses fast — and on
-# 2026-09-24 bailaspot's v4.41.0 needed 164 s from `systemctl start` to "Nest
+# 2026-09-24 one node's v4.41.0 needed 164 s from `systemctl start` to "Nest
 # application successfully started" on a loaded host (a neighbour's
 # daemon-reload was running at the same time). The gate declared a HEALTHY
 # release unhealthy 17 s before it came up, and the rollback that followed is
@@ -195,7 +195,7 @@ node_data_dir() {
 # model): a missing, unreadable, oversized, malformed or foreign-class file is
 # no answer at all, and so is one whose `at` predates the start this wait
 # belongs to — a refusal left over from an earlier boot must never cut short
-# the wait for a release that is merely slow (bailaspot, 2026-09-24). What it
+# the wait for a release that is merely slow (seen on 2026-09-24). What it
 # can decide is only what this node does with its OWN boot, and only while the
 # unit is also not answering /healthz: at worst a forged file rolls back a
 # release that was not coming up anyway. Names are reduced to the characters a
@@ -226,9 +226,9 @@ boot_failure_since() { # boot_failure_since <epoch-seconds>
 # During a daemon-reload PID 1 does not answer on its bus, and every systemctl
 # fails with "Transport endpoint is not connected" (ENOTCONN) or "Failed to
 # connect to bus". On a host that runs several nodes, a NEIGHBOUR's upgrade
-# reloads systemd too: on 2026-09-24 symoditi's unit reconciliation started a
-# reload that took 119 s, and bailaspot's rollback `systemctl stop` died inside
-# it — leaving the node on the release the gate had just rejected while the
+# reloads systemd too: on 2026-09-24 one node's unit reconciliation started a
+# reload that took 119 s, and its neighbour's rollback `systemctl stop` died
+# inside it — leaving the node on the release the gate had just rejected while the
 # chat was told it was rolled back (ClickUp 12418agg32g; the 2026-09-19 hub
 # reload took 113 s, 12418agfmgz). A reload ends; waiting it out is the fix.
 # Only those bus errors are retried, for AGENTOS_SYSTEMD_BUS_WAIT_SEC (default
@@ -1154,11 +1154,12 @@ gh_add_apt_repo() {
 # Codex runs its read-only / workspace-write sandbox through bwrap. Ubuntu 24.04
 # sets kernel.apparmor_restrict_unprivileged_userns=1, and there an unconfined
 # bwrap cannot create the user namespace it needs ("No permissions to create a
-# new namespace") until an AppArmor profile grants `userns` — BitMotors had both
-# done by hand. The node's default sandbox (danger-full-access) never uses bwrap,
-# so nothing here stops the run: a gap is a warning, and an existing profile is
-# the operator's and is never overwritten. HOST_PREFIX is the test suite's
-# stand-in for /. Same function as install.sh's: `agentos upgrade` is the root
+# new namespace") until an AppArmor profile grants `userns` — one production
+# node had both done by hand. The node's default sandbox (danger-full-access)
+# never uses bwrap, so nothing here stops the run: a gap is a warning, and an
+# existing profile is the operator's and is never overwritten. HOST_PREFIX is
+# the test suite's stand-in for /. Same function as install.sh's: `agentos
+# upgrade` is the root
 # path every node walks after install, so an existing node heals here.
 BWRAP_APPARMOR_PROFILE="/etc/apparmor.d/bwrap"
 bwrap_apparmor_profile() { # bwrap_apparmor_profile <bwrap-path>
@@ -1459,7 +1460,7 @@ $3"
   # `-f "$main_unit"` guard makes this correctly skip there.
   #
   # Local drop-ins live in ${AGENTOS_SERVICE}.service.d/*.conf — a separate tree
-  # this write never touches — so an operator's override (e.g. Symoditi's manual
+  # this write never touches — so an operator's override (e.g. a manual
   # 21-stop-timeout.conf) survives the migration untouched.
   local main_unit="$units_dir/${AGENTOS_SERVICE}.service"
   # The hooks the template calls as root, BEFORE the template that calls them —
@@ -1477,7 +1478,7 @@ $3"
     # target whose directory is missing. It does not degrade: the unit fails
     # 209/STDOUT before ExecStart, Restart=always retries, and the node sits in
     # a restart loop until a human creates one directory. That is exactly what
-    # took the Symoditi node down on 2026-08-19 (restart counter 54, ~6 min of
+    # took a production node down on 2026-08-19 (restart counter 54, ~6 min of
     # downtime), and it would have hit every pre-log-file install on ITS next
     # upgrade. Create the directory BEFORE writing the unit, never after: the
     # window between the two is precisely the failure.
@@ -3231,8 +3232,8 @@ systemd_prune_orphans() { # AGENTOS_ORPHAN_KEEP_DAYS (default 14, 0 = never) —
 # Retention of the upgrade snapshots (ClickUp 12418aghyzv). Each auto snapshot
 # is a full copy of data/'s contexts tree — on the hub ~1.3 GB of state.db
 # alone, ~3.4 GB per snapshot — and the fleet upgrades about twice a day. The
-# old keep-5-by-mtime rule held five such copies per node (prpillar and
-# symoditi were found holding seven on 2026-10-16, ~10 GB across the host),
+# old keep-5-by-mtime rule held five such copies per node (two nodes were
+# found holding seven on 2026-10-16, ~10 GB across the host),
 # and its "pruned" lines went into the caller's $(...) capture, so the journal
 # never showed what retention did. Now:
 #   * by COUNT: AGENTOS_KEEP_BACKUPS (default 1 — the pending-rollback
@@ -3481,7 +3482,7 @@ systemd_restore_sqlite_try() {
   done
   # Submodule object stores the snapshot left out (5. above, 12418agg7zh) are
   # set aside too, so the restore does not depend on the remote for them: on
-  # 2026-10-09 the hub's rollback could not refetch workspaces/prpillar/analytics
+  # 2026-10-09 the hub's rollback could not refetch a workspace submodule
   # (the node had no access to its remote), the git dir came back with an empty
   # objects/ under HEAD=e2b36d3 and repo-sync stopped on "bad object HEAD". The
   # live store is the same content-addressed store the snapshot was taken from,
@@ -4150,7 +4151,7 @@ systemd_rollback() { # undo the last recorded upgrade — code + database togeth
   set_env_version "$prev"
   # The release left behind goes on the blacklist (spec §8.4, ClickUp
   # 12418agg8wa): without it the next poller tick reinstalls exactly what was
-  # just thrown out — the v4.41.0 return on hub and symoditi, 24.09.
+  # just thrown out — the v4.41.0 return on two nodes, 24.09.
   blacklist_left "$left" "$prev" rollback
   rm -f "$STABILITY_DIR/.last-upgrade" 2>/dev/null || true
   release_exit_watch_restart
