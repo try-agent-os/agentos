@@ -1650,7 +1650,10 @@ fi
 #
 # The passport is a fact about the INSTALL, not about the running version:
 #   - `installed` is written once, by the run that created the install, and every
-#     later run carries it over from the previous passport;
+#     later run carries it over from the previous passport. A run over an install
+#     that predates the passport did NOT create it and cannot know who did, so it
+#     writes `installed: null` (unknown) rather than its own version and date:
+#     the field is carried over forever, so a wrong value would never heal;
 #   - `last_run` is rewritten by every run (a re-run, a contour backfill);
 #   - the version the node runs NOW is the core's own build info — `agentos
 #     upgrade` and the autoupdate timer move it without this script.
@@ -1671,12 +1674,13 @@ install_actor() {
   id -un 2>/dev/null || echo "unknown"
 }
 
-# render_install_passport <version> <previous passport JSON or empty> -> JSON on stdout.
+# render_install_passport <version> <previous passport JSON or empty> <existing install 0|1>
+#   -> JSON on stdout.
 # Pure apart from the clock and the host name, both overridable for tests
 # (AGENTOS_TEST_NOW, AGENTOS_TEST_HOST). A previous passport that is not valid
 # JSON is ignored, never fatal: the install must not die on a damaged file.
 render_install_passport() {
-  local version="$1" previous="$2" now host by cli prev_installed="null"
+  local version="$1" previous="$2" existing="${3:-0}" now host by cli prev_installed="null"
   now="${AGENTOS_TEST_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
   host="${AGENTOS_TEST_HOST:-$(hostname 2>/dev/null || echo unknown)}"
   by="$(install_actor)"
@@ -1700,6 +1704,7 @@ render_install_passport() {
     --arg version "$version" \
     --arg now "$now" \
     --arg by "$by" \
+    --arg existing "$existing" \
     --argjson prev "$prev_installed" '
     {
       schema: 1,
@@ -1714,6 +1719,7 @@ render_install_passport() {
       cli: $cli,
       installed: (if ($prev | type) == "object" and ($prev.at // "") != ""
                   then $prev
+                  elif $existing == "1" then null
                   else { version: $version, at: $now, by: $by } end),
       last_run: { version: $version, at: $now, by: $by }
     }'
@@ -1721,11 +1727,11 @@ render_install_passport() {
 
 # Write the passport into the data dir. Best effort: a passport that cannot be
 # written costs the node its answer to "where am I from", never the install.
-write_install_passport() { # write_install_passport <version>
+write_install_passport() { # write_install_passport <version> <existing install 0|1>
   local file previous body
   file="$(install_passport_path)"
   previous="$(read_maybe_sudo "$file" 2>/dev/null || true)"
-  if ! body="$(render_install_passport "$1" "$previous")"; then
+  if ! body="$(render_install_passport "$1" "$previous" "${2:-0}")"; then
     warn "install passport: could not be rendered (jq?) — the node will not know where it came from"
     return 0
   fi
@@ -1776,11 +1782,12 @@ check_instance_port_free() {
 
 # "What passport would this run write?" — answered without touching the machine.
 # AGENTOS_PRINT_PASSPORT_PREV names a file holding a PREVIOUS passport (unset for
-# a fresh install). Driven by scripts/tests/install-passport.test.sh.
+# a fresh install); AGENTOS_PRINT_PASSPORT_EXISTING=1 says the install was already
+# there. Driven by scripts/tests/install-passport.test.sh.
 if [ -n "${AGENTOS_PRINT_PASSPORT:-}" ]; then
   _prev=""
   [ -n "${AGENTOS_PRINT_PASSPORT_PREV:-}" ] && _prev="$(cat "$AGENTOS_PRINT_PASSPORT_PREV")"
-  render_install_passport "${AGENTOS_TEST_TAG:-v0.0.0-dryrun}" "$_prev"
+  render_install_passport "${AGENTOS_TEST_TAG:-v0.0.0-dryrun}" "$_prev" "${AGENTOS_PRINT_PASSPORT_EXISTING:-0}"
   exit 0
 fi
 # "Would a fresh instance with this --port be refused?" — exit code and message
@@ -3240,7 +3247,7 @@ install_systemd() {
   # its bin dir on PATH for any child `node` processes npm spawns.
   $SUDO env PATH="$INSTALL_DIR/node/bin:$PATH" \
     "$INSTALL_DIR/node/bin/node" "$INSTALL_DIR/node/bin/npm" \
-    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.312"
+    install -g --prefix "$INSTALL_DIR/node" "@anthropic-ai/claude-code@2.1.318"
 
   step "Config + unit"
   # Snapshot what a RUNNING node booted with, before this run rewrites any of
@@ -3280,7 +3287,8 @@ install_systemd() {
     | $SUDO tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null
   # Before the tree chown, so the passport is the service account's like the
   # rest of data/: where this node came from, for the node itself (12418agjuhx).
-  write_install_passport "$tag"
+  # `installed` was read from the `current` link before this run replaced it.
+  write_install_passport "$tag" "$([ -n "$installed" ] && echo 1 || echo 0)"
   $SUDO chown -R "${SERVICE_USER}:${SERVICE_USER}" "$INSTALL_DIR"
   # AFTER the tree chown: record any newly-declared external secret readers and
   # (re)apply their ACLs, so a reader survives this re-run and every later update
