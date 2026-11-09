@@ -1765,6 +1765,29 @@ port_claimed_by_other_instance() { # port_claimed_by_other_instance <port>
   return 1
 }
 
+# Does something listen on <port>? AGENTOS_TEST_LISTENING_PORTS (a space-separated
+# list) replaces the probe for scripts/tests/install-passport.test.sh: no socket
+# on the machine that runs the suite decides its result.
+port_listener_here() { # port_listener_here <port>
+  if [ -n "${AGENTOS_TEST_LISTENING_PORTS+x}" ]; then
+    case " ${AGENTOS_TEST_LISTENING_PORTS} " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+  fi
+  [ -z "${AGENTOS_TEST_SKIP_LISTEN_PROBE:-}" ] && port_in_use "$1"
+}
+
+# The hint of a refusal: the nearest port above <port> this script would accept,
+# so the command it suggests is not refused in turn. Prints ", e.g. --port N", or
+# nothing when no port above it is free.
+free_port_hint() { # free_port_hint <port>
+  local p
+  for ((p = $1 + 1; p <= 65535; p++)); do
+    port_claimed_by_other_instance "$p" >/dev/null && continue
+    port_listener_here "$p" && continue
+    printf ', e.g. --port %s' "$p"
+    return 0
+  done
+}
+
 # A FRESH systemd instance refuses a port that is taken — by a listener or by a
 # neighbour instance's .env. A re-run of an existing install keeps its own port
 # (it is the listener), so the check only applies when this root has no .env yet.
@@ -1772,10 +1795,10 @@ check_instance_port_free() {
   local owner
   [ -n "$(read_maybe_sudo "$INSTALL_DIR/.env" 2>/dev/null || true)" ] && return 0
   if owner="$(port_claimed_by_other_instance "$PORT")"; then
-    die "--port ${PORT} is already the port of ${owner} on this host — pick another one, e.g. --port $((PORT + 1))"
+    die "--port ${PORT} is already the port of ${owner} on this host — pick another one$(free_port_hint "$PORT")"
   fi
-  if [ -z "${AGENTOS_TEST_SKIP_LISTEN_PROBE:-}" ] && port_in_use "$PORT"; then
-    die "--port ${PORT}: something already listens on it — pick a free port, e.g. --port $((PORT + 1))"
+  if port_listener_here "$PORT"; then
+    die "--port ${PORT}: something already listens on it — pick a free port$(free_port_hint "$PORT")"
   fi
   return 0
 }
