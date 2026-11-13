@@ -5695,6 +5695,15 @@ agentos — operate an AgentOS Core node
                               write: marks newest first, days by the day rule
                               and the streak; delete is the only way a mark is
                               ever erased. The same answer as `agentos ctl marks`
+  skill list | review | install | update | enable | disable | rollback | remove …
+                              node skill packages per consumer set (chat,
+                              routine, worker) through the running node's API:
+                              install stages a DISABLED generation; enable
+                              prints the capabilities and, with --yes, asks the
+                              owner in their private chat. Never enables by
+                              itself. The same answer as `agentos ctl skill`;
+                              the contour is the one this command belongs to
+                              (`agentos-<name> skill …` on a shared host)
   sessions <verb> …           durable agent sessions over this node's job API
                               (create|ls|status|attach|steer|stop|resume|budget;
                               `session` is the singular alias). Receipts, event
@@ -5772,6 +5781,7 @@ case "${1:-}" in
   ctl)        shift; cmd_ctl "$@" ;;
   stats)      shift; cmd_ctl stats "$@" ;;
   marks)      shift; cmd_ctl marks "$@" ;;
+  skill|skills) shift; cmd_ctl skill "$@" ;;
   sessions|session) shift; cmd_sessions "$@" ;;
   mcp)        shift; cmd_mcp "$@" ;;
   md2quill)   shift; cmd_md2quill "$@" ;;
