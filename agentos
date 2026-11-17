@@ -3170,6 +3170,85 @@ record_upgrade_downtime() { # record_upgrade_downtime <docker|systemd> <from> <t
   return 0
 }
 
+# snapshot_copy <data> <dest> — copies the entries <dest>/$SNAPSHOT_MANIFEST/list
+# names from <data> into <dest>. 0 when the copy is usable, 1 otherwise.
+#
+# Two things a writer outside the stopped unit does to a plain tar are not a
+# reason to abort an upgrade (ClickUp 12418agjh5h):
+#   • an entry the plan listed is GONE by the time tar reaches it (a git
+#     AUTO_MERGE, an index.lock, a temp file) — --ignore-failed-read keeps
+#     that a warning: what no longer exists is not part of the state;
+#   • a file CHANGED while tar read it (tar's exit 1) — a torn copy is only
+#     dangerous for a SQLite database, so every database in the copy is then
+#     replaced by a consistent one (snapshot_sqlite_copy). Any other file is
+#     the last state a stray writer left, as good as a copy taken a second
+#     later.
+# Anything else — tar's exit 2, a failed extract, a database that cannot be
+# copied consistently — fails the copy.
+snapshot_copy() {
+  local data="$1" dest="$2" list="$2/$SNAPSHOT_MANIFEST/list" rc_c=0 rc_x=0 rel errexit=0
+  local -a rcs
+  [ -s "$list" ] || return 0
+  # Both exit codes are needed, so PIPESTATUS is read right after a bare
+  # pipeline: inside `if <pipeline>; else` it no longer holds both, and
+  # `set -u` would kill the engine on PIPESTATUS[1]. errexit is lifted for
+  # this one pipeline only and restored as the caller had it.
+  case "$-" in *e*) errexit=1; set +e ;; esac
+  # --no-recursion: the list already names every directory and file, and
+  # recursion would pull back in exactly what the plan left out.
+  tar -C "$data" --null --no-recursion --ignore-failed-read -T "$list" -cf - \
+    | tar -C "$dest" -xpf -
+  rcs=("${PIPESTATUS[@]}")
+  [ "$errexit" = 1 ] && set -e
+  rc_c="${rcs[0]:-1}"; rc_x="${rcs[1]:-1}"
+  [ "$rc_c" = 0 ] && [ "$rc_x" = 0 ] && return 0
+  [ "$rc_x" = 0 ] || { warn "snapshot copy: extract into $dest failed (tar exit $rc_x)" >&2; return 1; }
+  [ "$rc_c" = 1 ] || { warn "snapshot copy: reading $data failed (tar exit $rc_c)" >&2; return 1; }
+  info "snapshot copy: files changed while read — taking consistent copies of the SQLite databases" >&2
+  while IFS= read -r -d '' rel; do
+    case "$rel" in *.db) ;; *) continue ;; esac
+    [ -f "$dest/$rel" ] && [ ! -L "$dest/$rel" ] || continue
+    [ "$(head -c 15 "$dest/$rel" 2>/dev/null)" = "SQLite format 3" ] || continue
+    snapshot_sqlite_copy "$data/$rel" "$dest/$rel" \
+      || { warn "snapshot copy: no consistent copy of $rel" >&2; return 1; }
+  done < "$list"
+  return 0
+}
+
+# What snapshot_sqlite_copy runs: SQLite's own VACUUM INTO, which reads one
+# transaction-consistent state of the database (its WAL included) and writes
+# it as a single file. Opened read-only, so the live file is never written.
+SNAPSHOT_SQLITE_COPY_JS='
+const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync(process.argv[1], { readOnly: true });
+db.exec("PRAGMA busy_timeout = 15000");
+db.prepare("VACUUM INTO ?").run(process.argv[2]);
+db.close();
+'
+
+# snapshot_sqlite_copy <src-db> <dest-db> — replaces <dest-db> (and drops its
+# -wal/-shm: a stale WAL next to a vacuumed file would be replayed onto it)
+# with a consistent copy of <src-db>. Runs as the service account, so no
+# root-owned -shm is ever left next to the live database.
+snapshot_sqlite_copy() {
+  local src="$1" dst="$2" node="$AGENTOS_HOME/node/bin/node" tmpd
+  if [ ! -x "$node" ]; then node="$(command -v node 2>/dev/null)" || return 1; fi
+  [ -f "$src" ] || return 1
+  tmpd="$(mktemp -d "$(dirname "$dst")/.agentos-sqlite.XXXXXX")" || return 1
+  if [ "${EUID:-$(id -u 2>/dev/null || echo 0)}" = 0 ]; then
+    chown "$AGENTOS_ACCOUNT" "$tmpd" 2>/dev/null || { rm -rf "$tmpd"; return 1; }
+  fi
+  if ! snapshot_as_account "$node" --no-warnings -e "$SNAPSHOT_SQLITE_COPY_JS" "$src" "$tmpd/copy.db" >&2 \
+     || [ ! -s "$tmpd/copy.db" ]; then
+    rm -rf "$tmpd"
+    return 1
+  fi
+  rm -f "$dst-wal" "$dst-shm"
+  mv -f "$tmpd/copy.db" "$dst" || { rm -rf "$tmpd"; return 1; }
+  rm -rf "$tmpd"
+  return 0
+}
+
 systemd_backup_sqlite() { # systemd_backup_sqlite <label> — <label> is the code tag this snapshot belongs next to. Prints the new dir's path on stdout (nothing if managed Postgres). Never touches .last-upgrade — callers decide that.
   if uses_managed_postgres; then
     warn "DATABASE_URL is set: skipping local SQLite backup (managed PostgreSQL backups are external)." >&2
@@ -3182,7 +3261,6 @@ systemd_backup_sqlite() { # systemd_backup_sqlite <label> — <label> is the cod
   # Make room first: keep-1 old snapshots plus the one about to be copied, so
   # the disk never holds keep+1 of them, not even for the length of the copy.
   systemd_prune_backups 1
-  mkdir -p "$dest/$SNAPSHOT_MANIFEST"
   systemd_prune_orphans
   # What is copied: the SQLite files; .aop/ — the agent run-state (in-flight
   # run dirs, cursors), which docker mode captures by tarring the whole /data
@@ -3190,16 +3268,37 @@ systemd_backup_sqlite() { # systemd_backup_sqlite <label> — <label> is the cod
   # node with mismatched runs; and contexts/ — every per-context ledger and
   # local-only repository, including unpushed local history. The exact path
   # list, and what it leaves out as rebuildable, is snapshot_plan's (above).
-  snapshot_plan "$AGENTOS_HOME/data" "$dest/$SNAPSHOT_MANIFEST"
-  if [ -s "$dest/$SNAPSHOT_MANIFEST/list" ]; then
-    # --no-recursion: the list already names every directory and file, and
-    # recursion would pull back in exactly what the plan left out.
-    if ! tar -C "$AGENTOS_HOME/data" --null --no-recursion -T "$dest/$SNAPSHOT_MANIFEST/list" -cf - \
-         | tar -C "$dest" -xpf -; then
-      warn "snapshot copy failed: $dest is incomplete" >&2
-      return 1
+  #
+  # The unit is stopped, but data/ is not necessarily quiet: a detached
+  # session, a worker or a repair tree started outside the node's cgroup may
+  # still write a state.db or rewrite a .git of a checkout under contexts/
+  # (hub, 2026-10-25: `checkout/.git/AUTO_MERGE: Cannot stat` and `state.db:
+  # file changed as we read it` failed the copy and aborted the upgrade —
+  # ClickUp 12418agjh5h). snapshot_copy tolerates that (see there); what is
+  # left — a copy that still fails — is retried on a fresh plan, so a file
+  # that vanished meanwhile is simply no longer listed.
+  local attempts="${AGENTOS_SNAPSHOT_ATTEMPTS:-3}" attempt=1
+  case "$attempts" in ''|*[!0-9]*|0) attempts=3 ;; esac
+  while :; do
+    mkdir -p "$dest/$SNAPSHOT_MANIFEST"
+    snapshot_plan "$AGENTOS_HOME/data" "$dest/$SNAPSHOT_MANIFEST"
+    snapshot_copy "$AGENTOS_HOME/data" "$dest" && break
+    if [ "$attempt" -ge "$attempts" ]; then
+      # An incomplete snapshot named like a complete one is a trap for the
+      # next rollback that picks it: it goes, and the line says so.
+      rm -rf "${dest:?}"
+      warn "snapshot copy failed after $attempt attempt(s): $(basename "$dest") was incomplete and is removed" >&2
+      # A sentinel on stdout, not a non-zero return: the caller reads this
+      # function through $(…), and calling it in a `||` context would switch
+      # errexit off for everything inside it.
+      printf '\n%s' "$SNAPSHOT_FAILED_MARK"
+      return 0
     fi
-  fi
+    warn "snapshot copy attempt $attempt/$attempts failed — retrying on a fresh plan" >&2
+    rm -rf "${dest:?}"
+    attempt=$((attempt + 1))
+    sleep "${AGENTOS_SNAPSHOT_RETRY_SLEEP:-2}"
+  done
   rm -f "$dest/$SNAPSHOT_MANIFEST/list"
   echo "$label" > "$dest/version"
   ok "backup: $(basename "$dest")"
@@ -3995,7 +4094,10 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   stop_epoch="$(date +%s)"
   systemctl_bus stop "$AGENTOS_SERVICE"
   snap_started="$(date +%s)"
-  snap="$(systemd_backup_sqlite "$prev" | tail -1)"   # consistent copy: the unit is stopped
+  # consistent copy: the unit is stopped. A snapshot that cannot be taken ends
+  # the upgrade HERE, before anything is replaced (12418agjh5h).
+  snap="$(systemd_backup_sqlite "$prev" | tail -1)"
+  [ "$snap" != "$SNAPSHOT_FAILED_MARK" ] || systemd_upgrade_snapshot_abort "$prev" "$tag" "$stop_epoch"
   snap_seconds=$(( $(date +%s) - snap_started ))
   [ -n "$snap" ] && echo "$snap" > "$BACKUP_DIR/.last-upgrade"   # pairs snapshot + code tag atomically, before the swap
   if [ -n "$RECOVERY_EPISODE" ] && [ -n "$snap" ]; then
@@ -4097,6 +4199,34 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
     record_upgrade_downtime systemd "${prev#v}" "${prev#v}" "$stop_epoch" "$snap_seconds"
     die "upgrade to $tag failed; $prev restored"
   fi
+}
+
+# systemd_upgrade_snapshot_abort <prev> <tag> <stop-epoch> — the pre-upgrade
+# snapshot failed after the stop; never returns (ClickUp 12418agjh5h).
+#
+# Nothing was replaced: `current` still points at <prev>, no health gate ran
+# and there is nothing to roll back. So the old release is simply started
+# again, and the outcome is said in a machine line of its own,
+#   snapshot-failed: <text>
+# which the poller turns into `reason=snapshot-failed` instead of reading the
+# exit code as a failed gate whose rollback did not complete. The release is
+# not at fault, so nothing goes on the blacklist; the next tick retries.
+UPGRADE_SNAPSHOT_FAILED=0
+SNAPSHOT_FAILED_MARK="agentos-snapshot-failed"
+systemd_upgrade_snapshot_abort() {
+  local prev="$1" tag="$2" stop_epoch="$3"
+  UPGRADE_SNAPSHOT_FAILED=1
+  if [ -n "${RECOVERY_EPISODE:-}" ]; then
+    recovery_terminal aborted "$prev" "pre-upgrade snapshot failed; current never moved"
+  fi
+  echo "snapshot-failed: the pre-upgrade snapshot could not be taken; current still points at $prev" >&2
+  release_exit_watch_restart
+  systemctl_bus start "$AGENTOS_SERVICE" || true   # a failed activation IS a failed healthz below
+  if wait_healthz "$AGENTOS_SERVICE"; then
+    record_upgrade_downtime systemd "${prev#v}" "${prev#v}" "$stop_epoch" 0
+    die "upgrade to $tag aborted before the switch: the pre-upgrade snapshot failed. Nothing was replaced and no health gate ran; $prev was started again and answers /healthz"
+  fi
+  die "upgrade to $tag aborted before the switch: the pre-upgrade snapshot failed. Nothing was replaced; $prev was started again but does NOT answer /healthz — inspect: journalctl -u $AGENTOS_SERVICE"
 }
 
 # systemd_upgrade_recover <prev> <tag> <stop-epoch> <snap-seconds> — the
@@ -4709,6 +4839,11 @@ upgrade_abort_report() { # upgrade_abort_report [exit-status]  — default: $? a
       write_upgrade_result failed-no-rollback "$MANUAL_UPGRADE_FROM" "$MANUAL_UPGRADE_TO" \
         "schema-compat" "$UPGRADE_SCHEMA_COMPAT_DETAIL"
       write_failed_marker "${UPGRADE_SCHEMA_COMPAT_TO:-$MANUAL_UPGRADE_TO}" schema-compat
+    elif [ "${UPGRADE_SNAPSHOT_FAILED:-0}" = 1 ]; then
+      # The pre-upgrade snapshot failed after the stop: nothing was replaced,
+      # the old release was started again (ClickUp 12418agjh5h). Same reason
+      # string as the unattended poller; nothing is blacklisted.
+      write_upgrade_result failed-no-rollback "$MANUAL_UPGRADE_FROM" "$MANUAL_UPGRADE_TO" "snapshot-failed"
     elif [ "${UPGRADE_FETCH_FAILED:-0}" = 1 ]; then
       # The release could not be downloaded: the engine died before it stopped
       # anything, so there is no rollback to report and no health gate that
