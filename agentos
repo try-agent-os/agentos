@@ -1267,15 +1267,16 @@ install_exit_hooks() { # install_exit_hooks <profiles-dir> — root-owned copies
       warn "could not install $dst — the exit journal keeps the previous hook"
     fi
   done
-  if [ -f "$pdir/agentos-exit-watch@.service" ] && [ -d "$units_dir" ]; then
-    if ! cmp -s "$pdir/agentos-exit-watch@.service" "$units_dir/agentos-exit-watch@.service" 2>/dev/null; then
-      if install -m 0644 "$pdir/agentos-exit-watch@.service" "$units_dir/agentos-exit-watch@.service" 2>/dev/null; then
-        EXIT_HOOKS_CHANGED=1
-      else
-        warn "could not install agentos-exit-watch@.service"
-      fi
+  # The recovery watcher's pair (ClickUp 12418aghqj8) rides the same path.
+  for f in agentos-exit-watch@.service agentos-recovery-watch@.service agentos-recovery-watch@.timer; do
+    [ -f "$pdir/$f" ] && [ -d "$units_dir" ] || continue
+    cmp -s "$pdir/$f" "$units_dir/$f" 2>/dev/null && continue
+    if install -m 0644 "$pdir/$f" "$units_dir/$f" 2>/dev/null; then
+      EXIT_HOOKS_CHANGED=1
+    else
+      warn "could not install $f"
     fi
-  fi
+  done
   if plain_dir_ok "$state" "exit-journal state directory"; then
     mkdir -p "$state" 2>/dev/null && chmod 0755 "$state" 2>/dev/null ||
       warn "could not create $state — the exit hooks will try again on the next exit"
@@ -1572,6 +1573,11 @@ $3"
   fi
   if [ -f "$units_dir/${mu}.path" ]; then
     systemctl enable --now "${mu}.path" >/dev/null 2>&1 || true
+  fi
+  # The recovery watcher of THIS node (ClickUp 12418aghqj8): armed on every
+  # reconcile for the same self-healing reason; a no-op when already active.
+  if [ -f "$main_unit" ] && [ -f "$units_dir/agentos-recovery-watch@.timer" ]; then
+    systemctl enable --now "agentos-recovery-watch@${AGENTOS_SERVICE%.service}.timer" >/dev/null 2>&1 || true
   fi
 
   # The daemon-reload above re-reads the main unit, so systemd honours the new
@@ -4088,6 +4094,10 @@ systemd_upgrade() { # systemd_upgrade [tag]  — empty tag = latest stable
   RECOVERY_EPISODE=""
   if [ "$AGENTOS_RECOVERY_LADDER" = 1 ] && ! uses_managed_postgres; then
     recovery_runner_install || warn "recovery runner not installed at $(recovery_dir) — a failed gate is recovered in-process"
+    # The episode lock BEFORE the episode exists, held to this process's exit
+    # (ClickUp 12418aghqj8): the host watcher takes it with flock -n and leaves
+    # an episode whose updater is alive alone. The runner inherits the fd.
+    recovery_episode_lock_hold || warn "could not take the recovery episode lock — the recovery watcher may race this upgrade"
     RECOVERY_EPISODE="$(recovery_episode_begin "$prev" "$tag")" || { RECOVERY_EPISODE=""; warn "could not record the recovery episode"; }
   fi
   hold_exit_watch_restart
@@ -4239,7 +4249,7 @@ systemd_upgrade_recover() {
   if recovery_runner_ok; then
     info "recovery: running the stable runner $(recovery_dir)/agentos" >&2
     AGENTOS_DIR="$AGENTOS_HOME" AGENTOS_SERVICE="$AGENTOS_SERVICE" AGENTOS_USER="$AGENTOS_ACCOUNT" \
-      RECOVERY_FIRST_FAILURE="$first" AGENTOS_RECOVERY_FROM_UPDATER=1 \
+      RECOVERY_FIRST_FAILURE="$first" AGENTOS_RECOVERY_FROM_UPDATER=1 AGENTOS_RECOVERY_LOCK_FD="$RECOVERY_LOCK_FD" \
       bash "$(recovery_dir)/agentos" rollback --ladder --episode "$RECOVERY_EPISODE" >&2 || true
   else
     RECOVERY_FIRST_FAILURE="$first" recovery_ladder >&2 || true
@@ -5650,7 +5660,16 @@ cmd_rollback_ladder() {
   [ "${AGENTOS_RECOVERY_FROM_UPDATER:-0}" = 1 ] || acquire_upgrade_host_lock
   lock="$STABILITY_DIR/.recovery.lock"
   [ ! -L "$lock" ] || die "unsafe recovery lock $lock"
-  exec {fd}>>"$lock"
+  # The updater hands its own lock down (same open file description, so the
+  # flock below is ours already); anyone else opens the file afresh.
+  fd=""
+  if [ "${AGENTOS_RECOVERY_FROM_UPDATER:-0}" = 1 ]; then
+    case "${AGENTOS_RECOVERY_LOCK_FD:-}" in
+      ''|*[!0-9]*) ;;
+      *) { : >&"$AGENTOS_RECOVERY_LOCK_FD"; } 2>/dev/null && fd="$AGENTOS_RECOVERY_LOCK_FD" ;;
+    esac
+  fi
+  [ -n "$fd" ] || exec {fd}>>"$lock"
   flock -n "$fd" || die "recovery episode lock $lock is held by another process — leaving the episode pending"
   local doc
   doc="$(recovery_journal_read)" || die "no trusted recovery journal at $(recovery_journal_path)"
@@ -5661,6 +5680,59 @@ cmd_rollback_ladder() {
   esac
   [ "$(jq -r '.outcome // ""' <<<"$doc")" = committed ] && die "episode $ep ended in a healthy upgrade — nothing to recover"
   recovery_resume "$ep"
+}
+
+# recovery_episode_lock_hold — take the episode lock for the life of this
+# process (flock -w 25: a watcher tick holding it is short when no episode is
+# pending). Sets RECOVERY_LOCK_FD.
+RECOVERY_LOCK_FD=""
+recovery_episode_lock_hold() {
+  local lock fd
+  command -v flock >/dev/null 2>&1 || return 1
+  stability_dir_init
+  mkdir -p "$STABILITY_DIR" 2>/dev/null || return 1
+  lock="$STABILITY_DIR/.recovery.lock"
+  [ ! -L "$lock" ] || return 1
+  { exec {fd}>>"$lock"; } 2>/dev/null || return 1
+  flock -w 25 "$fd" || { exec {fd}>&-; return 1; }
+  RECOVERY_LOCK_FD="$fd"
+}
+
+# `agentos recovery-watch` — root's host watcher (ClickUp 12418aghqj8). Run by
+# agentos-recovery-watch@<unit>.timer from the stable runner copy, and kicked
+# by agentos-exit-watch when a crash meets an unfinished episode. Strict locks:
+# the host upgrade lock and the episode lock are both taken with flock -n — a
+# busy one means an updater (or an operator's retry) owns the episode, which
+# then stays pending for the next tick. Never force over a lock. Exit 0 always
+# past argument checks: a timer unit that fails teaches nobody anything.
+cmd_recovery_watch() {
+  local doc rc=0 hfd lock fd
+  [ "$AGENTOS_RECOVERY_LADDER" = 1 ] || { echo "recovery-watch: no recovery ladder next to this CLI" >&2; return 0; }
+  [ "$(detect_mode)" = systemd ] || { echo "recovery-watch: systemd-mode only"; return 0; }
+  stability_dir_init
+  # Fast path, no lock: nothing to finish.
+  doc="$(recovery_journal_read 2>/dev/null)" || rc=$?
+  [ "$rc" = 1 ] && return 0
+  if [ "$rc" = 0 ] && [ "$(jq -r .phase <<<"$doc")" = terminal ] && [ "$(jq -r '.outcome // ""' <<<"$doc")" != held ]; then
+    return 0
+  fi
+  command -v flock >/dev/null 2>&1 || { echo "recovery-watch: no flock(1) — the episode stays pending" >&2; return 0; }
+  if ! { exec {hfd}>>"$UPGRADE_HOST_LOCK"; } 2>/dev/null; then
+    echo "recovery-watch: cannot open the host upgrade lock $UPGRADE_HOST_LOCK — the episode stays pending" >&2; return 0
+  fi
+  if ! flock -n "$hfd"; then
+    echo "recovery-watch: the host upgrade lock is held — the episode stays pending"; return 0
+  fi
+  UPGRADE_HOST_LOCK_FD="$hfd"
+  lock="$STABILITY_DIR/.recovery.lock"
+  [ ! -L "$lock" ] || { echo "recovery-watch: unsafe recovery lock $lock — nothing done" >&2; return 0; }
+  { exec {fd}>>"$lock"; } 2>/dev/null || { echo "recovery-watch: cannot open $lock — the episode stays pending" >&2; return 0; }
+  if ! flock -n "$fd"; then
+    echo "recovery-watch: the recovery episode lock is held — the episode stays pending"; return 0
+  fi
+  RECOVERY_LOCK_FD="$fd"
+  recovery_reconcile
+  return 0
 }
 
 cmd_backup() {
@@ -5904,6 +5976,7 @@ case "${1:-}" in
   manual-upgrade) shift; cmd_manual_upgrade "$@" ;;
   rollback)   shift; cmd_rollback "$@" ;;
   recovery-protocol) [ "$AGENTOS_RECOVERY_LADDER" = 1 ] && echo "$RECOVERY_PROTOCOL" || exit 1 ;;
+  recovery-watch) cmd_recovery_watch; exit 0 ;;
   fleet-op)   shift
               [ "${FLEET_OP_LIB:-0}" = 1 ] || die "fleet-op: lib/fleet-op.sh is missing next to this CLI"
               rc=0; fleet_op_main "$@" || rc=$?; exit "$rc" ;;
