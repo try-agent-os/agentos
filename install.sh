@@ -3137,10 +3137,12 @@ install_exit_hooks() { # install_exit_hooks <profiles-dir>
       warn "could not install $libexec/$f"
     fi
   done
-  if $SUDO test -f "$pdir/agentos-exit-watch@.service"; then
-    $SUDO install -m 0644 "$pdir/agentos-exit-watch@.service" /etc/systemd/system/agentos-exit-watch@.service \
-      || warn "could not install agentos-exit-watch@.service"
-  fi
+  # The recovery watcher's pair (ClickUp 12418aghqj8) rides the same path; its
+  # timer instance is enabled with the node's units below.
+  for f in agentos-exit-watch@.service agentos-recovery-watch@.service agentos-recovery-watch@.timer; do
+    $SUDO test -f "$pdir/$f" || continue
+    $SUDO install -m 0644 "$pdir/$f" "/etc/systemd/system/$f" || warn "could not install $f"
+  done
   ok "exit journal hooks → ${libexec}, journal → /var/lib/${SERVICE_NAME}/exits.jsonl"
 }
 
@@ -3329,6 +3331,12 @@ install_systemd() {
   fi
   $SUDO systemctl daemon-reload
   $SUDO systemctl enable --now "$SERVICE_NAME"
+  # The host recovery watcher's clock (ClickUp 12418aghqj8); a no-op run until
+  # an upgrade has installed the stable recovery runner.
+  if $SUDO test -f /etc/systemd/system/agentos-recovery-watch@.timer; then
+    $SUDO systemctl enable --now "agentos-recovery-watch@${SERVICE_NAME}.timer" >/dev/null 2>&1 \
+      || warn "could not enable agentos-recovery-watch@${SERVICE_NAME}.timer"
+  fi
 
   if [ "$HTTPS_MODE" = "caddy" ]; then
     step "HTTPS (Caddy)"
