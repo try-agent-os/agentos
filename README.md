@@ -1,7 +1,18 @@
 # AgentOS
 
-Your own agent, 24/7 — a Telegram bot + scheduled routines + Mini App, running
-as a single process on your own box, over a git repo you own.
+**A work computer for your agents.** Security & Privacy first, any AI model,
+hosted wherever you want — even on your own box.
+
+AgentOS gives your agents a machine of their own to work on: a Telegram bot,
+scheduled routines and a Mini App, running as a single process over a git repo
+you own. Your data and keys stay on that machine.
+
+- **Security & Privacy first** — one machine per owner, nothing shared. Your
+  context, chats and secrets live on your box; there is no vendor database.
+- **Any models** — pick your provider and model (Anthropic, OpenAI and others),
+  including a local model on your own hardware.
+- **Host it anywhere** — a managed machine set up for you, your own VM, or your
+  own hardware. It is the same node in every case, and it moves between them.
 
 ## Install
 
@@ -139,7 +150,7 @@ doctl compute droplet create agentos --image ubuntu-24-04-x64 --size s-2vcpu-4gb
   chores.
 - **Mini App** — routines, activity and sessions from your phone, right inside
   Telegram: flip a routine on, run it now, or watch a run as it goes.
-- **One process on your box** — a single systemd service (or a single Docker
+- **One process on your machine** — a single systemd service (or a single Docker
   container, if you prefer). Your server, your keys, your data.
 
 ## Own your files, own your repo
