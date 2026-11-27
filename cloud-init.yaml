@@ -25,6 +25,9 @@
 #   The token goes through the environment, never argv: argv shows up in ps
 #   and in your shell history.
 #   Then DM your bot and send /login to connect Claude. That is it.
+#   The login script below exports AGENTOS_INSTALL_VIA=cloud-init (and the
+#   installer URL) until the node is installed, so the install passport names
+#   this file as its source instead of a bare install.sh run.
 #
 # WHY TWO STAGES (and not a fully hands-off boot): the deploy URL is fetched by
 # the cloud provider and lands in your browser history, so it must never carry
@@ -101,6 +104,11 @@ write_files:
       # installer writes /opt/agentos/.env on success, so its presence is the
       # "done" signal.
       if [ ! -f /opt/agentos/.env ] && [ -f /opt/agentos-bootstrap/install.sh ]; then
+        # Name this path in the install passport (install-passport.json):
+        # install.sh cannot see how it was fetched, so without these it records
+        # via=install.sh. The staged copy came from the default URL on main.
+        export AGENTOS_INSTALL_VIA=cloud-init
+        export AGENTOS_INSTALLER_URL=https://raw.githubusercontent.com/try-agent-os/agentos/main/install.sh
         echo "AgentOS: finish setup ->"
         echo "  read -rsp 'Bot token: ' TELEGRAM_BOT_TOKEN && echo && export TELEGRAM_BOT_TOKEN"
         echo "  bash /opt/agentos-bootstrap/install.sh --no-https --admin <YOUR_TELEGRAM_ID>"

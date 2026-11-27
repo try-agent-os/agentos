@@ -619,6 +619,8 @@ One command, all flags decided, nothing interactive:
 
 ```bash
 TELEGRAM_BOT_TOKEN="$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$SECRETS" | tail -1)" \
+AGENTOS_INSTALL_VIA=agent \
+AGENTOS_INSTALLER_URL=https://raw.githubusercontent.com/try-agent-os/agentos/main/install.sh \
 bash /tmp/agentos-install.sh \
   --admin <telegram-id-or-username> \
   --no-https \
@@ -632,6 +634,11 @@ The `tee` keeps the installer's output in `/tmp/agentos-install.log`, and
 `PIPESTATUS[0]` is the installer's own exit status, not `tee`'s — a plain `$?`
 after the pipe reports `tee`. Read it in the same tool call as the install:
 it is gone by the next one. Both are what Phase 4 asserts below.
+
+The two `AGENTOS_INSTALL*` lines are for the node's install passport
+(`data/install-passport.json`): the installer cannot see how it was fetched, so
+they record that an agent installed this node with this prompt, and from which
+URL. If you downloaded `install.sh` from anywhere else, put that URL there.
 
 The first line puts the bot token into the installer's environment straight
 from the secrets file: it never reaches argv, `ps` or your transcript. Run it
